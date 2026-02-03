@@ -57,7 +57,10 @@ public class VulkanPipeline {
     private final VContext ctx;
     private final AccelerationManager accelerationManager;
 
-    private record RtPipeline(VRef<VRaytracePipeline> pipeline, int commonSet, int geomSet, int customTexSet, int ssboSet) {}
+    private record RtPipeline(VRef<VRaytracePipeline> pipeline, int commonSet, int geomSet, int customTexSet,
+            int ssboSet) {
+    }
+
     private final ArrayList<RtPipeline> raytracePipelines = new ArrayList<>();
 
     private final VRef<VSampler> sampler;
@@ -80,7 +83,8 @@ public class VulkanPipeline {
 
     private final PoolLinearAllocator uboAllocator;
 
-    public VulkanPipeline(VContext ctx, AccelerationManager accelerationManager, RaytracingShaderSet[] passes, int[] ssboIds, List<VRef<VGImage>> customTextures) {
+    public VulkanPipeline(VContext ctx, AccelerationManager accelerationManager, RaytracingShaderSet[] passes,
+            int[] ssboIds, List<VRef<VGImage>> customTextures) {
         this.ctx = ctx;
         this.accelerationManager = accelerationManager;
 
@@ -88,7 +92,8 @@ public class VulkanPipeline {
             this.customTextureViews = new SharedImageViewTracker[customTextures.size()];
             for (int i = 0; i < customTextures.size(); i++) {
                 int index = i;
-                this.customTextureViews[i] = new SharedImageViewTracker(ctx, () -> new VRef<>(customTextures.get(index).get()));
+                this.customTextureViews[i] = new SharedImageViewTracker(ctx,
+                        () -> new VRef<>(customTextures.get(index).get()));
             }
 
             this.irisRenderTargetViews = new SharedImageViewTracker[maxIrisRenderTargets];
@@ -96,39 +101,50 @@ public class VulkanPipeline {
                 this.irisRenderTargetViews[i] = new SharedImageViewTracker(ctx, null);
             }
             this.blockAtlasView = new SharedImageViewTracker(ctx, () -> {
-                AbstractTexture blockAtlas = MinecraftClient.getInstance().getTextureManager().getTexture(new Identifier("minecraft", "textures/atlas/blocks.png"));
+                AbstractTexture blockAtlas = MinecraftClient.getInstance().getTextureManager()
+                        .getTexture(new Identifier("minecraft", "textures/atlas/blocks.png"));
                 return ((IVGImage) blockAtlas).getVGImage();
             });
             this.blockAtlasNormalView = new SharedImageViewTracker(ctx, () -> {
-                AbstractTexture blockAtlas = MinecraftClient.getInstance().getTextureManager().getTexture(new Identifier("minecraft", "textures/atlas/blocks.png"));
-                PBRTextureHolder holder = PBRTextureManager.INSTANCE.getOrLoadHolder(blockAtlas.getGlId());//((TextureAtlasExtension)blockAtlas).getPBRHolder()
+                AbstractTexture blockAtlas = MinecraftClient.getInstance().getTextureManager()
+                        .getTexture(new Identifier("minecraft", "textures/atlas/blocks.png"));
+                PBRTextureHolder holder = PBRTextureManager.INSTANCE.getOrLoadHolder(blockAtlas.getGlId());// ((TextureAtlasExtension)blockAtlas).getPBRHolder()
                 return ((IVGImage) holder.normalTexture()).getVGImage();
             });
             this.blockAtlasSpecularView = new SharedImageViewTracker(ctx, () -> {
-                AbstractTexture blockAtlas = MinecraftClient.getInstance().getTextureManager().getTexture(new Identifier("minecraft", "textures/atlas/blocks.png"));
-                PBRTextureHolder holder = PBRTextureManager.INSTANCE.getOrLoadHolder(blockAtlas.getGlId());//((TextureAtlasExtension)blockAtlas).getPBRHolder()
+                AbstractTexture blockAtlas = MinecraftClient.getInstance().getTextureManager()
+                        .getTexture(new Identifier("minecraft", "textures/atlas/blocks.png"));
+                PBRTextureHolder holder = PBRTextureManager.INSTANCE.getOrLoadHolder(blockAtlas.getGlId());// ((TextureAtlasExtension)blockAtlas).getPBRHolder()
                 return ((IVGImage) holder.specularTexture()).getVGImage();
             });
-            this.placeholderSpecular = ctx.memory.createImage2D(4, 4, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            this.placeholderSpecular = ctx.memory.createImage2D(4, 4, 1, VK_FORMAT_R8G8B8A8_UNORM,
+                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             this.placeholderSpecularView = VImageView.create(ctx, placeholderSpecular);
-            this.placeholderNormals = ctx.memory.createImage2D(4, 4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            this.placeholderNormals = ctx.memory.createImage2D(4, 4, 1, VK_FORMAT_R32G32B32A32_SFLOAT,
+                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             this.placeholderNormalsView = VImageView.create(ctx, placeholderNormals);
 
             try (var stack = stackPush()) {
                 var initZeros = stack.callocInt(4 * 4);
                 var initNormals = stack.mallocFloat(4 * 4 * 4);
                 for (int i = 0; i < 4 * 4; i++) {
-                    initNormals.put(new float[]{0.5f, 0.5f, 1.0f, 1.0f});
+                    initNormals.put(new float[] { 0.5f, 0.5f, 1.0f, 1.0f });
                 }
                 initNormals.rewind();
 
                 ctx.cmd.executeWait(cmd -> {
-                    cmd.encodeImageTransition(placeholderSpecular, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-                    cmd.encodeImageTransition(placeholderNormals, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-                    cmd.encodeImageUpload(ctx.memory, MemoryUtil.memAddress(initZeros), placeholderSpecular, initZeros.capacity() * 4L, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                    cmd.encodeImageUpload(ctx.memory, MemoryUtil.memAddress(initNormals), placeholderNormals, initNormals.capacity() * 4L, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-                    cmd.encodeImageTransition(placeholderSpecular, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-                    cmd.encodeImageTransition(placeholderNormals, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+                    cmd.encodeImageTransition(placeholderSpecular, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+                    cmd.encodeImageTransition(placeholderNormals, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+                    cmd.encodeImageUpload(ctx.memory, MemoryUtil.memAddress(initZeros), placeholderSpecular,
+                            initZeros.capacity() * 4L, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                    cmd.encodeImageUpload(ctx.memory, MemoryUtil.memAddress(initNormals), placeholderNormals,
+                            initNormals.capacity() * 4L, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                    cmd.encodeImageTransition(placeholderSpecular, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+                    cmd.encodeImageTransition(placeholderNormals, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
                 });
             }
         }
@@ -155,9 +171,11 @@ public class VulkanPipeline {
                 .borderColor(VK_BORDER_COLOR_INT_OPAQUE_BLACK)
                 .maxAnisotropy(1.0f));
 
-        this.uboAllocator = new PoolLinearAllocator(ctx, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        this.uboAllocator = new PoolLinearAllocator(ctx,
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 32 * 1024,
-                0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
 
         if (passes == null) {
             supportsEntities = false;
@@ -173,7 +191,7 @@ public class VulkanPipeline {
         }
         supportsEntities = supportsEntitiesT;
         try {
-            var commonSetExpected = new ShaderReflection.Set(new ShaderReflection.Binding[]{
+            var commonSetExpected = new ShaderReflection.Set(new ShaderReflection.Binding[] {
                     new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 0, false),
                     new ShaderReflection.Binding("", 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
@@ -181,14 +199,23 @@ public class VulkanPipeline {
                     new ShaderReflection.Binding("", 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
                     new ShaderReflection.Binding("", 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, maxIrisRenderTargets, false),
             });
+            var commonSetExpectedSingle = new ShaderReflection.Set(new ShaderReflection.Binding[] {
+                    new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 0, false),
+                    new ShaderReflection.Binding("", 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+            });
 
-            var geomSetExpected = new ShaderReflection.Set(new ShaderReflection.Binding[]{
+            var geomSetExpected = new ShaderReflection.Set(new ShaderReflection.Binding[] {
                     new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, true)
             });
 
             ArrayList<ShaderReflection.Binding> customTexBindings = new ArrayList<>();
             for (int i = 0; i < customTextureViews.length; i++) {
-                customTexBindings.add(new ShaderReflection.Binding("", i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false));
+                customTexBindings
+                        .add(new ShaderReflection.Binding("", i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false));
             }
             var customTexSetExpected = new ShaderReflection.Set(customTexBindings);
 
@@ -211,7 +238,9 @@ public class VulkanPipeline {
 
                 for (int setIdx = 0; setIdx < pipe.get().reflection.getNSets(); setIdx++) {
                     var set = pipe.get().reflection.getSet(setIdx);
-                    if (set.validate(commonSetExpected)) {
+                    if (set.bindings().isEmpty())
+                        continue;
+                    if (set.validate(commonSetExpected) || set.validate(commonSetExpectedSingle)) {
                         commonSet = setIdx;
                     } else if (set.validate(geomSetExpected)) {
                         geomSet = setIdx;
@@ -220,7 +249,8 @@ public class VulkanPipeline {
                     } else if (set.validate(ssboSetExpected)) {
                         ssboSet = setIdx;
                     } else {
-                        throw new RuntimeException("Raytracing pipeline " + i + " has an unexpected descriptor set layout at set " + setIdx);
+                        throw new RuntimeException("Raytracing pipeline " + i
+                                + " has an unexpected descriptor set layout at set " + setIdx + ". Actual: " + set);
                     }
                 }
 
@@ -237,11 +267,15 @@ public class VulkanPipeline {
     }
 
     private final EntityCapture capture = new EntityCapture();
+
     private void captureEntities() {
-        accelerationManager.setEntityData(supportsEntities?capture.capture(CapturedRenderingState.INSTANCE.getTickDelta(), MinecraftClient.getInstance().world):null);
+        accelerationManager.setEntityData(supportsEntities
+                ? capture.capture(CapturedRenderingState.INSTANCE.getTickDelta(), MinecraftClient.getInstance().world)
+                : null);
     }
 
-    public void renderPostShadows(List<VRef<VGImage>> vgOutImgs, Camera camera, ShaderStorageBuffer[] ssbos, MixinCelestialUniforms celestialUniforms) {
+    public void renderPostShadows(List<VRef<VGImage>> vgOutImgs, Camera camera, ShaderStorageBuffer[] ssbos,
+            MixinCelestialUniforms celestialUniforms) {
         var prof = MinecraftClient.getInstance().getProfiler();
 
         for (int i = 0; i < 15; i++) {
@@ -301,12 +335,13 @@ public class VulkanPipeline {
                 Matrix4f invViewMatrix = new Matrix4f();
 
                 CapturedRenderingState.INSTANCE.getGbufferProjection().invert(invProjMatrix);
-                new Matrix4f(CapturedRenderingState.INSTANCE.getGbufferModelView()).translate(camera.getPos().toVector3f().negate()).invert(invViewMatrix);
+                new Matrix4f(CapturedRenderingState.INSTANCE.getGbufferModelView())
+                        .translate(camera.getPos().toVector3f().negate()).invert(invViewMatrix);
 
                 invProjMatrix.transformProject(-1, -1, 0, 1, tmpv3).get(bb);
-                invProjMatrix.transformProject(+1, -1, 0, 1, tmpv3).get(4*Float.BYTES, bb);
-                invProjMatrix.transformProject(-1, +1, 0, 1, tmpv3).get(8*Float.BYTES, bb);
-                invProjMatrix.transformProject(+1, +1, 0, 1, tmpv3).get(12*Float.BYTES, bb);
+                invProjMatrix.transformProject(+1, -1, 0, 1, tmpv3).get(4 * Float.BYTES, bb);
+                invProjMatrix.transformProject(-1, +1, 0, 1, tmpv3).get(8 * Float.BYTES, bb);
+                invProjMatrix.transformProject(+1, +1, 0, 1, tmpv3).get(12 * Float.BYTES, bb);
                 invViewMatrix.get(Float.BYTES * 16, bb);
 
                 celestialUniforms.invokeGetSunPosition().get(Float.BYTES * 32, bb);
@@ -333,17 +368,25 @@ public class VulkanPipeline {
                 // Put barriers on images & transition to the optimal layout
                 // These layouts also need to match the descriptor sets
                 for (var img : outImgs) {
-                    cmd.encodeImageTransition(img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+                    cmd.encodeImageTransition(img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
                 }
-                cmd.encodeImageTransition(blockAtlasView.getImage(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+                cmd.encodeImageTransition(blockAtlasView.getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
 
                 var image = blockAtlasNormalView.getImage();
-                if (image != null) cmd.encodeImageTransition(image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+                if (image != null)
+                    cmd.encodeImageTransition(image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
                 image = blockAtlasSpecularView.getImage();
-                if (image != null) cmd.encodeImageTransition(image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+                if (image != null)
+                    cmd.encodeImageTransition(image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
 
-                for(SharedImageViewTracker customtexView : customTextureViews) {
-                   cmd.encodeImageTransition(customtexView.getImage(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+                for (SharedImageViewTracker customtexView : customTextureViews) {
+                    cmd.encodeImageTransition(customtexView.getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT,
+                            VK_REMAINING_MIP_LEVELS);
                 }
             }
 
@@ -356,7 +399,8 @@ public class VulkanPipeline {
                     sets.add(null); // Well, LOL, can't use Arrays.toList because it's generic
                 }
                 if (record.commonSet != -1) {
-                    var commonSet = Vulkanite.INSTANCE.getPoolByLayout(layouts.get(record.commonSet)).get().allocateSet();
+                    var commonSet = Vulkanite.INSTANCE.getPoolByLayout(layouts.get(record.commonSet)).get()
+                            .allocateSet();
 
                     var updater = new DescriptorUpdateBuilder(ctx, pipeline.get().reflection.getSet(record.commonSet))
                             .set(commonSet)
@@ -372,7 +416,15 @@ public class VulkanPipeline {
                                             : placeholderSpecularView,
                                     sampler);
                     List<VRef<VImageView>> outImgViewList = new ArrayList<>(outImgs.size());
-                    for (int i = 0; i < outImgs.size(); i++) {
+
+                    // Determine how many images to bind based on reflection
+                    var binding6 = pipeline.get().reflection.getSet(record.commonSet).getBindingAt(6);
+                    int maxImages = 16;
+                    if (binding6 != null) {
+                        maxImages = binding6.arraySize() <= 0 ? 1 : binding6.arraySize();
+                    }
+
+                    for (int i = 0; i < outImgs.size() && i < maxImages; i++) {
                         int index = i;
                         outImgViewList.add(irisRenderTargetViews[i].getView(() -> vgOutImgs.get(index)));
                     }
@@ -385,9 +437,11 @@ public class VulkanPipeline {
                     sets.set(record.geomSet, accelerationManager.getGeometrySet());
                 }
                 if (record.customTexSet != -1) {
-                    var ctexSet = Vulkanite.INSTANCE.getPoolByLayout(layouts.get(record.customTexSet)).get().allocateSet();
+                    var ctexSet = Vulkanite.INSTANCE.getPoolByLayout(layouts.get(record.customTexSet)).get()
+                            .allocateSet();
 
-                    var updater = new DescriptorUpdateBuilder(ctx, pipeline.get().reflection.getSet(record.customTexSet))
+                    var updater = new DescriptorUpdateBuilder(ctx,
+                            pipeline.get().reflection.getSet(record.customTexSet))
                             .set(ctexSet);
                     for (int i = 0; i < customTextureViews.length; i++) {
                         updater.imageSampler(i, customTextureViews[i].getView(), ctexSampler);
@@ -408,27 +462,44 @@ public class VulkanPipeline {
 
                     sets.set(record.ssboSet, ssboSet);
                 }
+
+                // Fill in any gaps (nulls) with empty descriptor sets
+                for (int i = 0; i < sets.size(); i++) {
+                    if (sets.get(i) == null) {
+                        var emptySet = Vulkanite.INSTANCE.getPoolByLayout(layouts.get(i)).get().allocateSet();
+                        // No update needed for empty set
+                        sets.set(i, emptySet);
+                    }
+                }
+
                 cmd.bindDSet(sets);
                 cmd.traceRays(outImgs.get(0).get().width, outImgs.get(0).get().height, 1);
                 sets.forEach(VRef::close);
 
                 // Barrier on the output images
                 for (var img : outImgs) {
-                    cmd.encodeImageTransition(img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+                    cmd.encodeImageTransition(img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
                 }
             }
 
             {
                 // Transition images back to general layout (for OpenGL)
-                cmd.encodeImageTransition(blockAtlasView.getImage(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+                cmd.encodeImageTransition(blockAtlasView.getImage(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
 
                 var image = blockAtlasNormalView.getImage();
-                if (image != null) cmd.encodeImageTransition(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+                if (image != null)
+                    cmd.encodeImageTransition(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
                 image = blockAtlasSpecularView.getImage();
-                if (image != null) cmd.encodeImageTransition(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+                if (image != null)
+                    cmd.encodeImageTransition(image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
 
-                for(SharedImageViewTracker customtexView : customTextureViews) {
-                   cmd.encodeImageTransition(customtexView.getImage(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+                for (SharedImageViewTracker customtexView : customTextureViews) {
+                    cmd.encodeImageTransition(customtexView.getImage(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
                 }
             }
 
@@ -454,6 +525,5 @@ public class VulkanPipeline {
         ctx.cmd.newFrame();
         System.gc();
     }
-
 
 }

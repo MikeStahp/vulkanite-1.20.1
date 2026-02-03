@@ -17,7 +17,9 @@ import static org.lwjgl.vulkan.VK10.*;
 import static org.lwjgl.vulkan.VK12.*;
 
 public class ShaderReflection {
-    public record Binding(String name, int binding, int descriptorType, int arraySize, boolean runtimeSized) {}
+    public record Binding(String name, int binding, int descriptorType, int arraySize, boolean runtimeSized) {
+    }
+
     public record Set(ArrayList<Binding> bindings) {
         public Set(ArrayList<Binding> bindings) {
             // Sort by binding
@@ -25,7 +27,7 @@ public class ShaderReflection {
             this.bindings.sort((a, b) -> Integer.compare(a.binding, b.binding));
         }
 
-        public Set(Binding ...bindings) {
+        public Set(Binding... bindings) {
             this(new ArrayList<Binding>(List.of(bindings)));
         }
 
@@ -65,12 +67,29 @@ public class ShaderReflection {
             }
             return true;
         }
+
+        @Override
+        public String toString() {
+            StringBuilder sb = new StringBuilder();
+            sb.append("Set {\n");
+            for (var binding : bindings) {
+                sb.append("  Binding ").append(binding.binding)
+                        .append(": ").append(binding.name)
+                        .append(" (type=").append(binding.descriptorType)
+                        .append(", arraySize=").append(binding.arraySize)
+                        .append(", runtimeSized=").append(binding.runtimeSized).append(")\n");
+            }
+            sb.append("}");
+            return sb.toString();
+        }
     }
+
     private ArrayList<Set> sets = new ArrayList<>();
 
     public List<Binding> getBindings(int set) {
         return sets.get(set).bindings;
     }
+
     public Set getSet(int set) {
         return sets.get(set);
     }
@@ -80,30 +99,31 @@ public class ShaderReflection {
     }
 
     public ShaderReflection() {
-        //Empty
+        // Empty
     }
 
     public ShaderReflection(ByteBuffer spirv) {
         try (var stack = stackPush()) {
-            //Create context
+            // Create context
             var ptr = stack.mallocPointer(1);
             var ptr2 = stack.mallocPointer(1);
             _CHECK_(spvc_context_create(ptr));
             long context = ptr.get(0);
 
-            //Parse the spir-v
-            _CHECK_(spvc_context_parse_spirv(context, spirv.asIntBuffer(), spirv.remaining()>>2, ptr));
+            // Parse the spir-v
+            _CHECK_(spvc_context_parse_spirv(context, spirv.asIntBuffer(), spirv.remaining() >> 2, ptr));
             long ir = ptr.get(0);
 
             // Hand it off to a compiler instance and give it ownership of the IR.
-            _CHECK_(spvc_context_create_compiler(context, SPVC_BACKEND_NONE, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP, ptr));
+            _CHECK_(spvc_context_create_compiler(context, SPVC_BACKEND_NONE, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP,
+                    ptr));
             long compiler = ptr.get(0);
 
             // Create resources from spir-v
             _CHECK_(spvc_compiler_create_shader_resources(compiler, ptr));
             long resources = ptr.get(0);
 
-            //Get reflection data
+            // Get reflection data
             for (var type : ResourceType.values()) {
                 int vkDescType = type.toVkDescriptorType();
 
@@ -147,13 +167,15 @@ public class ShaderReflection {
         for (int set = 0; set < sets.size(); set++) {
             sb.append("Set ").append(set).append(":\n");
             for (var binding : sets.get(set).bindings) {
-                sb.append("  - ").append(binding.binding).append(" : ").append(binding.name).append("; arraySize = ").append(binding.arraySize).append("; runtimeSized = ").append(binding.runtimeSized).append("\n");
+                sb.append("  - ").append(binding.binding).append(" : ").append(binding.name).append("; arraySize = ")
+                        .append(binding.arraySize).append("; runtimeSized = ").append(binding.runtimeSized)
+                        .append("\n");
             }
         }
         return sb.toString();
     }
 
-    public static ShaderReflection mergeStages(ShaderReflection ...stages) {
+    public static ShaderReflection mergeStages(ShaderReflection... stages) {
         ShaderReflection out = new ShaderReflection();
         int maxSets = 0;
         for (var stage : stages) {
@@ -170,17 +192,22 @@ public class ShaderReflection {
                             if (b.binding == binding.binding) {
                                 // Check for conflicts
                                 if (b.descriptorType != binding.descriptorType) {
-                                    throw new IllegalStateException("Conflicting descriptor types for binding " + binding.binding + " in set " + set);
+                                    throw new IllegalStateException("Conflicting descriptor types for binding "
+                                            + binding.binding + " in set " + set);
                                 }
                                 if (b.runtimeSized != binding.runtimeSized) {
-                                    throw new IllegalStateException("Conflicting runtime sized for binding " + binding.binding + " in set " + set);
+                                    throw new IllegalStateException("Conflicting runtime sized for binding "
+                                            + binding.binding + " in set " + set);
                                 }
                                 if (!b.runtimeSized && b.arraySize != binding.arraySize) {
-                                    throw new IllegalStateException("Conflicting array sizes for binding " + binding.binding + " in set " + set);
+                                    throw new IllegalStateException("Conflicting array sizes for binding "
+                                            + binding.binding + " in set " + set);
                                 }
                                 // We don't check for name conflicts, but still warn
-                                if (!b.name.isEmpty() && !binding.name.isEmpty() && b.name.compareTo(binding.name) != 0) {
-                                    System.err.println("Warning: Conflicting names for binding " + binding.binding + " : " + b.name + " and " + binding.name);
+                                if (!b.name.isEmpty() && !binding.name.isEmpty()
+                                        && b.name.compareTo(binding.name) != 0) {
+                                    System.err.println("Warning: Conflicting names for binding " + binding.binding
+                                            + " : " + b.name + " and " + binding.name);
                                 }
                                 alreadyExists = true;
                             }
@@ -202,6 +229,7 @@ public class ShaderReflection {
     }
 
     private List<VRef<VDescriptorSetLayout>> layouts = new ArrayList<>();
+
     public List<VRef<VDescriptorSetLayout>> buildSetLayouts(VContext context, int runtimeSizedArrayMaxSize) {
         freeLayouts();
         layouts = new ArrayList<>();
@@ -214,13 +242,15 @@ public class ShaderReflection {
             for (var binding : set.bindings) {
                 if (binding.arraySize > 0) {
                     if (binding.runtimeSized) {
-                        builder.binding(binding.binding, binding.descriptorType, runtimeSizedArrayMaxSize, VK_SHADER_STAGE_ALL);
+                        builder.binding(binding.binding, binding.descriptorType, runtimeSizedArrayMaxSize,
+                                VK_SHADER_STAGE_ALL);
                         builder.setBindingFlags(binding.binding,
                                 VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT
                                         | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT
                                         | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
                     } else {
-                        builder.binding(binding.binding, binding.descriptorType, binding.arraySize, VK_SHADER_STAGE_ALL);
+                        builder.binding(binding.binding, binding.descriptorType, binding.arraySize,
+                                VK_SHADER_STAGE_ALL);
                         builder.setBindingFlags(binding.binding, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
                     }
                 } else {
