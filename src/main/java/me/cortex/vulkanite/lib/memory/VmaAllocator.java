@@ -28,15 +28,20 @@ public class VmaAllocator {
 
     private final long sharedBlockSize;
 
-    private record ImageFormatQuery(int format, int imageType, int tiling, int usage, int flags) {}
-    private record ImageFormatQueryResult(boolean supported, ImageFormatQuery updatedParams) {}
+    private record ImageFormatQuery(int format, int imageType, int tiling, int usage, int flags) {
+    }
+
+    private record ImageFormatQueryResult(boolean supported, ImageFormatQuery updatedParams) {
+    }
+
     private HashMap<ImageFormatQuery, ImageFormatQueryResult> formatSupportCache = new HashMap<>();
 
     private final VkExportMemoryAllocateInfo exportMemoryAllocateInfo;
     private final VkExportMemoryAllocateInfo exportDedicatedMemoryAllocateInfo;
 
     boolean testModifyFormatSupport(VkDevice device, VkImageCreateInfo imageCreateInfo) {
-        var query = new ImageFormatQuery(imageCreateInfo.format(), imageCreateInfo.imageType(), imageCreateInfo.tiling(),
+        var query = new ImageFormatQuery(imageCreateInfo.format(), imageCreateInfo.imageType(),
+                imageCreateInfo.tiling(),
                 imageCreateInfo.usage(), imageCreateInfo.flags());
         if (formatSupportCache.containsKey(query)) {
             var res = formatSupportCache.get(query);
@@ -67,7 +72,8 @@ public class VmaAllocator {
                 imageCreateInfo.usage(imageCreateInfo.usage() & ~VK_IMAGE_USAGE_STORAGE_BIT);
                 boolean res = testModifyFormatSupport(device, imageCreateInfo);
                 if (res) {
-                    System.err.println("WARNING: Storage image usage was removed from " + imageCreateInfo.format() + " due to lack of support");
+                    System.err.println("WARNING: Storage image usage was removed from " + imageCreateInfo.format()
+                            + " due to lack of support");
                 }
                 return res;
             }
@@ -77,7 +83,8 @@ public class VmaAllocator {
                 imageCreateInfo.tiling(VK_IMAGE_TILING_LINEAR);
                 boolean res = testModifyFormatSupport(device, imageCreateInfo);
                 if (res) {
-                    System.err.println("WARNING: TILING_OPTIMAL was changed to TILING_LINEAR " + imageCreateInfo.format() + " due to lack of support");
+                    System.err.println("WARNING: TILING_OPTIMAL was changed to TILING_LINEAR "
+                            + imageCreateInfo.format() + " due to lack of support");
                 }
                 return res;
             }
@@ -126,7 +133,8 @@ public class VmaAllocator {
                                 | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT)
                         .sharingMode(VK_SHARING_MODE_EXCLUSIVE)
                         .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
-                var allocationCreateInfo = VmaAllocationCreateInfo.calloc(stack).usage(VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE)
+                var allocationCreateInfo = VmaAllocationCreateInfo.calloc(stack)
+                        .usage(VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE)
                         .requiredFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 IntBuffer pMemoryTypeIndex = stack.callocInt(1);
                 if (vmaFindMemoryTypeIndexForImageInfo(allocator, imageCreateInfo, allocationCreateInfo,
@@ -211,7 +219,8 @@ public class VmaAllocator {
                         .calloc(stack)
                         .sType$Default()
                         .buffer(buffer), memReq2);
-                dedicated = dedicatedMemReq.prefersDedicatedAllocation() || dedicatedMemReq.requiresDedicatedAllocation();
+                dedicated = dedicatedMemReq.prefersDedicatedAllocation()
+                        || dedicatedMemReq.requiresDedicatedAllocation();
             }
 
             if (dedicated) {
@@ -292,10 +301,12 @@ public class VmaAllocator {
                         .image(image), memReq2);
                 if (Vulkanite.INSTANCE.IS_ZINK) {
                     if (dedicatedMemReq.requiresDedicatedAllocation()) {
-                        throw new RuntimeException("Zink does not support importing dedicated memory, however the Vulkan implementation demands it");
+                        throw new RuntimeException(
+                                "Zink does not support importing dedicated memory, however the Vulkan implementation demands it");
                     }
                 } else {
-                    dedicated = dedicatedMemReq.prefersDedicatedAllocation() || dedicatedMemReq.requiresDedicatedAllocation();
+                    dedicated = dedicatedMemReq.prefersDedicatedAllocation()
+                            || dedicatedMemReq.requiresDedicatedAllocation();
                 }
             }
 
@@ -310,7 +321,8 @@ public class VmaAllocator {
 
             VmaAllocationInfo vai = VmaAllocationInfo.calloc();
             PointerBuffer pAllocation = stack.mallocPointer(1);
-            _CHECK_(vmaAllocateMemoryForImage(allocator, image, allocationCreateInfo, pAllocation, vai), "Failed to allocate memory for image");
+            _CHECK_(vmaAllocateMemoryForImage(allocator, image, allocationCreateInfo, pAllocation, vai),
+                    "Failed to allocate memory for image");
 
             long allocation = pAllocation.get(0);
             _CHECK_(vmaBindImageMemory(allocator, allocation, image), "failed to bind image memory");

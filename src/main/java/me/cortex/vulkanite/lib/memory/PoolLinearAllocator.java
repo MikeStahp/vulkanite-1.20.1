@@ -13,13 +13,15 @@ public class PoolLinearAllocator {
     private final int vmaFlags;
     private final long poolSize;
     private final long alignment;
+    private final long alignmentMask;
 
     private VRef<VBuffer> buffer;
     private long currentOffset;
 
     private final VContext ctx;
 
-    public record BufferRegion(VRef<VBuffer> buffer, long offset, long size, long deviceAddress) { }
+    public record BufferRegion(VRef<VBuffer> buffer, long offset, long size, long deviceAddress) {
+    }
 
     public PoolLinearAllocator(VContext ctx, int usage, long poolSize, long alignment) {
         this(ctx, usage, poolSize, alignment, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
@@ -32,6 +34,7 @@ public class PoolLinearAllocator {
         this.alignment = alignment;
         this.properties = properties;
         this.vmaFlags = vmaFlags;
+        this.alignmentMask = ~(alignment - 1);
 
         this.currentOffset = 0;
 
@@ -54,7 +57,7 @@ public class PoolLinearAllocator {
 
         long deviceAddress = buffer.get().hasDeviceAddress() ? buffer.get().deviceAddress() + currentOffset : 0;
         BufferRegion region = new BufferRegion(buffer, currentOffset, size, deviceAddress);
-        currentOffset = (currentOffset + size + alignment - 1) & ~(alignment - 1);
+        currentOffset = (currentOffset + size + alignment - 1) & alignmentMask;
 
         return region;
     }

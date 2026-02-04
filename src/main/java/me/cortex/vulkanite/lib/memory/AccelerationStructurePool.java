@@ -21,7 +21,9 @@ import static org.lwjgl.vulkan.VK10.*;
 public class AccelerationStructurePool {
     private static final int PAGE_SIZE = 1024;
     private static final int BLOCK_NUM_PAGES = 128 * 1024;
-    private static final int BUFFER_USAGE = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR;
+    private static final int BUFFER_USAGE = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR
+            | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+            | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR;
 
     public static class Block {
         private final VRef<VBuffer> buffer;
@@ -42,14 +44,13 @@ public class AccelerationStructurePool {
 
         private int allocate_n_pages(int count) {
             int pos = vacant.nextSetBit(0);
-            outer: while (pos != -1) {
-                for (int offset = 1; offset < count; offset++) {
-                    if (!vacant.get(offset + pos)) {
-                        pos = vacant.nextSetBit(offset + pos + 1);
-                        continue outer;
-                    }
+            while (pos != -1) {
+                int endPos = pos + count;
+                int nextClear = vacant.nextClearBit(pos);
+                if (nextClear >= endPos) {
+                    break;
                 }
-                break;
+                pos = vacant.nextSetBit(nextClear + 1);
             }
             if (pos == -1) {
                 throw new IllegalStateException();
@@ -136,12 +137,12 @@ public class AccelerationStructurePool {
         try (var stack = stackPush()) {
             LongBuffer pAccelerationStructure = stack.mallocLong(1);
             _CHECK_(vkCreateAccelerationStructureKHR(ctx.device, VkAccelerationStructureCreateInfoKHR
-                            .calloc(stack)
-                            .sType$Default()
-                            .type(type)
-                            .size(size)
-                            .buffer(block.buffer.get().buffer())
-                            .offset(offset), null, pAccelerationStructure),
+                    .calloc(stack)
+                    .sType$Default()
+                    .type(type)
+                    .size(size)
+                    .buffer(block.buffer.get().buffer())
+                    .offset(offset), null, pAccelerationStructure),
                     "Failed to create acceleration acceleration structure");
             structure = new AccelerationStructurePooled(ctx.device, pAccelerationStructure.get(0), block, offset, size);
         }

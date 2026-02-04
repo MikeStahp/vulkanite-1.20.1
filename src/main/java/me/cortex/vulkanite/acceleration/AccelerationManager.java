@@ -1,5 +1,7 @@
 package me.cortex.vulkanite.acceleration;
 
+import me.cortex.vulkanite.acceleration.blas.BLASBatchResult;
+import me.cortex.vulkanite.acceleration.blas.BLASBuildResult;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.cmd.VCmdBuff;
@@ -22,20 +24,20 @@ public class AccelerationManager {
     private final VContext ctx;
 
     private final AccelerationBlasBuilder blasBuilder;
-    private final ConcurrentLinkedDeque<AccelerationBlasBuilder.BLASBatchResult> blasResults = new ConcurrentLinkedDeque<>();
+    private final ConcurrentLinkedDeque<BLASBatchResult> blasResults = new ConcurrentLinkedDeque<>();
 
     private final AccelerationTLASManager tlasManager;
 
     public AccelerationManager(VContext context, int blasBuildQueue) {
         this.ctx = context;
         this.blasBuilder = new AccelerationBlasBuilder(context, blasBuildQueue, blasResults::add);
-        this.tlasManager = new AccelerationTLASManager(context, 0);//TODO: pick the main queue or something? (maybe can do the blasBuildQueue)
+        this.tlasManager = new AccelerationTLASManager(context, 0);// TODO: pick the main queue or something? (maybe can
+                                                                   // do the blasBuildQueue)
     }
 
     public void chunkBuilds(List<ChunkBuildOutput> results) {
         blasBuilder.enqueue(results);
     }
-
 
     public void setEntityData(List<Pair<RenderLayer, BufferBuilder.BuiltBuffer>> data) {
         tlasManager.setEntityData(data);
@@ -43,11 +45,12 @@ public class AccelerationManager {
 
     private final List<Long> blasExecutions = new LinkedList<>();
 
-    //This updates the tlas internal structure, DOES NOT INCLUDING BUILDING THE TLAS
+    // This updates the tlas internal structure, DOES NOT INCLUDING BUILDING THE
+    // TLAS
     public void updateTick() {
-        if (!blasResults.isEmpty()) {//If there are results
-            //Atomicly collect the results from the queue
-            List<AccelerationBlasBuilder.BLASBuildResult> results = new LinkedList<>();
+        if (!blasResults.isEmpty()) {// If there are results
+            // Atomicly collect the results from the queue
+            List<BLASBuildResult> results = new LinkedList<>();
             while (!blasResults.isEmpty()) {
                 var batch = blasResults.poll();
                 results.addAll(batch.results());
