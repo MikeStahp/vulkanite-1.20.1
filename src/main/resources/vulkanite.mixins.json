@@ -8,6 +8,7 @@
     "iris.MixinCommonUniforms",
     "iris.MixinGlResource",
     "iris.MixinGlTexture",
+    "iris.MixinGlImage",
     "iris.MixinNativeImageBackedTexture",
     "iris.MixinIrisRenderingPipeline",
     "iris.MixinPackRenderTargetDirectives",

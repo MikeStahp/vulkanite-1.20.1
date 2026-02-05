@@ -82,4 +82,16 @@ public final class PipelineDescriptorSets {
         }
         return new ShaderReflection.Set(new ArrayList<>(Arrays.asList(bindings)));
     }
+
+    /**
+     * Creates the expected ReSTIR reservoir descriptor set layout.
+     * Supports storage images for temporal/spatial resampling (reservoirA_Sampler,
+     * reservoirB_Sampler).
+     */
+    public static ShaderReflection.Set createReSTIRSetExpected() {
+        return new ShaderReflection.Set(new ShaderReflection.Binding[] {
+                new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                new ShaderReflection.Binding("", 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+        });
+    }
 }

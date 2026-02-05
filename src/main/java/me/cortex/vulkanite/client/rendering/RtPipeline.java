@@ -8,9 +8,10 @@ import me.cortex.vulkanite.lib.pipeline.VRaytracePipeline;
  * indices.
  */
 public record RtPipeline(
-        VRef<VRaytracePipeline> pipeline,
-        int commonSet,
-        int geomSet,
-        int customTexSet,
-        int ssboSet) {
+                VRef<VRaytracePipeline> pipeline,
+                int commonSet,
+                int geomSet,
+                int customTexSet,
+                int ssboSet,
+                int restirSet) {
 }

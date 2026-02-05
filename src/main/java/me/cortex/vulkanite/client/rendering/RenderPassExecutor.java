@@ -147,6 +147,32 @@ public final class RenderPassExecutor {
             sets.set(ssboSetIdx, ssboSet);
         }
 
+        // ReSTIR reservoir set binding
+        int restirSetIdx = record.restirSet();
+        if (restirSetIdx != -1) {
+            var restirSet = Vulkanite.INSTANCE.getPoolByLayout(layouts.get(restirSetIdx)).get().allocateSet();
+            var updater = new DescriptorUpdateBuilder(ctx, reflection.getSet(restirSetIdx)).set(restirSet);
+
+            // ReSTIR reservoirs are the last 2 custom textures, bound as storage images
+            int reservoirStartIdx = customTextureViews.length - 2;
+            if (reservoirStartIdx >= 0 && customTextureViews.length >= 2) {
+                var reservoirAView = customTextureViews[reservoirStartIdx].getView();
+                var reservoirBView = customTextureViews[reservoirStartIdx + 1].getView();
+                if (reservoirAView != null && reservoirBView != null) {
+                    updater.imageStore(0, reservoirAView);
+                    updater.imageStore(1, reservoirBView);
+                    updater.apply();
+                    sets.set(restirSetIdx, restirSet);
+                } else {
+                    System.err.println("[Vulkanite] WARNING: ReSTIR reservoir views are null, skipping binding");
+                }
+            } else {
+                System.err
+                        .println("[Vulkanite] WARNING: Not enough custom textures for ReSTIR reservoirs (need 2, have "
+                                + customTextureViews.length + ")");
+            }
+        }
+
         // Fill gaps with empty descriptor sets
         for (int i = 0; i < layoutCount; i++) {
             if (sets.get(i) == null) {
