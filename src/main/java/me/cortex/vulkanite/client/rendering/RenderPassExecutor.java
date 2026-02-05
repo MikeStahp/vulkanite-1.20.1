@@ -34,6 +34,8 @@ public final class RenderPassExecutor {
 
     // Reusable list for output image views to avoid per-frame allocations
     private final List<VRef<VImageView>> outImgViewListCache = new ArrayList<>(16);
+    // Reusable list for descriptor sets to avoid per-frame allocations
+    private final List<VRef<VDescriptorSet>> setsCache = new ArrayList<>();
 
     public RenderPassExecutor(VContext ctx, AccelerationManager accelerationManager,
             VRef<VSampler> sampler, VRef<VSampler> ctexSampler) {
@@ -70,10 +72,12 @@ public final class RenderPassExecutor {
 
         var layouts = reflection.getLayouts();
         int layoutCount = layouts.size();
-        var sets = new ArrayList<VRef<VDescriptorSet>>(layoutCount);
+
+        setsCache.clear();
         for (int i = 0; i < layoutCount; i++) {
-            sets.add(null);
+            setsCache.add(null);
         }
+        var sets = setsCache;
 
         int commonSetIdx = record.commonSet();
         if (commonSetIdx != -1) {
