@@ -25,6 +25,7 @@
     "sodium.MixinRenderSectionManager",
     "sodium.PendingSectionUploadAccessor",
     "sodium.chunk.MixinChunkBuildResult",
+    "sodium.chunk.MixinChunkBuildOutput",
     "sodium.chunk.MixinChunkRenderRebuildTask",
     "sodium.chunk.VertexFormatAccessor",
     "sodium.gl.MixinCommandList",

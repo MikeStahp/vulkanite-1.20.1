@@ -1,12 +1,15 @@
 package me.cortex.vulkanite.client;
 
 import me.cortex.vulkanite.acceleration.AccelerationManager;
+import me.cortex.vulkanite.client.rendering.LightManager;
+import me.cortex.vulkanite.mixin.sodium.RenderSectionManagerAccessor;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.base.initalizer.VInitializer;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorPool;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorSetLayout;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSection;
+import me.jellysquid.mods.sodium.client.render.chunk.RenderSectionManager;
 import me.jellysquid.mods.sodium.client.render.chunk.compile.ChunkBuildOutput;
 import net.minecraft.util.Util;
 import org.lwjgl.opengl.GL20;
@@ -48,6 +51,8 @@ public class Vulkanite {
     private final ArbitarySyncPointCallback fencedCallback = new ArbitarySyncPointCallback();
 
     private final AccelerationManager accelerationManager;
+    private final LightManager lightManager;
+    private RenderSectionManager renderSectionManager;
     private final HashMap<VDescriptorSetLayout, VRef<VDescriptorPool>> descriptorPools = new HashMap<>();
 
     public Vulkanite() {
@@ -71,6 +76,19 @@ public class Vulkanite {
         // SharedQuadVkIndexBuffer.getIndexBuffer(ctx, 30000);
 
         accelerationManager = new AccelerationManager(ctx, 1);
+        lightManager = new LightManager(ctx);
+    }
+
+    public void setRenderSectionManager(RenderSectionManager manager) {
+        this.renderSectionManager = manager;
+    }
+
+    public RenderSectionManager getRenderSectionManager() {
+        return renderSectionManager;
+    }
+
+    public LightManager getLightManager() {
+        return lightManager;
     }
 
     public void upload(List<ChunkBuildOutput> results) {
@@ -106,6 +124,13 @@ public class Vulkanite {
     public void renderTick() {
         ctx.sync.checkFences();
         accelerationManager.updateTick();
+
+        if (renderSectionManager != null) {
+            var map = ((RenderSectionManagerAccessor)renderSectionManager).getSectionByPosition();
+            if (map != null) {
+                lightManager.update(map.values());
+            }
+        }
     }
 
     public void fenceTick() {
@@ -123,6 +148,7 @@ public class Vulkanite {
     public void destroy() {
         vkDeviceWaitIdle(ctx.device);
         descriptorPools.clear();
+        lightManager.destroy();
     }
 
     private static VContext createVulkanContext() {

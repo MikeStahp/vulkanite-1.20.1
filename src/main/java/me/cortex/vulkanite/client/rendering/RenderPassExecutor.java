@@ -2,6 +2,7 @@ package me.cortex.vulkanite.client.rendering;
 
 import me.cortex.vulkanite.acceleration.AccelerationManager;
 import me.cortex.vulkanite.client.Vulkanite;
+import me.cortex.vulkanite.client.rendering.LightManager;
 import me.cortex.vulkanite.compat.IVGBuffer;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
@@ -138,6 +139,9 @@ public final class RenderPassExecutor {
 
             for (ShaderStorageBuffer ssbo : ssbos) {
                 updater.buffer(ssbo.getIndex(), new VRef<>(((IVGBuffer) ssbo).getBuffer().get()));
+            }
+            if (Vulkanite.INSTANCE.getLightManager() != null) {
+                updater.buffer(LightManager.LIGHT_SSBO_BINDING, Vulkanite.INSTANCE.getLightManager().getBuffer());
             }
             updater.apply();
             sets.set(ssboSetIdx, ssboSet);

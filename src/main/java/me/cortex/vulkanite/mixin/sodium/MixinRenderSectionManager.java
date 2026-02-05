@@ -2,7 +2,9 @@ package me.cortex.vulkanite.mixin.sodium;
 
 import it.unimi.dsi.fastutil.longs.Long2ReferenceMap;
 import it.unimi.dsi.fastutil.objects.Reference2ReferenceLinkedOpenHashMap;
+import me.cortex.vulkanite.client.rendering.Light;
 import me.cortex.vulkanite.compat.IAccelerationBuildResult;
+import me.cortex.vulkanite.compat.ILightHolder;
 import me.cortex.vulkanite.client.Vulkanite;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSection;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSectionManager;
@@ -17,10 +19,16 @@ import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import java.util.ArrayList;
+import java.util.List;
 
 @Mixin(value = RenderSectionManager.class, remap = false)
 public abstract class MixinRenderSectionManager {
     @Shadow @Final private Long2ReferenceMap<RenderSection> sectionByPosition;
+
+    @Inject(method = "<init>", at = @At("RETURN"))
+    private void init(CallbackInfo ci) {
+        Vulkanite.INSTANCE.setRenderSectionManager((RenderSectionManager)(Object)this);
+    }
 
     @Inject(method = "destroy", at = @At("HEAD"))
     private void onDestroy(CallbackInfo ci) {
@@ -41,8 +49,12 @@ public abstract class MixinRenderSectionManager {
     private void processResults(ArrayList<ChunkBuildOutput> results, CallbackInfo ci) {
         Reference2ReferenceLinkedOpenHashMap<RenderSection, ChunkBuildOutput> map = new Reference2ReferenceLinkedOpenHashMap<>();
         for(ChunkBuildOutput output : results) {
-            if (((IAccelerationBuildResult)output).getAccelerationGeometryData() == null)
+            boolean hasGeometry = ((IAccelerationBuildResult)output).getAccelerationGeometryData() != null;
+            boolean hasLights = ((ILightHolder)output).getLights() != null && !((ILightHolder)output).getLights().isEmpty();
+
+            if (!hasGeometry && !hasLights)
                 continue;
+
             if (!output.render.isDisposed() && output.render.getLastBuiltFrame() <= output.buildTime) {
                 RenderSection render = output.render;
                 ChunkBuildOutput previous = map.get(render);
@@ -52,6 +64,10 @@ public abstract class MixinRenderSectionManager {
             }
         }
         if (!map.values().isEmpty()) {
+            for (ChunkBuildOutput output : map.values()) {
+                 List<Light> lights = ((ILightHolder) output).getLights();
+                 ((ILightHolder) output.render).setLights(lights);
+            }
             Vulkanite.INSTANCE.upload(new ArrayList<>(map.values()));
         }
     }
