@@ -10,7 +10,7 @@ import static org.lwjgl.vulkan.VK10.VK_OBJECT_TYPE_BUFFER;
 import static org.lwjgl.vulkan.VK10.VK_OBJECT_TYPE_IMAGE;
 
 public class VImage extends VObject {
-    protected VmaAllocator.ImageAllocation allocation;
+    protected ImageAllocation allocation;
     public final int width;
     public final int height;
     public final int depth;
@@ -19,7 +19,7 @@ public class VImage extends VObject {
 
     public final int dimensions;
 
-    protected VImage(VmaAllocator.ImageAllocation allocation, int width, int height, int depth, int mipLayers, int format) {
+    protected VImage(ImageAllocation allocation, int width, int height, int depth, int mipLayers, int format) {
         this.allocation = allocation;
         this.width = width;
         this.height = height;
@@ -39,7 +39,7 @@ public class VImage extends VObject {
         this.dimensions = dimensions;
     }
 
-    public static VRef<VImage> create(VmaAllocator.ImageAllocation allocation, int width, int height, int depth, int mipLayers, int format) {
+    public static VRef<VImage> create(ImageAllocation allocation, int width, int height, int depth, int mipLayers, int format) {
         return new VRef<>(new VImage(allocation, width, height, depth, mipLayers, format));
     }
 

@@ -9,15 +9,15 @@ import static org.lwjgl.vulkan.VK10.VK_OBJECT_TYPE_BUFFER;
 import static org.lwjgl.vulkan.VK10.VK_WHOLE_SIZE;
 
 public class VBuffer extends VObject {
-    private VmaAllocator.BufferAllocation allocation;
+    private BufferAllocation allocation;
     private final VkDeviceOrHostAddressConstKHR deviceAddressConst;
     private final int usage;
 
-    public static VRef<VBuffer> create(VmaAllocator.BufferAllocation allocation, int usage) {
+    public static VRef<VBuffer> create(BufferAllocation allocation, int usage) {
         return new VRef<>(new VBuffer(allocation, usage));
     }
 
-    protected VBuffer(VmaAllocator.BufferAllocation allocation, int usage) {
+    protected VBuffer(BufferAllocation allocation, int usage) {
         this.allocation = allocation;
         if (allocation.deviceAddress != -1) {
             this.deviceAddressConst = VkDeviceOrHostAddressConstKHR.calloc()

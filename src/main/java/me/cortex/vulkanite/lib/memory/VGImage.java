@@ -11,14 +11,14 @@ public class VGImage extends VImage {
     public final int glFormat;
     private final long vkMemory;
 
-    protected VGImage(VmaAllocator.ImageAllocation allocation, int width, int height, int depth, int mipLayers, int format, int glFormat, int glId) {
+    protected VGImage(ImageAllocation allocation, int width, int height, int depth, int mipLayers, int format, int glFormat, int glId) {
         super(allocation, width, height, depth, mipLayers, format);
         this.glId = glId;
         this.glFormat = glFormat;
         this.vkMemory = allocation.ai.deviceMemory();
     }
 
-    public static VRef<VGImage> create(VmaAllocator.ImageAllocation allocation, int width, int height, int depth, int mipLayers, int format, int glFormat, int glId) {
+    public static VRef<VGImage> create(ImageAllocation allocation, int width, int height, int depth, int mipLayers, int format, int glFormat, int glId) {
         return new VRef<>(new VGImage(allocation, width, height, depth, mipLayers, format, glFormat, glId));
     }
 

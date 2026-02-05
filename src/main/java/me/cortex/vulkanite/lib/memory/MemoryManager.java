@@ -64,7 +64,7 @@ public class MemoryManager {
         private static final HashMap<Long, HandleDescriptorTracked> MEMORY_TO_HANDLES = new HashMap<>();
 
         // Get the GL memory associated with the given vulkan memory object
-        public static int acquire(VmaAllocator.Allocation allocation, VkDevice device, boolean dedicated) {
+        public static int acquire(Allocation allocation, VkDevice device, boolean dedicated) {
             synchronized (MEMORY_TO_HANDLES) {
                 long vkMemory = allocation.ai.deviceMemory();
                 if (!MEMORY_TO_HANDLES.containsKey(vkMemory)) {
@@ -159,7 +159,7 @@ public class MemoryManager {
                 }
             }
         }
-    };
+    }
 
     public VRef<VGBuffer> createSharedBuffer(long size, int usage, int properties) {
         try (var stack = stackPush()) {
