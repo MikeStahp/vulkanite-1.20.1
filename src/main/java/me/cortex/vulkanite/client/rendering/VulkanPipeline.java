@@ -523,7 +523,6 @@ public class VulkanPipeline {
     public void destory() {
         vkDeviceWaitIdle(ctx.device);
         ctx.cmd.newFrame();
-        System.gc();
     }
 
 }
