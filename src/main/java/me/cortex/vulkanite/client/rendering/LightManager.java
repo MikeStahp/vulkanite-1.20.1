@@ -26,6 +26,7 @@ public class LightManager {
 
     private final VContext ctx;
     private VRef<VBuffer> lightBuffer;
+    private boolean isDestroyed = false;
 
     public LightManager(VContext ctx) {
         this.ctx = ctx;
@@ -38,14 +39,20 @@ public class LightManager {
     }
 
     public VRef<VBuffer> getBuffer() {
+        if (isDestroyed || lightBuffer == null) return null;
         return lightBuffer.addRef();
     }
 
     public void destroy() {
+        if (isDestroyed) return;
+        isDestroyed = true;
         lightBuffer.close();
+        lightBuffer = null;
     }
 
     public void update(Collection<RenderSection> visibleSections) {
+        if (isDestroyed || lightBuffer == null) return;
+
         List<Light> allLights = new ArrayList<>();
 
         // 1. Sun/Sky Light
