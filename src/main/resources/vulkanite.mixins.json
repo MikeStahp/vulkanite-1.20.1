@@ -23,6 +23,7 @@
     "sodium.MixinRenderRegionManager",
     "sodium.MixinRenderSection",
     "sodium.MixinRenderSectionManager",
+    "sodium.RenderSectionManagerAccessor",
     "sodium.PendingSectionUploadAccessor",
     "sodium.chunk.MixinChunkBuildResult",
     "sodium.chunk.MixinChunkBuildOutput",
