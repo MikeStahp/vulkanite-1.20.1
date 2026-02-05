@@ -176,6 +176,12 @@ public class VulkanPipeline {
             var geomSetExpected = PipelineDescriptorSets.createGeomSetExpected();
             var customTexSetExpected = PipelineDescriptorSets.createCustomTexSetExpected(customTextureViews.length);
             var ssboSetExpected = PipelineDescriptorSets.createSsboSetExpected(ssboIds);
+            var restirSetExpected = PipelineDescriptorSets.createReSTIRSetExpected();
+
+            // Debug logging for descriptor set validation
+            System.out.println(
+                    "[Vulkanite Debug] SSBO IDs from shaders.properties: " + java.util.Arrays.toString(ssboIds));
+            System.out.println("[Vulkanite Debug] Expected SSBO set: " + ssboSetExpected);
 
             for (int i = 0; i < passes.length; i++) {
                 var builder = new RaytracePipelineBuilder();
@@ -187,6 +193,7 @@ public class VulkanPipeline {
                 int geomSet = -1;
                 int customTexSet = -1;
                 int ssboSet = -1;
+                int restirSet = -1;
 
                 for (int setIdx = 0; setIdx < pipe.get().reflection.getNSets(); setIdx++) {
                     var set = pipe.get().reflection.getSet(setIdx);
@@ -200,13 +207,28 @@ public class VulkanPipeline {
                         customTexSet = setIdx;
                     } else if (set.validate(ssboSetExpected)) {
                         ssboSet = setIdx;
+                    } else if (set.validate(restirSetExpected)) {
+                        restirSet = setIdx;
                     } else {
+                        System.err
+                                .println("[Vulkanite Debug] Set " + setIdx + " validation failed. Actual set: " + set);
+                        System.err.println("[Vulkanite Debug] Does NOT match commonSet: "
+                                + set.validate(commonSetExpected) + " or " + set.validate(commonSetExpectedSingle));
+                        System.err
+                                .println("[Vulkanite Debug] Does NOT match geomSet: " + set.validate(geomSetExpected));
+                        System.err.println(
+                                "[Vulkanite Debug] Does NOT match customTexSet: " + set.validate(customTexSetExpected));
+                        System.err
+                                .println("[Vulkanite Debug] Does NOT match ssboSet: " + set.validate(ssboSetExpected));
+                        System.err
+                                .println("[Vulkanite Debug] Does NOT match restirSet: "
+                                        + set.validate(restirSetExpected));
                         throw new RuntimeException("Raytracing pipeline " + i
                                 + " has an unexpected descriptor set layout at set " + setIdx + ". Actual: " + set);
                     }
                 }
 
-                raytracePipelines.add(new RtPipeline(pipe, commonSet, geomSet, customTexSet, ssboSet));
+                raytracePipelines.add(new RtPipeline(pipe, commonSet, geomSet, customTexSet, ssboSet, restirSet));
             }
 
         } catch (Exception e) {
