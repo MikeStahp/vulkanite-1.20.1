@@ -27,13 +27,17 @@ import java.util.List;
 
 @Mixin(value = ChunkBuilderMeshingTask.class, remap = false)
 public class MixinChunkRenderRebuildTask {
-    @Shadow @Final private RenderSection render;
+    @Shadow
+    @Final
+    private RenderSection render;
 
     @Inject(method = "execute(Lme/jellysquid/mods/sodium/client/render/chunk/compile/ChunkBuildContext;Lme/jellysquid/mods/sodium/client/util/task/CancellationToken;)Lme/jellysquid/mods/sodium/client/render/chunk/compile/ChunkBuildOutput;", at = @At("TAIL"))
-    private void performExtraBuild(ChunkBuildContext buildContext, CancellationToken cancellationToken, CallbackInfoReturnable<ChunkBuildOutput> cir) {
+    private void performExtraBuild(ChunkBuildContext buildContext, CancellationToken cancellationToken,
+            CallbackInfoReturnable<ChunkBuildOutput> cir) {
         if (IrisApi.getInstance().isShaderPackInUse()) {
             var buildResult = cir.getReturnValue();
-            ((IAccelerationBuildResult) buildResult).setVertexFormat(((VertexFormatAccessor) buildContext.buffers).getVertexType());
+            ((IAccelerationBuildResult) buildResult)
+                    .setVertexFormat(((VertexFormatAccessor) buildContext.buffers).getVertexType());
             SodiumResultAdapter.compute(buildResult);
 
             // Light Collection Logic
@@ -42,11 +46,12 @@ public class MixinChunkRenderRebuildTask {
             int originY = this.render.getChunkY() << 4;
             int originZ = this.render.getChunkZ() << 4;
 
-            BlockView slice = (BlockView) buildContext.cache;
+            BlockView slice = buildContext.cache.getWorldSlice();
             BlockPos.Mutable pos = new BlockPos.Mutable();
 
             for (int y = 0; y < 16; y++) {
-                if (cancellationToken.isCancelled()) return;
+                if (cancellationToken.isCancelled())
+                    return;
                 for (int z = 0; z < 16; z++) {
                     for (int x = 0; x < 16; x++) {
                         int absX = originX + x;
