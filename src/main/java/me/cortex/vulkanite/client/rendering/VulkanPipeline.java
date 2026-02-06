@@ -1,7 +1,6 @@
 package me.cortex.vulkanite.client.rendering;
 
 import me.cortex.vulkanite.acceleration.AccelerationManager;
-import me.cortex.vulkanite.client.Vulkanite;
 import me.cortex.vulkanite.compat.IVGImage;
 import me.cortex.vulkanite.compat.RaytracingShaderSet;
 import me.cortex.vulkanite.lib.base.VContext;
@@ -47,6 +46,7 @@ public class VulkanPipeline {
 
     private final SharedImageViewTracker[] irisRenderTargetViews;
     private final SharedImageViewTracker[] customTextureViews;
+    private final SharedImageViewTracker[] customImageViews;
     private final SharedImageViewTracker blockAtlasView;
     private final SharedImageViewTracker blockAtlasNormalView;
     private final SharedImageViewTracker blockAtlasSpecularView;
@@ -65,7 +65,7 @@ public class VulkanPipeline {
     private final RenderPassExecutor renderPassExecutor;
 
     public VulkanPipeline(VContext ctx, AccelerationManager accelerationManager, RaytracingShaderSet[] passes,
-            int[] ssboIds, List<VRef<VGImage>> customTextures) {
+            int[] ssboIds, List<VRef<VGImage>> customTextures, List<VRef<VGImage>> customImages) {
         this.ctx = ctx;
         this.accelerationManager = accelerationManager;
 
@@ -75,6 +75,14 @@ public class VulkanPipeline {
             int index = i;
             this.customTextureViews[i] = new SharedImageViewTracker(ctx,
                     () -> new VRef<>(customTextures.get(index).get()));
+        }
+
+        // Initialize custom image views (Storage images like Reservoirs)
+        this.customImageViews = new SharedImageViewTracker[customImages.size()];
+        for (int i = 0; i < customImages.size(); i++) {
+            int index = i;
+            this.customImageViews[i] = new SharedImageViewTracker(ctx,
+                    () -> new VRef<>(customImages.get(index).get()));
         }
 
         // Initialize Iris render target views
@@ -342,7 +350,7 @@ public class VulkanPipeline {
                 renderPassExecutor.execute(cmd, record, uboBuffer.buffer(), uboBuffer.offset(), uboBuffer.size(),
                         tlas, blockAtlasView, blockAtlasNormalView, blockAtlasSpecularView,
                         placeholderNormalsView, placeholderSpecularView, irisRenderTargetViews,
-                        vgOutImgs, outImgs, customTextureViews, ssbos);
+                        vgOutImgs, outImgs, customTextureViews, customImageViews, ssbos);
             }
 
             // Transition images back to general layout
@@ -360,6 +368,11 @@ public class VulkanPipeline {
 
             for (SharedImageViewTracker customtexView : customTextureViews) {
                 cmd.encodeImageTransition(customtexView.getImage(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+            }
+
+            for (SharedImageViewTracker customImgView : customImageViews) {
+                cmd.encodeImageTransition(customImgView.getImage(), VK_IMAGE_LAYOUT_GENERAL,
                         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
             }
 

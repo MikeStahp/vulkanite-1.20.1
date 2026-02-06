@@ -10,7 +10,7 @@ import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.memory.VGImage;
 import net.irisshaders.iris.gl.buffer.ShaderStorageBuffer;
 import net.irisshaders.iris.gl.image.GlImage;
-import java.util.Map;
+import java.util.Set;
 import net.irisshaders.iris.gl.texture.TextureAccess;
 import net.irisshaders.iris.gl.buffer.ShaderStorageBufferHolder;
 import net.irisshaders.iris.mixin.LevelRendererAccessor;
@@ -48,7 +48,7 @@ public class MixinIrisRenderingPipeline {
     private ShaderStorageBufferHolder shaderStorageBufferHolder;
     @Shadow
     @Final
-    private Map<String, GlImage> customImages;
+    private Set<GlImage> customImages;
 
     @Shadow
     @Final
@@ -82,10 +82,10 @@ public class MixinIrisRenderingPipeline {
         if (customImages == null || customImages.isEmpty()) {
             return new ArrayList<>();
         }
-        // Sort by key name to ensure consistent ordering
-        return customImages.entrySet().stream()
-                .sorted(Map.Entry.comparingByKey())
-                .map(entry -> ((IVGImage) entry.getValue()).getVGImage())
+        // Sort by name to ensure consistent ordering
+        return customImages.stream()
+                .sorted(Comparator.comparing(GlImage::getName))
+                .map(img -> ((IVGImage) (Object) img).getVGImage())
                 .filter(img -> img != null)
                 .toList();
     }

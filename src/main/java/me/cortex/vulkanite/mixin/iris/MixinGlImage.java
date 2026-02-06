@@ -25,6 +25,9 @@ public abstract class MixinGlImage implements IVGImage {
     private VRef<VGImage> sharedImage;
 
     @Shadow
+    public abstract String getName();
+
+    @Shadow
     public abstract int getId();
 
     @Shadow
@@ -38,9 +41,8 @@ public abstract class MixinGlImage implements IVGImage {
         return -1;
     }
 
-    @Redirect(method = "<init>", at = @At(value = "INVOKE", target = "Lnet/irisshaders/iris/gl/image/GlImage;getId()I", ordinal = 0))
-    private int redirectImageCreation(GlImage instance, String name, int width, int height,
-            InternalTextureFormat internalFormat) {
+    @Inject(method = "<init>", at = @At("TAIL"))
+    private void onConstructed(String name, int width, int height, InternalTextureFormat internalFormat, CallbackInfo ci) {
         int vkFormat = FormatConverter.getVkFormatFromGl(internalFormat);
 
         // Create shared image with storage usage for compute/raytracing read/write
@@ -61,8 +63,6 @@ public abstract class MixinGlImage implements IVGImage {
             cmdbuf.encodeImageTransition(new VRef<>(sharedImage.get()), VK_IMAGE_LAYOUT_UNDEFINED,
                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
         });
-
-        return sharedImage.get().glId;
     }
 
     @Inject(method = "destroy", at = @At("HEAD"))

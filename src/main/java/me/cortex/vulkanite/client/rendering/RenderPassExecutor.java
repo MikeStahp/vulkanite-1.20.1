@@ -65,6 +65,7 @@ public final class RenderPassExecutor {
             List<VRef<VGImage>> vgOutImgs,
             List<VRef<VImage>> outImgs,
             SharedImageViewTracker[] customTextureViews,
+            SharedImageViewTracker[] customImageViews,
             ShaderStorageBuffer[] ssbos) {
 
         var pipeline = record.pipeline();
@@ -153,11 +154,11 @@ public final class RenderPassExecutor {
             var restirSet = Vulkanite.INSTANCE.getPoolByLayout(layouts.get(restirSetIdx)).get().allocateSet();
             var updater = new DescriptorUpdateBuilder(ctx, reflection.getSet(restirSetIdx)).set(restirSet);
 
-            // ReSTIR reservoirs are the last 2 custom textures, bound as storage images
-            int reservoirStartIdx = customTextureViews.length - 2;
-            if (reservoirStartIdx >= 0 && customTextureViews.length >= 2) {
-                var reservoirAView = customTextureViews[reservoirStartIdx].getView();
-                var reservoirBView = customTextureViews[reservoirStartIdx + 1].getView();
+            // ReSTIR reservoirs are the first 2 custom images (reservoirA, reservoirB
+            // sorted alphabetically)
+            if (customImageViews.length >= 2) {
+                var reservoirAView = customImageViews[0].getView();
+                var reservoirBView = customImageViews[1].getView();
                 if (reservoirAView != null && reservoirBView != null) {
                     updater.imageStore(0, reservoirAView);
                     updater.imageStore(1, reservoirBView);
@@ -168,8 +169,8 @@ public final class RenderPassExecutor {
                 }
             } else {
                 System.err
-                        .println("[Vulkanite] WARNING: Not enough custom textures for ReSTIR reservoirs (need 2, have "
-                                + customTextureViews.length + ")");
+                        .println("[Vulkanite] WARNING: Not enough custom images for ReSTIR reservoirs (need 2, have "
+                                + customImageViews.length + ")");
             }
         }
 
