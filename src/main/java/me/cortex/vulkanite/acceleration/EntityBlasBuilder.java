@@ -30,8 +30,26 @@ import static org.lwjgl.vulkan.VK10.*;
 public class EntityBlasBuilder {
     private final VContext ctx;
 
+    @SuppressWarnings("unchecked")
+    private final VRef<VBuffer>[] reusedGeometryBuffers = new VRef[3];
+    @SuppressWarnings("unchecked")
+    private final VRef<VBuffer>[] reusedStagingBuffers = new VRef[3];
+    private int bufferIndex = 0;
+
     public EntityBlasBuilder(VContext context) {
         this.ctx = context;
+    }
+
+    private VRef<VBuffer> ensureBuffer(VRef<VBuffer> buffer, long size, int usage, int properties, long alignment, int vmaFlags) {
+        if (buffer != null) {
+            if (buffer.get().size() >= size) {
+                return buffer;
+            }
+            buffer.close();
+        }
+        // Allocate slightly more to avoid frequent resizing
+        long newSize = (long) (size * 1.5);
+        return ctx.memory.createBuffer(newSize, usage, properties, alignment, vmaFlags);
     }
 
     private static VRef<VAccelerationStructure> executeBlasBuild(VContext ctx, VCmdBuff cmd, MemoryStack stack, VkAccelerationStructureGeometryKHR.Buffer geometryInfos, int[] prims) {
@@ -88,6 +106,8 @@ public class EntityBlasBuilder {
     }
 
     List<BLASResult> buildBlas(List<Pair<RenderLayer, BufferBuilder.BuiltBuffer>> renders, VCmdBuff cmd) {
+        bufferIndex = (bufferIndex + 1) % 3;
+
         long combined_size = 0;
         TextureManager textureManager = MinecraftClient.getInstance().getTextureManager();
         for (var type : renders) {
@@ -108,16 +128,19 @@ public class EntityBlasBuilder {
         //Each render layer gets its own geometry entry in the blas
 
         //TODO: PUT THE BINDLESS TEXTURE REFERENCE AT THE START OF THE render layers geometry buffer
-        var geometryBufferStaging = ctx.memory.createBuffer(
-                combined_size,
+        reusedStagingBuffers[bufferIndex] = ensureBuffer(reusedStagingBuffers[bufferIndex], combined_size,
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                 0,
                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
-        var geometryBuffer = ctx.memory.createBuffer(
-                combined_size,
+        var geometryBufferStaging = reusedStagingBuffers[bufferIndex];
+
+        reusedGeometryBuffers[bufferIndex] = ensureBuffer(reusedGeometryBuffers[bufferIndex], combined_size,
                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                0, 0);
+        var geometryBuffer = reusedGeometryBuffers[bufferIndex];
+
         long ptr = geometryBufferStaging.get().map();
         long offset = 0;
         List<BuildInfo> infos = new ArrayList<>();
@@ -135,7 +158,7 @@ public class EntityBlasBuilder {
 
         cmd.encodeBufferCopy(geometryBufferStaging, 0, geometryBuffer, 0, combined_size);
         cmd.encodeBufferBarrier(geometryBuffer, 0, combined_size, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
-        geometryBufferStaging.close();
+        // geometryBufferStaging is now reused, so we don't close it here
 
         VRef<VAccelerationStructure> blas;
         try (var stack = MemoryStack.stackPush()) {
@@ -145,7 +168,7 @@ public class EntityBlasBuilder {
             blas = executeBlasBuild(ctx, cmd, stack, buildInfo, primitiveCounts);
         }
 
-        return List.of(new BLASResult(blas, geometryBuffer, offsets));
+        return List.of(new BLASResult(blas, geometryBuffer.addRef(), offsets));
     }
 
     private VkAccelerationStructureGeometryKHR.Buffer populateBuildStructs(VContext ctx, MemoryStack stack, VCmdBuff cmdBuff, List<BuildInfo> geometries, int[] primitiveCounts) {
