@@ -13,12 +13,14 @@ public class VAccelerationStructure extends VObject {
     private final VRef<VBuffer> buffer;
 
     public final long deviceAddress;
+    public final long size;
     private final VkDevice device;
 
     protected VAccelerationStructure(VkDevice device, long structure, final VRef<VBuffer> buffer) {
         this.device = device;
         this.buffer = buffer.addRef();
         this.structure = structure;
+        this.size = buffer.get().size();
         try (MemoryStack stack = MemoryStack.stackPush()){
             deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(device,
                     VkAccelerationStructureDeviceAddressInfoKHR
