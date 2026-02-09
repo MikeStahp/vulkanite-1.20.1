@@ -29,62 +29,84 @@ import static org.lwjgl.vulkan.VK10.*;
 
 public class EntityBlasBuilder {
     private final VContext ctx;
+    private final FrameData[] frames = new FrameData[3];
+    private int frameIndex = 0;
 
     public EntityBlasBuilder(VContext context) {
         this.ctx = context;
+        for (int i = 0; i < frames.length; i++) {
+            frames[i] = new FrameData();
+        }
     }
 
-    private static VRef<VAccelerationStructure> executeBlasBuild(VContext ctx, VCmdBuff cmd, MemoryStack stack, VkAccelerationStructureGeometryKHR.Buffer geometryInfos, int[] prims) {
-        var buildInfos = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
-        var buildRanges = VkAccelerationStructureBuildRangeInfoKHR.calloc(prims.length, stack);
-        for (int primCount : prims) {
-            buildRanges.get().primitiveCount(primCount);
+    public void free() {
+        for (FrameData frame : frames) {
+            frame.free();
+        }
+    }
+
+    private class FrameData {
+        private VRef<VBuffer> geometryStaging;
+        private VRef<VBuffer> geometry;
+        private VRef<VAccelerationStructure> blas;
+        private VRef<VBuffer> scratch;
+
+        void free() {
+            if (geometryStaging != null) geometryStaging.close();
+            if (geometry != null) geometry.close();
+            if (blas != null) blas.close();
+            if (scratch != null) scratch.close();
         }
 
-        var bi = buildInfos.get()
-                .sType$Default()
-                .type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
-                .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR)
-                .pGeometries(geometryInfos)
-                .geometryCount(geometryInfos.remaining());
+        void ensureGeometry(long size) {
+            if (geometry == null || geometry.get().size() < size) {
+                if (geometry != null) geometry.close();
+                // 1.5x growth factor
+                long newSize = (long) (Math.max(size, geometry == null ? 0 : geometry.get().size()) * 1.5);
+                // Ensure at least the requested size if 1.5x is somehow smaller (e.g. 0 start)
+                newSize = Math.max(newSize, size);
 
-        VkAccelerationStructureBuildSizesInfoKHR buildSizesInfo = VkAccelerationStructureBuildSizesInfoKHR
-                .calloc(stack)
-                .sType$Default();
+                geometry = ctx.memory.createBuffer(
+                        newSize,
+                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            }
 
-        vkGetAccelerationStructureBuildSizesKHR(
-                ctx.device,
-                VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                bi,
-                prims,
-                buildSizesInfo);
+            if (geometryStaging == null || geometryStaging.get().size() < size) {
+                if (geometryStaging != null) geometryStaging.close();
+                long newSize = (long) (Math.max(size, geometryStaging == null ? 0 : geometryStaging.get().size()) * 1.5);
+                newSize = Math.max(newSize, size);
 
+                geometryStaging = ctx.memory.createBuffer(
+                        newSize,
+                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                        0,
+                        VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+            }
+        }
 
-        var structure = ctx.memory.createAcceleration(buildSizesInfo.accelerationStructureSize(), 256,
-                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+        void ensureBlas(long size, long scratchSize) {
+            if (blas == null || blas.get().size < size) {
+                if (blas != null) blas.close();
+                // 1.5x growth
+                long newSize = (long) (Math.max(size, blas == null ? 0 : blas.get().size) * 1.5);
+                newSize = Math.max(newSize, size);
 
-        var scratch = ctx.memory.createBuffer(buildSizesInfo.buildScratchSize(),
-                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 256, 0);
+                blas = ctx.memory.createAcceleration(newSize, 256,
+                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+            }
 
-        bi.scratchData(VkDeviceOrHostAddressKHR.calloc(stack).deviceAddress(scratch.get().deviceAddress()));
-        bi.dstAccelerationStructure(structure.get().structure);
+            if (scratch == null || scratch.get().size() < scratchSize) {
+                if (scratch != null) scratch.close();
+                long newSize = (long) (Math.max(scratchSize, scratch == null ? 0 : scratch.get().size()) * 1.5);
+                newSize = Math.max(newSize, scratchSize);
 
-        buildInfos.rewind();
-        buildRanges.rewind();
-
-        vkCmdBuildAccelerationStructuresKHR(cmd.buffer(), buildInfos, stack.pointers(buildRanges));
-
-        vkCmdPipelineBarrier(cmd.buffer(), VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, VkMemoryBarrier.calloc(1, stack)
-                .sType$Default()
-                .srcAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
-                .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR), null, null);
-
-        cmd.addAccelerationStructureRef(structure);
-        cmd.addBufferRef(scratch);
-        scratch.close();
-
-        return structure;
+                scratch = ctx.memory.createBuffer(newSize,
+                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 256, 0);
+            }
+        }
     }
 
     List<BLASResult> buildBlas(List<Pair<RenderLayer, BufferBuilder.BuiltBuffer>> renders, VCmdBuff cmd) {
@@ -105,19 +127,15 @@ public class EntityBlasBuilder {
             }
             combined_size += type.getRight().getVertexBuffer().remaining() + 256;//Add just some buffer so we can do alignment etc
         }
-        //Each render layer gets its own geometry entry in the blas
 
-        //TODO: PUT THE BINDLESS TEXTURE REFERENCE AT THE START OF THE render layers geometry buffer
-        var geometryBufferStaging = ctx.memory.createBuffer(
-                combined_size,
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                0,
-                VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
-        var geometryBuffer = ctx.memory.createBuffer(
-                combined_size,
-                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        FrameData frame = frames[frameIndex];
+        frameIndex = (frameIndex + 1) % frames.length;
+
+        frame.ensureGeometry(combined_size);
+
+        var geometryBufferStaging = frame.geometryStaging;
+        var geometryBuffer = frame.geometry;
+
         long ptr = geometryBufferStaging.get().map();
         long offset = 0;
         List<BuildInfo> infos = new ArrayList<>();
@@ -130,22 +148,71 @@ public class EntityBlasBuilder {
 
             offset += pair.getRight().getVertexBuffer().remaining();
         }
-        cmd.addBufferRef(geometryBufferStaging);
+        cmd.addBufferRef(geometryBufferStaging.addRef()); // Keep alive for command buffer
         geometryBufferStaging.get().unmap();
 
         cmd.encodeBufferCopy(geometryBufferStaging, 0, geometryBuffer, 0, combined_size);
         cmd.encodeBufferBarrier(geometryBuffer, 0, combined_size, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
-        geometryBufferStaging.close();
+
+        // geometryBufferStaging is NOT closed here because it belongs to FrameData.
+        // The VCmdBuff holds a reference (added above) which protects it during execution.
+        // FrameData holds a reference which keeps it alive for reuse.
 
         VRef<VAccelerationStructure> blas;
         try (var stack = MemoryStack.stackPush()) {
             int[] primitiveCounts = new int[infos.size()];
-            var buildInfo = populateBuildStructs(ctx, stack, cmd, infos, primitiveCounts);
+            var geometryInfos = populateBuildStructs(ctx, stack, cmd, infos, primitiveCounts);
 
-            blas = executeBlasBuild(ctx, cmd, stack, buildInfo, primitiveCounts);
+            // Query sizes
+            var buildInfos = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
+            var buildRanges = VkAccelerationStructureBuildRangeInfoKHR.calloc(primitiveCounts.length, stack);
+            for (int primCount : primitiveCounts) {
+                buildRanges.get().primitiveCount(primCount);
+            }
+
+            var bi = buildInfos.get()
+                    .sType$Default()
+                    .type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+                    .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR)
+                    .pGeometries(geometryInfos)
+                    .geometryCount(geometryInfos.remaining());
+
+            VkAccelerationStructureBuildSizesInfoKHR buildSizesInfo = VkAccelerationStructureBuildSizesInfoKHR
+                    .calloc(stack)
+                    .sType$Default();
+
+            vkGetAccelerationStructureBuildSizesKHR(
+                    ctx.device,
+                    VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                    bi,
+                    primitiveCounts,
+                    buildSizesInfo);
+
+            frame.ensureBlas(buildSizesInfo.accelerationStructureSize(), buildSizesInfo.buildScratchSize());
+
+            blas = frame.blas;
+            var scratch = frame.scratch;
+
+            bi.scratchData(VkDeviceOrHostAddressKHR.calloc(stack).deviceAddress(scratch.get().deviceAddress()));
+            bi.dstAccelerationStructure(blas.get().structure);
+
+            buildInfos.rewind();
+            buildRanges.rewind();
+
+            vkCmdBuildAccelerationStructuresKHR(cmd.buffer(), buildInfos, stack.pointers(buildRanges));
+
+            vkCmdPipelineBarrier(cmd.buffer(), VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, VkMemoryBarrier.calloc(1, stack)
+                    .sType$Default()
+                    .srcAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
+                    .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR), null, null);
+
+            cmd.addAccelerationStructureRef(blas.addRef());
+            cmd.addBufferRef(scratch.addRef());
         }
 
-        return List.of(new BLASResult(blas, geometryBuffer, offsets));
+        // Return new references to the reused buffers/structures.
+        // The caller will close() them, which decrements the ref count, but FrameData keeps them alive.
+        return List.of(new BLASResult(blas.addRef(), geometryBuffer.addRef(), offsets));
     }
 
     private VkAccelerationStructureGeometryKHR.Buffer populateBuildStructs(VContext ctx, MemoryStack stack, VCmdBuff cmdBuff, List<BuildInfo> geometries, int[] primitiveCounts) {
