@@ -24,7 +24,8 @@ import static org.lwjgl.vulkan.VK10.*;
 
 @Mixin(value = GlTexture.class, remap = false)
 public abstract class MixinGlTexture extends MixinGlResource implements IVGImage {
-    @Unique private VRef<VGImage> sharedImage;
+    @Unique
+    private VRef<VGImage> sharedImage;
 
     @Redirect(method = "<init>", at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/platform/GlStateManager;_genTexture()I"))
     private static int redirectGen() {
@@ -32,7 +33,8 @@ public abstract class MixinGlTexture extends MixinGlResource implements IVGImage
     }
 
     @Redirect(method = "<init>", at = @At(value = "INVOKE", target = "Lnet/irisshaders/iris/gl/texture/GlTexture;getGlId()I", ordinal = 0))
-    private int redirectTextureCreation(GlTexture instance, TextureType target, int sizeX, int sizeY, int sizeZ, int internalFormat, int format, int pixelType, byte[] pixels, TextureFilteringData filteringData) {
+    private int redirectTextureCreation(GlTexture instance, TextureType target, int sizeX, int sizeY, int sizeZ,
+            int internalFormat, int format, int pixelType, byte[] pixels, TextureFilteringData filteringData) {
         // Before getting the texture id, create the texture that wasn't created earlier
 
         InternalTextureFormat textureFormat = FormatConverter.findFormatFromGlFormat(internalFormat);
@@ -43,21 +45,21 @@ public abstract class MixinGlTexture extends MixinGlResource implements IVGImage
         sizeZ = Math.max(sizeZ, 1);
 
         sharedImage = Vulkanite.INSTANCE.getCtx().memory
-            .createSharedImage(
-                    (sizeZ == 1 && sizeY == 1? 1 : (sizeZ == 1?2:3)),
-                    sizeX,
-                    sizeY,
-                    sizeZ,
-                    1,
-                    vkFormat,
-                    textureFormat.getGlFormat(),
-                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-        );
+                .createSharedImage(
+                        (sizeZ == 1 && sizeY == 1 ? 1 : (sizeZ == 1 ? 2 : 3)),
+                        sizeX,
+                        sizeY,
+                        sizeZ,
+                        1,
+                        vkFormat,
+                        textureFormat.getGlFormat(),
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         sharedImage.get().setDebugUtilsObjectName("GlTexture");
 
         Vulkanite.INSTANCE.getCtx().cmd.executeWait(cmdbuf -> {
-            cmdbuf.encodeImageTransition(new VRef<>(sharedImage.get()), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+            cmdbuf.encodeImageTransition(new VRef<>(sharedImage.get()), VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
         });
 
         this.setGlId(sharedImage.get().glId);
@@ -65,8 +67,9 @@ public abstract class MixinGlTexture extends MixinGlResource implements IVGImage
         return sharedImage.get().glId;
     }
 
-    @Redirect(method="<init>", at = @At(value = "INVOKE", target = "Lnet/irisshaders/iris/gl/texture/TextureType;apply(IIIIIIILjava/nio/ByteBuffer;)V"))
-    private void redirectUpload(TextureType instance, int glId, int width, int height, int depth, int internalFormat, int format, int pixelType, ByteBuffer data) {
+    @Redirect(method = "<init>", at = @At(value = "INVOKE", target = "Lnet/irisshaders/iris/gl/texture/TextureType;apply(IIIIIIILjava/nio/ByteBuffer;)V"))
+    private void redirectUpload(TextureType instance, int glId, int width, int height, int depth, int internalFormat,
+            int format, int pixelType, ByteBuffer data) {
         int target = instance.getGlType();
 
         RenderSystem.assertOnRenderThreadOrInit();
@@ -87,7 +90,9 @@ public abstract class MixinGlTexture extends MixinGlResource implements IVGImage
     }
 
     @Overwrite
-    protected void destroyInternal(){
+    protected void destroyInternal() {
+        if (sharedImage != null)
+            sharedImage.close();
         sharedImage = null;
     }
 

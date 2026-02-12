@@ -343,6 +343,10 @@ public class VulkanPipeline {
 
             prof.pop();
             ctx.cmd.submit(0, cmdRef, Arrays.asList(vref_in), Arrays.asList(vref_out), null);
+
+            for (var ref : outImgs) {
+                ref.close();
+            }
         }
 
         cmdRef.close();

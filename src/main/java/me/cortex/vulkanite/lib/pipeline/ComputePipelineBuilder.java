@@ -2,77 +2,85 @@ package me.cortex.vulkanite.lib.pipeline;
 
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
-import me.cortex.vulkanite.lib.descriptors.VDescriptorSetLayout;
 import me.cortex.vulkanite.lib.shader.ShaderModule;
+import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
 
 import java.nio.LongBuffer;
-import java.util.*;
 
 import static me.cortex.vulkanite.lib.other.VUtil._CHECK_;
-import static me.cortex.vulkanite.lib.other.VUtil.alignUp;
-import static org.lwjgl.system.MemoryStack.stackPush;
-import static org.lwjgl.system.MemoryUtil.memCopy;
 import static org.lwjgl.vulkan.VK10.*;
 
-public class ComputePipelineBuilder {
+/**
+ * Builder for Vulkan compute pipelines with improved error handling and debugging capabilities.
+ */
+public class ComputePipelineBuilder extends PipelineBuilder<ComputePipelineBuilder> {
+    private ShaderModule computeShader;
+
     public ComputePipelineBuilder() {
-
+        super();
     }
 
-    Set<VRef<VDescriptorSetLayout>> layouts = new LinkedHashSet<>();
-    public ComputePipelineBuilder addLayout(VRef<VDescriptorSetLayout> layout) {
-        layouts.add(layout);
+    /**
+     * Sets the compute shader module for this pipeline.
+     *
+     * @param shader The compute shader module
+     * @return This builder instance for chaining
+     */
+    public ComputePipelineBuilder setShader(ShaderModule shader) {
+        this.computeShader = shader;
         return this;
     }
 
-    private ShaderModule compute;
+    /**
+     * Sets the compute shader module for this pipeline (alias for setShader to maintain API compatibility).
+     *
+     * @param shader The compute shader module
+     * @return This builder instance for chaining
+     */
     public ComputePipelineBuilder set(ShaderModule shader) {
-        this.compute = shader;
-        return this;
+        return setShader(shader);
     }
 
-    private record PushConstant(int size, int offset) {}
-    private List<PushConstant> pushConstants = new ArrayList<>();
+    /**
+     * Builds the compute pipeline with the configured settings.
+     *
+     * @param context The Vulkan context
+     * @return A reference to the created compute pipeline
+     * @throws IllegalStateException if required components are missing
+     */
+    public VRef<VComputePipeline> build(VContext context) throws IllegalStateException {
+        validate();
 
-    public void addPushConstantRange(int size, int offset) {
-        pushConstants.add(new PushConstant(size, offset));
-    }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            // Create pipeline layout
+            long pipelineLayout = createPipelineLayout(context, stack);
 
-    public VRef<VComputePipeline> build(VContext context) {
-        try (var stack = stackPush()) {
-
-            VkPipelineLayoutCreateInfo layoutCreateInfo = VkPipelineLayoutCreateInfo.calloc(stack)
-                    .sType$Default();
-            {
-                //TODO: cleanup and add push constants
-                layoutCreateInfo.pSetLayouts(stack.longs(layouts.stream().mapToLong(a->a.get().layout).toArray()));
-            }
-
-            if (pushConstants.size() > 0) {
-                var pushConstantRanges = VkPushConstantRange.calloc(pushConstants.size(), stack);
-                for (int i = 0; i < pushConstants.size(); i++) {
-                    var pushConstant = pushConstants.get(i);
-                    pushConstantRanges.get(i)
-                            .stageFlags(VK_SHADER_STAGE_ALL)
-                            .offset(pushConstant.offset)
-                            .size(pushConstant.size);
-                }
-                layoutCreateInfo.pPushConstantRanges(pushConstantRanges);
-            }
-
-            LongBuffer pLayout = stack.mallocLong(1);
-            _CHECK_(vkCreatePipelineLayout(context.device, layoutCreateInfo, null, pLayout));
-
+            // Setup shader stage
             VkPipelineShaderStageCreateInfo shaderStage = VkPipelineShaderStageCreateInfo.calloc(stack);
-            compute.setupStruct(stack, shaderStage);
-            LongBuffer pPipeline = stack.mallocLong(1);
-            _CHECK_(vkCreateComputePipelines(context.device, 0, VkComputePipelineCreateInfo.calloc(1, stack)
-                    .sType$Default()
-                    .layout(pLayout.get(0))
-                    .stage(shaderStage), null, pPipeline));
+            computeShader.setupStruct(stack, shaderStage);
 
-            return new VRef<>(new VComputePipeline(context, pLayout.get(0), pPipeline.get(0)));
+            // Create compute pipeline
+            LongBuffer pPipeline = stack.mallocLong(1);
+            int result = vkCreateComputePipelines(context.device, 0,
+                    VkComputePipelineCreateInfo.calloc(1, stack)
+                            .sType(VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO)
+                            .layout(pipelineLayout)
+                            .stage(shaderStage),
+                    null, pPipeline);
+
+            _CHECK_(result, "Failed to create compute pipeline");
+
+            return new VRef<>(new VComputePipeline(context, pipelineLayout, pPipeline.get(0)));
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to build compute pipeline: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    protected void validate() throws IllegalStateException {
+        if (computeShader == null) {
+            throw new IllegalStateException("Compute shader must be set before building pipeline");
         }
     }
 }

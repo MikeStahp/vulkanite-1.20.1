@@ -13,12 +13,13 @@ public class SharedImageViewTracker {
     private final VContext ctx;
     private final Supplier<VRef<VGImage>> supplier;
     private VRef<VImageView> view;
+
     public SharedImageViewTracker(VContext ctx, Supplier<VRef<VGImage>> imageSupplier) {
         this.supplier = imageSupplier;
         this.ctx = ctx;
     }
 
-    //NOTE: getting the image doesnt invalidate/check for a different image
+    // NOTE: getting the image doesnt invalidate/check for a different image
     public VRef<VImage> getImage() {
         if (view != null) {
             return view.get().image.addRef();
@@ -32,14 +33,26 @@ public class SharedImageViewTracker {
 
     public VRef<VImageView> getView(Supplier<VRef<VGImage>> imageSupplier) {
         VRef<VGImage> image = imageSupplier.get();
-        if (view == null || (!view.get().isDerivedFrom(image.get()))) {
-            //TODO: move this to like a fence free that you pass in via an arg
+        try {
+            if (view == null || (image != null && !view.get().isDerivedFrom(image.get()))
+                    || (image == null && view != null)) {
+                // TODO: move this to like a fence free that you pass in via an arg
+                if (view != null) {
+                    view.close();
+                    view = null;
+                }
+
+                if (image != null) {
+                    view = VImageView.create(ctx, (VRef) image);
+                } else {
+                    view = null;
+                }
+            }
+            return view == null ? null : view.addRef();
+        } finally {
             if (image != null) {
-                view = VImageView.create(ctx, new VRef<>(image.get()));
-            } else {
-                view = null;
+                image.close();
             }
         }
-        return view == null ? null : view.addRef();
     }
 }

@@ -25,6 +25,9 @@ public class VDescriptorPool extends VObject {
 
     private final int nSetsPerPool;
     private final int countPerType;
+    
+    // Track total allocated sets for debugging
+    private int totalAllocated = 0;
 
     private VDescriptorPool(VContext ctx, VRef<VDescriptorSetLayout> layout, int flags, int nSetsPerPool, int countPerType) {
         this.ctx = ctx;
@@ -60,12 +63,30 @@ public class VDescriptorPool extends VObject {
     }
 
     public VRef<VDescriptorSet> allocateSet(int variableSize) {
-        if (poolFreeSizes.isEmpty() || poolFreeSizes.get(pools.size() - 1) == 0) {
-            createNewPool();
+        if (layout == null || layout.get() == null) {
+            throw new IllegalStateException("Descriptor pool has been freed");
         }
-        long pool = pools.get(pools.size() - 1);
+        
+        // Find a pool with available space, starting from the most recent
+        int poolIndex = -1;
+        for (int i = pools.size() - 1; i >= 0; i--) {
+            if (poolFreeSizes.get(i) > 0) {
+                poolIndex = i;
+                break;
+            }
+        }
+        
+        // If no pool has space, create a new one
+        if (poolIndex == -1) {
+            createNewPool();
+            poolIndex = pools.size() - 1;
+        }
+        
+        long pool = pools.get(poolIndex);
         long set;
-        poolFreeSizes.set(pools.size() - 1, poolFreeSizes.get(pools.size() - 1) - 1);
+        poolFreeSizes.set(poolIndex, poolFreeSizes.get(poolIndex) - 1);
+        totalAllocated++;
+        
         try (var stack = stackPush()) {
             var pSet = stack.mallocLong(1);
             var allocInfo = VkDescriptorSetAllocateInfo.calloc(stack)
@@ -80,12 +101,21 @@ public class VDescriptorPool extends VObject {
             }
             int result = vkAllocateDescriptorSets(ctx.device, allocInfo, pSet);
             if (result == VK_ERROR_OUT_OF_POOL_MEMORY) {
+                // Restore the free count since allocation failed
+                poolFreeSizes.set(poolIndex, poolFreeSizes.get(poolIndex) + 1);
+                totalAllocated--;
                 createNewPool();
                 return allocateSet(variableSize);
             }
             _CHECK_(result);
             set = pSet.get(0);
+        } catch (Exception e) {
+            // Restore the free count on failure
+            poolFreeSizes.set(poolIndex, poolFreeSizes.get(poolIndex) + 1);
+            totalAllocated--;
+            throw e;
         }
+        
         return new VRef<>(new VDescriptorSet(new VRef<>(this), pool, set));
     }
 
@@ -94,23 +124,56 @@ public class VDescriptorPool extends VObject {
     }
 
     public void freeSet(VDescriptorSet set) {
+        if (set == null) {
+            return;
+        }
+        
         int index = pools.indexOf(set.poolHandle);
+        if (index == -1) {
+            System.err.println("Warning: Attempting to free descriptor set from unknown pool");
+            return;
+        }
+        
         try (var stack = stackPush()) {
             var pDescriptorSets = stack.mallocLong(1).put(0, set.set);
             _CHECK_(vkFreeDescriptorSets(ctx.device, set.poolHandle, pDescriptorSets));
+        } catch (Exception e) {
+            System.err.println("Warning: Failed to free descriptor set: " + e.getMessage());
         }
-        poolFreeSizes.set(index, poolFreeSizes.get(index) + 1);
-        if (poolFreeSizes.get(index) == nSetsPerPool) {
+        
+        int newFreeCount = poolFreeSizes.get(index) + 1;
+        poolFreeSizes.set(index, newFreeCount);
+        totalAllocated--;
+        
+        // If pool is completely free, destroy it
+        if (newFreeCount == nSetsPerPool) {
             vkDestroyDescriptorPool(ctx.device, set.poolHandle, null);
             pools.remove(index);
             poolFreeSizes.remove(index);
         }
     }
+    
+    // Debug method to get allocation statistics
+    public String getStats() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("DescriptorPool Stats: ");
+        sb.append("Total Pools: ").append(pools.size()).append(", ");
+        sb.append("Total Allocated: ").append(totalAllocated).append(", ");
+        sb.append("Free Sizes: ").append(poolFreeSizes);
+        return sb.toString();
+    }
 
     @Override
     protected void free() {
+        // Free all remaining pools
         for (long pool : pools) {
-            vkDestroyDescriptorPool(ctx.device, pool, null);
+            try {
+                vkDestroyDescriptorPool(ctx.device, pool, null);
+            } catch (Exception e) {
+                System.err.println("Warning: Failed to destroy descriptor pool: " + e.getMessage());
+            }
         }
+        pools.clear();
+        poolFreeSizes.clear();
     }
 }

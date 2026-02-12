@@ -16,46 +16,66 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.vkCreateDescriptorSetLayout;
 
 public class DescriptorSetLayoutBuilder {
-    private IntArrayList types = new IntArrayList();
-    private HashMap<Integer, Integer> bindingFlagsMap = new HashMap<>();
-    private VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(0);
+    private final IntArrayList types = new IntArrayList();
+    private final HashMap<Integer, Integer> bindingFlagsMap = new HashMap<>();
+    private VkDescriptorSetLayoutBinding.Buffer bindings;
+    private int capacity = 0;
+    
     public DescriptorSetLayoutBuilder binding(int binding, int type, int count, int stages) {
-        bindings = VkDescriptorSetLayoutBinding.create(MemoryUtil.nmemRealloc(bindings.address(), (bindings.capacity() + 1L) * VkDescriptorSetLayoutBinding.SIZEOF), bindings.capacity() + 1);
-        var struct = bindings.get(bindings.capacity()-1);
+        ensureCapacity(capacity + 1);
+        var struct = bindings.get(capacity);
         struct.set(binding, type, count, stages, null);
         types.add(type);
+        capacity++;
         return this;
     }
 
     public DescriptorSetLayoutBuilder binding(int binding, int type, int stages) {
         return binding(binding, type, 1, stages);
     }
+    
     public DescriptorSetLayoutBuilder binding(int type, int stages) {
-        return binding(bindings.capacity(), type, stages);
+        return binding(capacity, type, stages);
     }
 
     public void setBindingFlags(int binding, int flag) {
         bindingFlagsMap.put(binding, flag);
     }
 
-    int flags;
+    private int flags;
+    
     public DescriptorSetLayoutBuilder() {
         this(0);
     }
-    public DescriptorSetLayoutBuilder(int flags){
+    
+    public DescriptorSetLayoutBuilder(int flags) {
         this.flags = flags;
+        this.bindings = VkDescriptorSetLayoutBinding.calloc(8); // Start with reasonable capacity
+        this.capacity = 0;
+    }
+    
+    private void ensureCapacity(int minCapacity) {
+        if (minCapacity > bindings.capacity()) {
+            int newCapacity = Math.max(minCapacity, bindings.capacity() * 2);
+            bindings = VkDescriptorSetLayoutBinding.create(
+                MemoryUtil.nmemRealloc(bindings.address(), (long) newCapacity * VkDescriptorSetLayoutBinding.SIZEOF),
+                newCapacity);
+        }
     }
 
     public VRef<VDescriptorSetLayout> build(VContext ctx) {
         try (var stack = stackPush()) {
+            // Limit the buffer to actual size
+            bindings.limit(capacity);
+            
             var info = VkDescriptorSetLayoutCreateInfo.calloc(stack)
                     .sType$Default()
                     .pBindings(bindings)
                     .flags(flags);
 
             if (!bindingFlagsMap.isEmpty()) {
-                var bindingFlags = new int[bindings.remaining()];
-                for (var i = 0; i < bindings.remaining(); i++) {
+                var bindingFlags = new int[capacity];
+                for (var i = 0; i < capacity; i++) {
                     bindingFlags[i] = bindingFlagsMap.getOrDefault(bindings.get(i).binding(), 0);
                 }
 
@@ -68,6 +88,20 @@ public class DescriptorSetLayoutBuilder {
             LongBuffer pBuffer = stack.mallocLong(1);
             _CHECK_(vkCreateDescriptorSetLayout(ctx.device, info, null, pBuffer));
             return VDescriptorSetLayout.create(ctx, pBuffer.get(0), types.toIntArray());
+        } finally {
+            // Clean up resources
+            if (bindings != null) {
+                bindings.free();
+                bindings = null;
+            }
+        }
+    }
+    
+    // Cleanup method for explicit resource management
+    public void cleanup() {
+        if (bindings != null) {
+            bindings.free();
+            bindings = null;
         }
     }
 }
