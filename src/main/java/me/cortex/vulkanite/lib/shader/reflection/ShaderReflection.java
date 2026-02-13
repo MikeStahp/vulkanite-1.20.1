@@ -24,15 +24,19 @@ public class ShaderReflection {
         public Set(ArrayList<Binding> bindings) {
             // Sort by binding
             this.bindings = bindings;
-            this.bindings.sort((a, b) -> Integer.compare(a.binding, b.binding));
+            this.bindings().sort((a, b) -> Integer.compare(a.binding, b.binding));
         }
 
         public Set(Binding... bindings) {
             this(new ArrayList<Binding>(List.of(bindings)));
         }
+        
+        public ArrayList<Binding> bindings() {
+            return bindings;
+        }
 
         public Binding getBindingAt(int binding) {
-            for (var b : bindings) {
+            for (var b : bindings()) {
                 if (b.binding == binding) {
                     return b;
                 }
@@ -41,7 +45,7 @@ public class ShaderReflection {
         }
 
         public boolean hasUnsizedArrays() {
-            for (var binding : bindings) {
+            for (var binding : bindings()) {
                 if (binding.runtimeSized) {
                     return true;
                 }
@@ -50,7 +54,7 @@ public class ShaderReflection {
         }
 
         public boolean validate(Set expected) {
-            for (var binding : bindings) {
+            for (var binding : bindings()) {
                 var expectedBinding = expected.getBindingAt(binding.binding);
                 if (expectedBinding == null) {
                     return false;
@@ -72,7 +76,7 @@ public class ShaderReflection {
         public String toString() {
             StringBuilder sb = new StringBuilder();
             sb.append("Set {\n");
-            for (var binding : bindings) {
+            for (var binding : bindings()) {
                 sb.append("  Binding ").append(binding.binding)
                         .append(": ").append(binding.name)
                         .append(" (type=").append(binding.descriptorType)
@@ -87,7 +91,7 @@ public class ShaderReflection {
     private ArrayList<Set> sets = new ArrayList<>();
 
     public List<Binding> getBindings(int set) {
-        return sets.get(set).bindings;
+        return sets.get(set).bindings();
     }
 
     public Set getSet(int set) {
@@ -103,62 +107,7 @@ public class ShaderReflection {
     }
 
     public ShaderReflection(ByteBuffer spirv) {
-        try (var stack = stackPush()) {
-            // Create context
-            var ptr = stack.mallocPointer(1);
-            var ptr2 = stack.mallocPointer(1);
-            _CHECK_(spvc_context_create(ptr));
-            long context = ptr.get(0);
-
-            // Parse the spir-v
-            _CHECK_(spvc_context_parse_spirv(context, spirv.asIntBuffer(), spirv.remaining() >> 2, ptr));
-            long ir = ptr.get(0);
-
-            // Hand it off to a compiler instance and give it ownership of the IR.
-            _CHECK_(spvc_context_create_compiler(context, SPVC_BACKEND_NONE, ir, SPVC_CAPTURE_MODE_TAKE_OWNERSHIP,
-                    ptr));
-            long compiler = ptr.get(0);
-
-            // Create resources from spir-v
-            _CHECK_(spvc_compiler_create_shader_resources(compiler, ptr));
-            long resources = ptr.get(0);
-
-            // Get reflection data
-            for (var type : ResourceType.values()) {
-                int vkDescType = type.toVkDescriptorType();
-
-                _CHECK_(spvc_resources_get_resource_list_for_type(resources, type.id, ptr, ptr2));
-                var reflectedResources = SpvcReflectedResource.create(ptr.get(0), (int) ptr2.get(0));
-                for (var reflect : reflectedResources) {
-                    if (vkDescType != -1) {
-                        int binding = spvc_compiler_get_decoration(compiler, reflect.id(), SpvDecorationBinding);
-                        int set = spvc_compiler_get_decoration(compiler, reflect.id(), SpvDecorationDescriptorSet);
-                        var spvcType = spvc_compiler_get_type_handle(compiler, reflect.type_id());
-                        int arrayNDims = spvc_type_get_num_array_dimensions(spvcType);
-                        int arraySize = 0;
-                        String name = spvc_compiler_get_name(compiler, reflect.id());
-                        if (arrayNDims > 0) {
-                            arraySize = 1;
-                            for (int i = 0; i < arrayNDims; i++) {
-                                arraySize *= spvc_type_get_array_dimension(spvcType, i);
-                            }
-                        }
-                        boolean isRuntimeSized = false;
-                        if (arraySize == 0 && arrayNDims > 0) {
-                            isRuntimeSized = true;
-                            arraySize = 1;
-                        }
-                        var descriptor = new Binding(name, binding, vkDescType, arraySize, isRuntimeSized);
-                        while (sets.size() <= set) {
-                            sets.add(new Set(new ArrayList<>()));
-                        }
-                        sets.get(set).bindings.add(descriptor);
-                    }
-                }
-            }
-
-            spvc_context_destroy(context);
-        }
+        this.sets = SpirvParser.parse(spirv);
     }
 
     @Override
@@ -166,7 +115,7 @@ public class ShaderReflection {
         StringBuilder sb = new StringBuilder();
         for (int set = 0; set < sets.size(); set++) {
             sb.append("Set ").append(set).append(":\n");
-            for (var binding : sets.get(set).bindings) {
+            for (var binding : sets.get(set).bindings()) {
                 sb.append("  - ").append(binding.binding).append(" : ").append(binding.name).append("; arraySize = ")
                         .append(binding.arraySize).append("; runtimeSized = ").append(binding.runtimeSized)
                         .append("\n");
@@ -239,7 +188,7 @@ public class ShaderReflection {
                 flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
             }
             var builder = new DescriptorSetLayoutBuilder(flags);
-            for (var binding : set.bindings) {
+            for (var binding : set.bindings()) {
                 if (binding.arraySize > 0) {
                     if (binding.runtimeSized) {
                         builder.binding(binding.binding, binding.descriptorType, runtimeSizedArrayMaxSize,
