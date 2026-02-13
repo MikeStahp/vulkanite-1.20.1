@@ -3,6 +3,7 @@ package me.cortex.vulkanite.mixin.sodium;
 import it.unimi.dsi.fastutil.longs.Long2ReferenceMap;
 import it.unimi.dsi.fastutil.objects.Reference2ReferenceLinkedOpenHashMap;
 import me.cortex.vulkanite.compat.IAccelerationBuildResult;
+import me.cortex.vulkanite.compat.NativeBufferTracker;
 import me.cortex.vulkanite.client.Vulkanite;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSection;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSectionManager;
@@ -33,6 +34,8 @@ public abstract class MixinRenderSectionManager {
     @Redirect(method = "destroy", at = @At(value = "INVOKE", target = "Lme/jellysquid/mods/sodium/client/render/chunk/compile/ChunkBuildOutput;delete()V"))
     private void destroyAccelerationData(ChunkBuildOutput instance) {
         var data = ((IAccelerationBuildResult)instance).getAccelerationGeometryData();
+        // Notify tracker that this result is being destroyed
+        NativeBufferTracker.getInstance().untrackBuffers(instance);
         instance.delete();
         //TODO: need to ingest and cleanup all the blas builds and tlas updates
     }

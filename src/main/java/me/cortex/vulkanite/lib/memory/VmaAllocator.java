@@ -8,7 +8,6 @@ import org.lwjgl.vulkan.*;
 
 import java.nio.IntBuffer;
 import java.nio.LongBuffer;
-import java.util.HashMap;
 
 import static me.cortex.vulkanite.lib.other.VUtil._CHECK_;
 import static org.lwjgl.system.MemoryStack.stackPush;
@@ -25,11 +24,8 @@ public class VmaAllocator {
     private long sharedDedicatedPool;
     private final long sharedBlockSize;
 
-    private record ImageFormatQuery(int format, int imageType, int tiling, int usage, int flags) {}
-
-    private record ImageFormatQueryResult(boolean supported, ImageFormatQuery updatedParams) {}
-
-    private final HashMap<ImageFormatQuery, ImageFormatQueryResult> formatSupportCache = new HashMap<>();
+    private SharedAllocationHelper sharedAllocationHelper;
+    private StandardAllocationHelper standardAllocationHelper;
 
     private VkExportMemoryAllocateInfo exportMemoryAllocateInfo;
     private VkExportMemoryAllocateInfo exportDedicatedMemoryAllocateInfo;
@@ -53,6 +49,10 @@ public class VmaAllocator {
             PointerBuffer pAllocator = stack.pointers(0);
             _CHECK_(vmaCreateAllocator(allocatorCreateInfo, pAllocator), "Failed to create allocator");
             this.allocator = pAllocator.get(0);
+            
+            // Initialize helpers with the actual allocator
+            this.standardAllocationHelper = new StandardAllocationHelper(device, allocator, hasDeviceAddresses);
+            this.sharedAllocationHelper = new SharedAllocationHelper(device, allocator, hasDeviceAddresses, sharedBlockSize);
 
             if (sharedHandleType != 0) {
                 initSharedPools(stack, sharedHandleType);
@@ -131,36 +131,7 @@ public class VmaAllocator {
     // --- Allocation Methods ---
 
     public SharedBufferAllocation allocShared(VkBufferCreateInfo bufferCreateInfo, VmaAllocationCreateInfo allocationCreateInfo) {
-        try (var stack = stackPush()) {
-            LongBuffer pb = stack.callocLong(1);
-            _CHECK_(vkCreateBuffer(device, bufferCreateInfo, null, pb), "Failed to create VkBuffer");
-            long buffer = pb.get(0);
-
-            var memReq = VkMemoryRequirements.calloc(stack);
-            vkGetBufferMemoryRequirements(device, buffer, memReq);
-            allocationCreateInfo.memoryTypeBits(memReq.memoryTypeBits());
-
-            boolean dedicated = isDedicatedBuffer(stack, buffer, memReq.size());
-
-            if (dedicated) {
-                allocationCreateInfo.flags(VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT);
-                allocationCreateInfo.pool(sharedDedicatedPool);
-            } else {
-                allocationCreateInfo.pool(sharedPool);
-            }
-
-            VmaAllocationInfo vai = VmaAllocationInfo.calloc();
-            PointerBuffer pAllocation = stack.mallocPointer(1);
-
-            _CHECK_(vmaAllocateMemoryForBuffer(allocator, buffer, allocationCreateInfo, pAllocation, vai),
-                    "Failed to allocate memory for buffer");
-
-            long allocation = pAllocation.get(0);
-            _CHECK_(vmaBindBufferMemory(allocator, allocation, buffer), "failed to bind buffer memory");
-
-            boolean requestAddress = (bufferCreateInfo.usage() & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
-            return new SharedBufferAllocation(device, allocator, buffer, allocation, vai, hasDeviceAddresses, requestAddress, dedicated);
-        }
+        return sharedAllocationHelper.allocShared(bufferCreateInfo, allocationCreateInfo, sharedPool, sharedDedicatedPool);
     }
 
     public BufferAllocation alloc(long pool, VkBufferCreateInfo bufferCreateInfo, VmaAllocationCreateInfo allocationCreateInfo) {
@@ -168,171 +139,20 @@ public class VmaAllocator {
     }
 
     public BufferAllocation alloc(long pool, VkBufferCreateInfo bufferCreateInfo, VmaAllocationCreateInfo allocationCreateInfo, long alignment) {
-        if (bufferCreateInfo.size() == 0) {
-            throw new RuntimeException("Buffer size must be > 0");
-        }
+       return standardAllocationHelper.allocBuffer(pool, bufferCreateInfo, allocationCreateInfo, alignment);
+   }
 
-        try (var stack = stackPush()) {
-            LongBuffer pb = stack.mallocLong(1);
-            PointerBuffer pa = stack.mallocPointer(1);
-            VmaAllocationInfo vai = VmaAllocationInfo.calloc();
+   public SharedImageAllocation allocShared(VkImageCreateInfo imageCreateInfo, VmaAllocationCreateInfo allocationCreateInfo) {
+       return sharedAllocationHelper.allocShared(imageCreateInfo, allocationCreateInfo, sharedPool, sharedDedicatedPool);
+   }
 
-            if (pool != 0) allocationCreateInfo.pool(pool);
+   public ImageAllocation alloc(long pool, VkImageCreateInfo imageCreateInfo, VmaAllocationCreateInfo allocationCreateInfo) {
+       return standardAllocationHelper.allocImage(pool, imageCreateInfo, allocationCreateInfo);
+   }
 
-            _CHECK_(vmaCreateBufferWithAlignment(allocator, bufferCreateInfo, allocationCreateInfo, alignment, pb, pa, vai),
-                    "Failed to allocate buffer");
-
-            boolean requestAddress = (bufferCreateInfo.usage() & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
-            return new BufferAllocation(device, allocator, pb.get(0), pa.get(0), vai, hasDeviceAddresses, requestAddress);
-        }
-    }
-
-    public SharedImageAllocation allocShared(VkImageCreateInfo imageCreateInfo, VmaAllocationCreateInfo allocationCreateInfo) {
-        testModifyFormatSupport(device, imageCreateInfo);
-        try (var stack = stackPush()) {
-            LongBuffer pb = stack.callocLong(1);
-            _CHECK_(vkCreateImage(device, imageCreateInfo, null, pb), "Failed to create VkImage");
-            long image = pb.get(0);
-
-            var memReq = VkMemoryRequirements.calloc(stack);
-            vkGetImageMemoryRequirements(device, image, memReq);
-
-            boolean dedicated = isDedicatedImage(stack, image, memReq.size());
-
-            if (dedicated) {
-                allocationCreateInfo.flags(VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT);
-                allocationCreateInfo.pool(sharedDedicatedPool);
-            } else {
-                allocationCreateInfo.pool(sharedPool);
-            }
-
-            allocationCreateInfo.memoryTypeBits(memReq.memoryTypeBits());
-            VmaAllocationInfo vai = VmaAllocationInfo.calloc();
-            PointerBuffer pAllocation = stack.mallocPointer(1);
-
-            _CHECK_(vmaAllocateMemoryForImage(allocator, image, allocationCreateInfo, pAllocation, vai),
-                    "Failed to allocate memory for image");
-
-            long allocation = pAllocation.get(0);
-            _CHECK_(vmaBindImageMemory(allocator, allocation, image), "failed to bind image memory");
-
-            return new SharedImageAllocation(device, allocator, image, allocation, vai, dedicated);
-        }
-    }
-
-    public ImageAllocation alloc(long pool, VkImageCreateInfo imageCreateInfo, VmaAllocationCreateInfo allocationCreateInfo) {
-        testModifyFormatSupport(device, imageCreateInfo);
-        try (var stack = stackPush()) {
-            LongBuffer pi = stack.mallocLong(1);
-            PointerBuffer pa = stack.mallocPointer(1);
-            VmaAllocationInfo vai = VmaAllocationInfo.calloc();
-
-            if (pool != 0) allocationCreateInfo.pool(pool);
-
-            _CHECK_(vmaCreateImage(allocator, imageCreateInfo, allocationCreateInfo, pi, pa, vai),
-                    "Failed to allocate image");
-
-            return new ImageAllocation(allocator, pi.get(0), pa.get(0), vai);
-        }
-    }
-
-    // --- Internal Helpers ---
-
-    private boolean isDedicatedBuffer(org.lwjgl.system.MemoryStack stack, long buffer, long size) {
-        if (size > sharedBlockSize) return true;
-
-        var dedicatedMemReq = VkMemoryDedicatedRequirements.calloc(stack).sType$Default();
-        var memReq2 = VkMemoryRequirements2.calloc(stack).sType$Default().pNext(dedicatedMemReq.address());
-
-        vkGetBufferMemoryRequirements2(device, VkBufferMemoryRequirementsInfo2.calloc(stack).sType$Default().buffer(buffer), memReq2);
-
-        return dedicatedMemReq.prefersDedicatedAllocation() || dedicatedMemReq.requiresDedicatedAllocation();
-    }
-
-    private boolean isDedicatedImage(org.lwjgl.system.MemoryStack stack, long image, long size) {
-        // Zink Check: Use dependency injection or configuration instead of statics if possible
-        if (Vulkanite.INSTANCE.IS_ZINK) return false;
-
-        if (size > sharedBlockSize) return true;
-
-        var dedicatedMemReq = VkMemoryDedicatedRequirements.calloc(stack).sType$Default();
-        var memReq2 = VkMemoryRequirements2.calloc(stack).sType$Default().pNext(dedicatedMemReq.address());
-
-        vkGetImageMemoryRequirements2(device, VkImageMemoryRequirementsInfo2.calloc(stack).sType$Default().image(image), memReq2);
-
-        if (Vulkanite.INSTANCE.IS_ZINK) {
-            if (dedicatedMemReq.requiresDedicatedAllocation()) {
-                throw new RuntimeException("Zink does not support importing dedicated memory, however the Vulkan implementation demands it");
-            }
-            return false;
-        }
-
-        return dedicatedMemReq.prefersDedicatedAllocation() || dedicatedMemReq.requiresDedicatedAllocation();
-    }
-
-    // Format support caching logic
-    boolean testModifyFormatSupport(VkDevice device, VkImageCreateInfo imageCreateInfo) {
-        var query = new ImageFormatQuery(imageCreateInfo.format(), imageCreateInfo.imageType(),
-                imageCreateInfo.tiling(), imageCreateInfo.usage(), imageCreateInfo.flags());
-
-        if (formatSupportCache.containsKey(query)) {
-            var res = formatSupportCache.get(query);
-            if (res.supported()) {
-                imageCreateInfo.format(res.updatedParams().format());
-                imageCreateInfo.imageType(res.updatedParams().imageType());
-                imageCreateInfo.tiling(res.updatedParams().tiling());
-                imageCreateInfo.usage(res.updatedParams().usage());
-                imageCreateInfo.flags(res.updatedParams().flags());
-            }
-            return res.supported();
-        }
-
-        try (var stack = stackPush()) {
-            var pImageFormatProperties = VkImageFormatProperties.callocStack(stack);
-            var result = vkGetPhysicalDeviceImageFormatProperties(device.getPhysicalDevice(), imageCreateInfo.format(),
-                    imageCreateInfo.imageType(), imageCreateInfo.tiling(), imageCreateInfo.usage(),
-                    imageCreateInfo.flags(), pImageFormatProperties);
-
-            if (result == VK_SUCCESS) {
-                formatSupportCache.put(query, new ImageFormatQueryResult(true, query));
-                return true;
-            } else if (result != VK_ERROR_FORMAT_NOT_SUPPORTED) {
-                throw new RuntimeException("Failed to get image format properties: " + result);
-            }
-
-            // Fallback logic
-            // 1. Remove Storage bit
-            if ((imageCreateInfo.usage() & VK_IMAGE_USAGE_STORAGE_BIT) != 0) {
-                imageCreateInfo.usage(imageCreateInfo.usage() & ~VK_IMAGE_USAGE_STORAGE_BIT);
-                if (testModifyFormatSupport(device, imageCreateInfo)) {
-                    System.err.println("WARNING: Storage image usage removed from " + imageCreateInfo.format() + " (not supported)");
-                    return true;
-                }
-            }
-
-            // 2. Tiling Optimal -> Linear
-            if (imageCreateInfo.tiling() == VK_IMAGE_TILING_OPTIMAL) {
-                imageCreateInfo.tiling(VK_IMAGE_TILING_LINEAR);
-                if (testModifyFormatSupport(device, imageCreateInfo)) {
-                    System.err.println("WARNING: TILING_OPTIMAL changed to TILING_LINEAR for " + imageCreateInfo.format());
-                    return true;
-                }
-            }
-        }
-
-        formatSupportCache.put(query, new ImageFormatQueryResult(false, null));
-        return false;
-    }
-
-    public String dumpJson(boolean detailed) {
-        try (var stack = stackPush()) {
-            PointerBuffer pb = stack.callocPointer(1);
-            vmaBuildStatsString(allocator, pb, detailed);
-            String result = MemoryUtil.memUTF8(pb.get(0));
-            nvmaFreeStatsString(allocator, pb.get(0));
-            return result;
-        }
-    }
+   public String dumpJson(boolean detailed) {
+       return standardAllocationHelper.dumpJson(allocator, detailed);
+   }
 
     // Cleanup of allocator if needed to destroy the global instance
     public void destroy() {

@@ -2,6 +2,7 @@ package me.cortex.vulkanite.acceleration.blas;
 
 import me.cortex.vulkanite.acceleration.JobPassThroughData;
 import me.cortex.vulkanite.compat.IAccelerationBuildResult;
+import me.cortex.vulkanite.compat.NativeBufferTracker;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.jellysquid.mods.sodium.client.render.chunk.compile.ChunkBuildOutput;
 import me.jellysquid.mods.sodium.client.render.chunk.data.BuiltSectionMeshParts;
@@ -94,6 +95,9 @@ public class BLASJobEnqueuer {
                 jobs.add(new BLASBuildJob(buildData,
                         new JobPassThroughData(cbr.render, cbr.buildTime, geomBuffer, bufferOffsets)));
             }
+            
+            // Notify tracker that buffers are being processed
+            NativeBufferTracker.getInstance().untrackBuffers(cbr);
         }
 
         if (hasJobs) {

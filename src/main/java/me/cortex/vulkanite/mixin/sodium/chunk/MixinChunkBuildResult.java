@@ -9,12 +9,14 @@ import me.jellysquid.mods.sodium.client.util.NativeBuffer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 
+import java.util.List;
 import java.util.Map;
 
 @Mixin(value = ChunkBuildOutput.class, remap = false)
 public class MixinChunkBuildResult implements IAccelerationBuildResult {
     @Unique private Map<TerrainRenderPass, GeometryData> geometryMap;
     @Unique private ChunkVertexType vertexType;
+    @Unique private List<NativeBuffer> nativeBuffers;
 
     @Override
     public void setAccelerationGeometryData(Map<TerrainRenderPass, GeometryData> map) {
@@ -34,5 +36,15 @@ public class MixinChunkBuildResult implements IAccelerationBuildResult {
     @Override
     public void setVertexFormat(ChunkVertexType format) {
         vertexType = format;
+    }
+    
+    @Override
+    public void setNativeBuffers(List<NativeBuffer> buffers) {
+        this.nativeBuffers = buffers;
+    }
+    
+    @Override
+    public List<NativeBuffer> getNativeBuffers() {
+        return nativeBuffers;
     }
 }

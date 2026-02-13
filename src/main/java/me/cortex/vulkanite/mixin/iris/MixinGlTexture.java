@@ -90,6 +90,9 @@ public abstract class MixinGlTexture extends MixinGlResource implements IVGImage
     }
 
     @Overwrite
+    /**
+     * Destroys the internal resources associated with this texture.
+     */
     protected void destroyInternal() {
         if (sharedImage != null)
             sharedImage.close();

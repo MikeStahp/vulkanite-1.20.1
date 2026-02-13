@@ -207,7 +207,8 @@ public class DescriptorUpdateBuilder {
         return this;
     }
 
-    public DescriptorUpdateBuilder acceleration(int binding, VRef<VAccelerationStructure>... structures) {
+    @SafeVarargs
+    public final DescriptorUpdateBuilder acceleration(int binding, VRef<VAccelerationStructure>... structures) {
         validateNotApplied();
         validateState();
         if (structures == null || structures.length == 0) {
@@ -393,15 +394,14 @@ public class DescriptorUpdateBuilder {
         }
     }
     
-    @Override
-    protected void finalize() throws Throwable {
-        try {
-            if (!applied && setRef != null) {
-                System.err.println("Warning: DescriptorUpdateBuilder was not properly cleaned up");
-                cleanup();
-            }
-        } finally {
-            super.finalize();
+    /**
+     * Cleans up resources if not already applied.
+     * This should be called explicitly instead of relying on finalize().
+     */
+    public void close() {
+        if (!applied && setRef != null) {
+            System.err.println("Warning: DescriptorUpdateBuilder was not properly cleaned up");
+            cleanup();
         }
     }
 }

@@ -45,16 +45,29 @@ public abstract class MixinRenderTarget implements IRenderTargetVkGetter {
     private void redirectResize(RenderTarget instance, int t, int w, int h) {}
 
     @Overwrite
+    /**
+     * Gets the main texture ID.
+     * @return the main texture ID
+     */
     public int getMainTexture() {
         return vgMainTexture.get().glId;
     }
 
     @Overwrite
+    /**
+     * Gets the alternate texture ID.
+     * @return the alternate texture ID
+     */
     public int getAltTexture() {
         return vgAltTexture.get().glId;
     }
 
     @Overwrite
+    /**
+     * Resizes the render target to the specified dimensions.
+     * @param width the new width
+     * @param height the new height
+     */
     public void resize(int width, int height) {
         glFinish();
         setupTextures(width, height, !internalFormat.getPixelFormat().isInteger());

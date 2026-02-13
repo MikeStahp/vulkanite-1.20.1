@@ -5,7 +5,10 @@ import me.jellysquid.mods.sodium.client.render.chunk.terrain.TerrainRenderPass;
 import me.jellysquid.mods.sodium.client.util.NativeBuffer;
 import org.lwjgl.system.MemoryUtil;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 //TODO: FIXME! the native buffer is destroyed by the AccelerationBlasBuilder after its copied to the gpu, however
@@ -15,8 +18,11 @@ public class SodiumResultAdapter {
     public static void compute(ChunkBuildOutput buildResult) {
         var ebr = (IAccelerationBuildResult) buildResult;
         Map<TerrainRenderPass, GeometryData> map = new HashMap<>();
+        List<NativeBuffer> nativeBuffers = new ArrayList<>();
+        
         for (var pass : buildResult.meshes.entrySet()) {
             var vertData = pass.getValue().getVertexData();
+            nativeBuffers.add(vertData); // Track the native buffer
 
             int stride = ebr.getVertexFormat().getVertexFormat().getStride();
 
@@ -31,8 +37,12 @@ public class SodiumResultAdapter {
 
         if (!map.isEmpty()) {
             ebr.setAccelerationGeometryData(map);
+            ebr.setNativeBuffers(nativeBuffers);
+            // Track buffers with the tracker
+            NativeBufferTracker.getInstance().trackBuffers(buildResult, nativeBuffers);
         } else {
             ebr.setAccelerationGeometryData(null);
+            ebr.setNativeBuffers(Collections.emptyList());
         }
     }
 }

@@ -1,0 +1,42 @@
+C:\Users\PCGAMER\Documents\GitHub\vulkanite-1.20.1\src\main\java\me\cortex\vulkanite\mixin\iris\MixinGlResource.java:43: warning: @Overwrite is missing javadoc comment
+    protected int getGlId(){
+                  ^
+C:\Users\PCGAMER\Documents\GitHub\vulkanite-1.20.1\src\main\java\me\cortex\vulkanite\mixin\iris\MixinGlTexture.java:93: warning: @Overwrite is missing javadoc comment
+    protected void destroyInternal() {
+                   ^
+C:\Users\PCGAMER\Documents\GitHub\vulkanite-1.20.1\src\main\java\me\cortex\vulkanite\mixin\iris\MixinRenderTarget.java:48: warning: @Overwrite is missing javadoc comment
+    public int getMainTexture() {
+               ^
+C:\Users\PCGAMER\Documents\GitHub\vulkanite-1.20.1\src\main\java\me\cortex\vulkanite\mixin\iris\MixinRenderTarget.java:53: warning: @Overwrite is missing javadoc comment
+    public int getAltTexture() {
+               ^
+C:\Users\PCGAMER\Documents\GitHub\vulkanite-1.20.1\src\main\java\me\cortex\vulkanite\mixin\iris\MixinRenderTarget.java:58: warning: @Overwrite is missing javadoc comment
+    public void resize(int width, int height) {
+                ^
+C:\Users\PCGAMER\Documents\GitHub\vulkanite-1.20.1\src\main\java\me\cortex\vulkanite\lib\descriptors\DescriptorUpdateBuilder.java:211: error: Invalid SafeVarargs annotation. Instance method acceleration(int,VRef<VAccelerationStructure>...) is neither final nor private.
+    public DescriptorUpdateBuilder acceleration(int binding, VRef<VAccelerationStructure>... structures) {
+                                   ^
+C:\Users\PCGAMER\Documents\GitHub\vulkanite-1.20.1\src\main\java\me\cortex\vulkanite\lib\descriptors\DescriptorUpdateBuilder.java:398: warning: [removal] finalize() in Object has been deprecated and marked for removal
+    protected void finalize() throws Throwable {
+                   ^
+C:\Users\PCGAMER\Documents\GitHub\vulkanite-1.20.1\src\main\java\me\cortex\vulkanite\lib\descriptors\DescriptorUpdateBuilder.java:405: warning: [removal] finalize() in Object has been deprecated and marked for removal
+            super.finalize();
+                 ^
+Note: Some input files use or override a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+Note: Some input files use unchecked or unsafe operations.
+Note: Recompile with -Xlint:unchecked for details.
+1 error
+7 warnings
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':compileJava'.
+> Compilation failed; see the compiler error output for details.
+
+* Try:
+> Run with --info option to get more log output.
+> Run with --scan to get full insights.
+
+BUILD FAILED in 3s
