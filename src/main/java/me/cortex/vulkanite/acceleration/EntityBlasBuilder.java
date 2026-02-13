@@ -20,6 +20,7 @@ import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.*;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 
 import static org.lwjgl.util.vma.Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
@@ -30,11 +31,54 @@ import static org.lwjgl.vulkan.VK10.*;
 public class EntityBlasBuilder {
     private final VContext ctx;
 
+    private final List<VRef<VBuffer>> geometryPool = new ArrayList<>();
+    private final List<VRef<VBuffer>> stagingPool = new ArrayList<>();
+    private final List<VRef<VBuffer>> scratchPool = new ArrayList<>();
+    private final List<VRef<VAccelerationStructure>> blasPool = new ArrayList<>();
+    private static final int MAX_POOL_SIZE = 10;
+
     public EntityBlasBuilder(VContext context) {
         this.ctx = context;
     }
 
-    private static VRef<VAccelerationStructure> executeBlasBuild(VContext ctx, VCmdBuff cmd, MemoryStack stack, VkAccelerationStructureGeometryKHR.Buffer geometryInfos, int[] prims) {
+    private VRef<VBuffer> getBuffer(List<VRef<VBuffer>> pool, long size, int usage, int properties, int alignment, int flags) {
+        Iterator<VRef<VBuffer>> iterator = pool.iterator();
+        while (iterator.hasNext()) {
+            VRef<VBuffer> ref = iterator.next();
+            if (ref.get().getRefCount() == 1) {
+                if (ref.get().size() >= size && ref.get().usage() == usage) {
+                    return ref.addRef();
+                }
+            }
+        }
+
+        var newBuffer = ctx.memory.createBuffer(size, usage, properties, alignment, flags);
+        if (pool.size() < MAX_POOL_SIZE) {
+            pool.add(newBuffer.addRef());
+        }
+        return newBuffer;
+    }
+
+    private VRef<VAccelerationStructure> getAccelerationStructure(List<VRef<VAccelerationStructure>> pool, long size) {
+        Iterator<VRef<VAccelerationStructure>> iterator = pool.iterator();
+        while (iterator.hasNext()) {
+            VRef<VAccelerationStructure> ref = iterator.next();
+            if (ref.get().getRefCount() == 1) {
+                if (ref.get().size() >= size) {
+                    return ref.addRef();
+                }
+            }
+        }
+
+        var newStructure = ctx.memory.createAcceleration(size, 256,
+                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+        if (pool.size() < MAX_POOL_SIZE) {
+            pool.add(newStructure.addRef());
+        }
+        return newStructure;
+    }
+
+    private VRef<VAccelerationStructure> executeBlasBuild(VContext ctx, VCmdBuff cmd, MemoryStack stack, VkAccelerationStructureGeometryKHR.Buffer geometryInfos, int[] prims) {
         var buildInfos = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
         var buildRanges = VkAccelerationStructureBuildRangeInfoKHR.calloc(prims.length, stack);
         for (int primCount : prims) {
@@ -60,10 +104,9 @@ public class EntityBlasBuilder {
                 buildSizesInfo);
 
 
-        var structure = ctx.memory.createAcceleration(buildSizesInfo.accelerationStructureSize(), 256,
-                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+        var structure = getAccelerationStructure(blasPool, buildSizesInfo.accelerationStructureSize());
 
-        var scratch = ctx.memory.createBuffer(buildSizesInfo.buildScratchSize(),
+        var scratch = getBuffer(scratchPool, buildSizesInfo.buildScratchSize(),
                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 256, 0);
 
@@ -108,16 +151,16 @@ public class EntityBlasBuilder {
         //Each render layer gets its own geometry entry in the blas
 
         //TODO: PUT THE BINDLESS TEXTURE REFERENCE AT THE START OF THE render layers geometry buffer
-        var geometryBufferStaging = ctx.memory.createBuffer(
+        var geometryBufferStaging = getBuffer(stagingPool,
                 combined_size,
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                 0,
                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
-        var geometryBuffer = ctx.memory.createBuffer(
+        var geometryBuffer = getBuffer(geometryPool,
                 combined_size,
                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, 0);
         long ptr = geometryBufferStaging.get().map();
         long offset = 0;
         List<BuildInfo> infos = new ArrayList<>();
