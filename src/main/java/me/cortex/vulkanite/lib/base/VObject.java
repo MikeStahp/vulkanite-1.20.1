@@ -8,6 +8,10 @@ public abstract class VObject {
 
     protected abstract void free();
 
+    public int getRefCount() {
+        return refCount.get();
+    }
+
     protected void incRef() {
         if (refCount.incrementAndGet() == 1) {
             // First reference, put into registry

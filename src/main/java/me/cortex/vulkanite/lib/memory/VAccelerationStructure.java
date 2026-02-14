@@ -15,6 +15,10 @@ public class VAccelerationStructure extends VObject {
     public final long deviceAddress;
     private final VkDevice device;
 
+    public long size() {
+        return buffer.get().size();
+    }
+
     protected VAccelerationStructure(VkDevice device, long structure, final VRef<VBuffer> buffer) {
         this.device = device;
         this.buffer = buffer.addRef();
