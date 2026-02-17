@@ -36,4 +36,8 @@ public class VAccelerationStructure extends VObject {
         vkDestroyAccelerationStructureKHR(device, structure, null);
         buffer.close();
     }
+
+    public long size() {
+        return buffer.get().size();
+    }
 }
