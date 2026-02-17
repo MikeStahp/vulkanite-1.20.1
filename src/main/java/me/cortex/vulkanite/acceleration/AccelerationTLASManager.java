@@ -180,4 +180,8 @@ public class AccelerationTLASManager {
     public VRef<VDescriptorSetLayout> getGeometryLayout() {
         return buildDataManager.getGeometryLayout();
     }
+
+    public void destroy() {
+        entityBlasBuilder.free();
+    }
 }

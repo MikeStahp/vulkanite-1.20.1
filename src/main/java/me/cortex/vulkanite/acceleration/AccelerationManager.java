@@ -77,4 +77,8 @@ public class AccelerationManager {
     public VRef<VDescriptorSetLayout> getGeometryLayout() {
         return tlasManager.getGeometryLayout();
     }
+
+    public void destroy() {
+        tlasManager.destroy();
+    }
 }
