@@ -21,4 +21,8 @@ public abstract class VObject {
             VRegistry.INSTANCE.unregister(this);
         }
     }
+
+    public int getRefCount() {
+        return refCount.get();
+    }
 }
