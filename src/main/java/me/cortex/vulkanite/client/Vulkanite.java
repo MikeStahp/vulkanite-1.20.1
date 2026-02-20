@@ -123,6 +123,7 @@ public class Vulkanite {
     public void destroy() {
         vkDeviceWaitIdle(ctx.device);
         descriptorPools.clear();
+        accelerationManager.destroy();
     }
 
     private static VContext createVulkanContext() {
