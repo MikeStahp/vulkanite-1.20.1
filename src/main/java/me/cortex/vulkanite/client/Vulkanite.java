@@ -3,6 +3,7 @@ package me.cortex.vulkanite.client;
 import me.cortex.vulkanite.acceleration.AccelerationManager;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
+import me.cortex.vulkanite.lib.base.VRegistry;
 import me.cortex.vulkanite.lib.base.initalizer.VInitializer;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorPool;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorSetLayout;
@@ -67,7 +68,8 @@ public class Vulkanite {
             }
         }
 
-        //Fill in the shared index buffer with a large count so we (hopefully) dont have to worry about it anymore
+        // Fill in the shared index buffer with a large count so we (hopefully) dont
+        // have to worry about it anymore
         // SharedQuadVkIndexBuffer.getIndexBuffer(ctx, 30000);
 
         accelerationManager = new AccelerationManager(ctx, 1);
@@ -75,9 +77,9 @@ public class Vulkanite {
 
     public void upload(List<ChunkBuildOutput> results) {
         /*
-        if (((IAccelerationBuildResult)result).getAccelerationGeometryData() == null)
-            return;//TODO: delete the chunk section in this case then or something
-        accelerationManager.chunkBuild(result);
+         * if (((IAccelerationBuildResult)result).getAccelerationGeometryData() == null)
+         * return;//TODO: delete the chunk section in this case then or something
+         * accelerationManager.chunkBuild(result);
          */
 
         accelerationManager.chunkBuilds(results);
@@ -104,6 +106,7 @@ public class Vulkanite {
     }
 
     public void renderTick() {
+        VRegistry.INSTANCE.threadLocalCollect();
         ctx.sync.checkFences();
         accelerationManager.updateTick();
     }
@@ -126,19 +129,17 @@ public class Vulkanite {
     }
 
     private static VContext createVulkanContext() {
-        var init = new VInitializer("Vulkan test", "Vulkanite", 1, 3,
-                new String[]{VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
-                        VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
-                        VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
-                        VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME,
-                        //VK_EXT_DEBUG_UTILS_EXTENSION_NAME
-                },
-                new String[] {
-                        //"VK_LAYER_KHRONOS_validation",
-                });
+    var init = new VInitializer("Vulkan test", "Vulkanite", 1, 3,
+    new String[] { VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME,
+    },
+    new String[] {
+    });
 
-        //This copies whatever gpu the opengl context is on
-        init.findPhysicalDevice();//glGetString(GL_RENDERER).split("/")[0]
+        // This copies whatever gpu the opengl context is on
+        init.findPhysicalDevice();// glGetString(GL_RENDERER).split("/")[0]
 
         List<String> extensions = new ArrayList<>(List.of(
                 VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
@@ -148,15 +149,14 @@ public class Vulkanite {
                 VK_KHR_SPIRV_1_4_EXTENSION_NAME,
                 VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME,
 
-                //VK_KHR_RAY_QUERY_EXTENSION_NAME,
+                // VK_KHR_RAY_QUERY_EXTENSION_NAME,
 
                 VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
                 VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
 
-//                VK_EXT_MEMORY_BUDGET_EXTENSION_NAME,
+                // VK_EXT_MEMORY_BUDGET_EXTENSION_NAME,
 
-                VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME
-        ));
+                VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME));
         if (IS_WINDOWS) {
             extensions.addAll(List.of(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
                     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
@@ -168,32 +168,40 @@ public class Vulkanite {
         }
         init.createDevice(extensions,
                 List.of(),
-                new float[]{1.0f, 0.9f},
+                new float[] { 1.0f, 1.0f },
                 features -> features.shaderInt16(true).shaderInt64(true).multiDrawIndirect(true), List.of(
-                        stack-> VkPhysicalDeviceAccelerationStructureFeaturesKHR.calloc(stack)
-                                .sType$Default(),
-
-                        stack-> VkPhysicalDeviceRayTracingPipelineFeaturesKHR.calloc(stack)
-                                .sType$Default(),
-
-                        stack-> VkPhysicalDeviceVulkan11Features.calloc(stack)
-                                .sType$Default(),
-
-                        stack-> VkPhysicalDeviceVulkan12Features.calloc(stack)
-                                .sType$Default()
-                ), List.of(
-                        features-> {},
-                        features -> {},
+                stack -> VkPhysicalDeviceAccelerationStructureFeaturesKHR.calloc(stack)
+                .sType$Default(),
+                stack -> VkPhysicalDeviceRayTracingPipelineFeaturesKHR.calloc(stack)
+                .sType$Default(),
+                stack -> VkPhysicalDeviceVulkan11Features.calloc(stack)
+                .sType$Default(),
+                
+                stack -> VkPhysicalDeviceVulkan12Features.calloc(stack)
+                .sType$Default()),
+                List.of(
+                        features -> {
+                            var asFeatures = (VkPhysicalDeviceAccelerationStructureFeaturesKHR) features;
+                            asFeatures.accelerationStructure(true);
+                        },
+                        features -> {
+                            var rtFeatures = (VkPhysicalDeviceRayTracingPipelineFeaturesKHR) features;
+                            rtFeatures.rayTracingPipeline(true);
+                        },
                         features -> {
                             var vulkan11Features = (VkPhysicalDeviceVulkan11Features) features;
                             vulkan11Features.protectedMemory(false);
                         },
                         features -> {
-                            var vulkan12Features = (VkPhysicalDeviceVulkan12Features) features;
-                            vulkan12Features.bufferDeviceAddressMultiDevice(false);
-//                            vulkan12Features.bufferDeviceAddressCaptureReplay(false);
-                        }
-                ));
+                        var vulkan12Features = (VkPhysicalDeviceVulkan12Features) features;
+                        vulkan12Features.bufferDeviceAddress(true);
+                        vulkan12Features.timelineSemaphore(true);
+                        vulkan12Features.descriptorIndexing(true);
+                        vulkan12Features.runtimeDescriptorArray(true);
+                        vulkan12Features.descriptorBindingVariableDescriptorCount(true);
+                        vulkan12Features.descriptorBindingPartiallyBound(true);
+                        vulkan12Features.bufferDeviceAddressMultiDevice(false);
+                        }));
 
         return init.createContext();
     }

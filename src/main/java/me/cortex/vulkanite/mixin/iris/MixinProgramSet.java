@@ -22,14 +22,16 @@ public abstract class MixinProgramSet implements IGetRaytracingSource {
 
     @Inject(method = "<init>", at = @At("TAIL"))
     private void injectRTShaders(AbsolutePackPath directory, Function<AbsolutePackPath, String> sourceProvider,
-                                 ShaderProperties shaderProperties, ShaderPack pack, CallbackInfo ci) {
-        List<RaytracingShaderSource> sourceList = new ArrayList<>();
-        int passId = 0;
-        while (true) {
-            int pass = passId++;
-            var gen = sourceProvider.apply(directory.resolve("ray"+pass+".rgen"));
-            if (gen == null)
-                break;
+    ShaderProperties shaderProperties, ShaderPack pack, CallbackInfo ci) {
+    System.out.println("[Vulkanite] Checking for ray tracing shaders...");
+    List<RaytracingShaderSource> sourceList = new ArrayList<>();
+    int passId = 0;
+    while (true) {
+    int pass = passId++;
+    var gen = sourceProvider.apply(directory.resolve("ray"+pass+".rgen"));
+    System.out.println("[Vulkanite] Looking for ray" + pass + ".rgen, found: " + (gen != null));
+    if (gen == null)
+    break;
             List<String> missSources = new ArrayList<>();
             int missId = 0;
             while (true) {
@@ -59,10 +61,14 @@ public abstract class MixinProgramSet implements IGetRaytracingSource {
                     gen,
                     missSources.toArray(new String[0]),
                     hitSources.toArray(new RaytracingShaderSource.RayHitSource[0])));
-        }
-        if (!sourceList.isEmpty()) {
-            sources = sourceList.toArray(new RaytracingShaderSource[0]);
-        }
+                    System.out.println("[Vulkanite] Found ray pass " + pass + " with " + missSources.size() + " miss shaders and " + hitSources.size() + " hit shaders");
+                    }
+                    if (!sourceList.isEmpty()) {
+                    sources = sourceList.toArray(new RaytracingShaderSource[0]);
+                    System.out.println("[Vulkanite] Ray tracing shaders loaded: " + sources.length + " passes");
+                    } else {
+                    System.out.println("[Vulkanite] No ray tracing shaders found");
+                    }
     }
 
     @Override

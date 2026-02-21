@@ -81,7 +81,7 @@ tasks.withType(JavaCompile).configureEach {
 
 tasks.withType(JavaExec).configureEach {
     javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
-    jvmArgs "-Dorg.lwjgl.system.stackSize=8192"
+    jvmArgs "-Dorg.lwjgl.system.stackSize=8192", "-Xmx6G"
 }
 
 java {

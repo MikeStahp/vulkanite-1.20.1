@@ -28,6 +28,7 @@ public class VInitializer {
     private VkDevice device;
     private int queueCount;
     private long debugMessenger = 0;
+
     public VInitializer(String appName, String engineName, int major, int minor, String[] extensions, String[] layers) {
         try (MemoryStack stack = stackPush()) {
             VkApplicationInfo appInfo = VkApplicationInfo.calloc(stack)
@@ -39,8 +40,10 @@ public class VInitializer {
             VkInstanceCreateInfo instanceCreateInfo = VkInstanceCreateInfo.calloc(stack)
                     .sType$Default()
                     .pApplicationInfo(appInfo)
-                    .ppEnabledExtensionNames(stack.pointers(Arrays.stream(extensions).map(stack::UTF8).toArray(ByteBuffer[]::new)))
-                    .ppEnabledLayerNames(stack.pointers(Arrays.stream(layers).map(stack::UTF8).toArray(ByteBuffer[]::new)));
+                    .ppEnabledExtensionNames(
+                            stack.pointers(Arrays.stream(extensions).map(stack::UTF8).toArray(ByteBuffer[]::new)))
+                    .ppEnabledLayerNames(
+                            stack.pointers(Arrays.stream(layers).map(stack::UTF8).toArray(ByteBuffer[]::new)));
 
             PointerBuffer result = stack.pointers(0);
             _CHECK_(vkCreateInstance(instanceCreateInfo, null, result));
@@ -50,10 +53,15 @@ public class VInitializer {
             if (Arrays.asList(extensions).contains(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
                 VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo = VkDebugUtilsMessengerCreateInfoEXT.calloc(stack)
                         .sType$Default()
-                        .messageSeverity(VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
-                        .messageType(VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT)
+                        .messageSeverity(VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT
+                                | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT
+                                | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
+                        .messageType(VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT
+                                | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT
+                                | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT)
                         .pfnUserCallback((messageSeverity, messageTypes, pCallbackData, pUserData) -> {
-                            VkDebugUtilsMessengerCallbackDataEXT callbackData = VkDebugUtilsMessengerCallbackDataEXT.create(pCallbackData);
+                            VkDebugUtilsMessengerCallbackDataEXT callbackData = VkDebugUtilsMessengerCallbackDataEXT
+                                    .create(pCallbackData);
                             System.err.println("Validation layer: " + callbackData.pMessageString());
                             Thread.dumpStack();
                             return VK_FALSE;
@@ -62,7 +70,8 @@ public class VInitializer {
                 var pDebugMessenger = stack.mallocLong(1);
                 _CHECK_(vkCreateDebugUtilsMessengerEXT(instance, debugCreateInfo, null, pDebugMessenger));
                 debugMessenger = pDebugMessenger.get(0);
-                // Runtime.getRuntime().addShutdownHook(new Thread(() -> vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, null)));
+                // Runtime.getRuntime().addShutdownHook(new Thread(() ->
+                // vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, null)));
             }
         }
     }
@@ -80,8 +89,10 @@ public class VInitializer {
         }
     }
 
-    //TODO: add nice queue creation system
-    public void createDevice(List<String> extensions, List<String> layers, float[] queuePriorities, Consumer<VkPhysicalDeviceFeatures> deviceFeatures, List<Function<MemoryStack, Struct>> applicators, List<Consumer<Struct>> postApplicators) {
+    // TODO: add nice queue creation system
+    public void createDevice(List<String> extensions, List<String> layers, float[] queuePriorities,
+            Consumer<VkPhysicalDeviceFeatures> deviceFeatures, List<Function<MemoryStack, Struct>> applicators,
+            List<Consumer<Struct>> postApplicators) {
         var deviceExtensions = new HashSet<>(getDeviceExtensionStrings(physicalDevice));
         for (var extension : extensions) {
             if (!deviceExtensions.contains(extension)) {
@@ -99,7 +110,8 @@ public class VInitializer {
 
             VkDeviceCreateInfo createInfo = VkDeviceCreateInfo.calloc(stack)
                     .sType$Default()
-                    .ppEnabledExtensionNames(stack.pointers(extensions.stream().map(stack::UTF8).toArray(ByteBuffer[]::new)))
+                    .ppEnabledExtensionNames(
+                            stack.pointers(extensions.stream().map(stack::UTF8).toArray(ByteBuffer[]::new)))
                     .ppEnabledLayerNames(stack.pointers(layers.stream().map(stack::UTF8).toArray(ByteBuffer[]::new)))
                     .pQueueCreateInfos(queueCreateInfos);
 
@@ -123,7 +135,7 @@ public class VInitializer {
                 vkGetPhysicalDeviceFeatures2(physicalDevice, deviceProperties2);
                 postApplicators.get(i).accept(feature);
                 long next = feature.address();
-                MemoryUtil.memPutAddress(chain+8, next);
+                MemoryUtil.memPutAddress(chain + 8, next);
                 chain = next;
             }
 
@@ -189,7 +201,7 @@ public class VInitializer {
     }
 
     public VContext createContext() {
-        //TODO:FIXME: DONT HARDCODE THE FACT IT HAS DEVICE ADDRESSES
+        // TODO:FIXME: DONT HARDCODE THE FACT IT HAS DEVICE ADDRESSES
         return new VContext(device, queueCount, true, debugMessenger != 0);
     }
 }

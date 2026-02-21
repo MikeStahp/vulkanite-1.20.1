@@ -16,6 +16,7 @@ import org.lwjgl.vulkan.VkPhysicalDeviceAccelerationStructureFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceBufferDeviceAddressFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayQueryFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingPipelineFeaturesKHR;
+import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
 
 import java.io.File;
 import java.io.IOException;
@@ -103,14 +104,19 @@ public class Test {
                                 .rayQuery(true),
 
                         stack-> VkPhysicalDeviceRayTracingPipelineFeaturesKHR.calloc(stack)
-                                .sType$Default()
-                                .rayTracingPipeline(true)
-                                .rayTracingPipelineTraceRaysIndirect(true)
-                ), List.of(
-                        s-> {},
-                        s-> {},
-                        s-> {},
-                        s-> {}
+.sType$Default()
+.rayTracingPipeline(true)
+.rayTracingPipelineTraceRaysIndirect(true),
+stack-> VkPhysicalDeviceVulkan12Features.calloc(stack)
+.sType$Default()
+.timelineSemaphore(true)
+.bufferDeviceAddress(true)
+), List.of(
+s-> {},
+s-> {},
+s-> {},
+s-> {},
+s-> {}
                 ));
 
         var context = init.createContext();

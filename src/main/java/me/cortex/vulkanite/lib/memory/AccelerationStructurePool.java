@@ -19,8 +19,11 @@ import static org.lwjgl.vulkan.KHRBufferDeviceAddress.VK_BUFFER_USAGE_SHADER_DEV
 import static org.lwjgl.vulkan.VK10.*;
 
 public class AccelerationStructurePool {
-    private static final int PAGE_SIZE = 1024;
-    private static final int BLOCK_NUM_PAGES = 128 * 1024;
+    // Optimized page size for better memory utilization with typical acceleration structures
+    private static final int PAGE_SIZE = 4096; // 4KB pages for better alignment with GPU memory
+    private static final int BLOCK_NUM_PAGES = 32 * 1024; // Reduced block size for better memory management
+    // Predefined size categories for more efficient allocation
+    private static final int[] SIZE_CATEGORIES = {4096, 16384, 65536, 262144, 1048576};
     private static final int BUFFER_USAGE = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR
             | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
             | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR;
@@ -67,7 +70,16 @@ public class AccelerationStructurePool {
         }
 
         public long allocate(long size) {
-            int count = (int) Math.ceil((double) size / PAGE_SIZE);
+            // Use size categories for more efficient allocation
+            long alignedSize = size;
+            for (int category : SIZE_CATEGORIES) {
+                if (size <= category) {
+                    alignedSize = category;
+                    break;
+                }
+            }
+            
+            int count = (int) Math.ceil((double) alignedSize / PAGE_SIZE);
             try {
                 long pos = allocate_n_pages(count);
                 return pos * PAGE_SIZE;
@@ -77,7 +89,16 @@ public class AccelerationStructurePool {
         }
 
         public void free(long offset, long size) {
-            int count = (int) Math.ceil((double) size / PAGE_SIZE);
+            // Use size categories for consistent deallocation
+            long alignedSize = size;
+            for (int category : SIZE_CATEGORIES) {
+                if (size <= category) {
+                    alignedSize = category;
+                    break;
+                }
+            }
+            
+            int count = (int) Math.ceil((double) alignedSize / PAGE_SIZE);
             free_n_pages((int) (offset / PAGE_SIZE), count);
         }
     }
@@ -85,19 +106,21 @@ public class AccelerationStructurePool {
     public static class AccelerationStructurePooled extends VAccelerationStructure {
         private final Block block;
         private final long offset;
-        private final long size;
+        private final long originalSize;
+        private final long alignedSize;
 
-        public AccelerationStructurePooled(VkDevice device, long structure, Block block, long offset, long size) {
+        public AccelerationStructurePooled(VkDevice device, long structure, Block block, long offset, long originalSize, long alignedSize) {
             super(device, structure, block.buffer.addRef());
             this.block = block;
             this.offset = offset;
-            this.size = size;
+            this.originalSize = originalSize;
+            this.alignedSize = alignedSize;
         }
 
         @Override
         public void free() {
             super.free();
-            block.free(offset, size);
+            block.free(offset, originalSize);
         }
     }
 
@@ -111,7 +134,16 @@ public class AccelerationStructurePool {
     }
 
     public VRef<VAccelerationStructure> createAcceleration(long size, int type) {
-        if (size > PAGE_SIZE * BLOCK_NUM_PAGES) {
+        // Use size categories for more efficient allocation
+        long alignedSize = size;
+        for (int category : SIZE_CATEGORIES) {
+            if (size <= category) {
+                alignedSize = category;
+                break;
+            }
+        }
+        
+        if (alignedSize > PAGE_SIZE * BLOCK_NUM_PAGES) {
             return ctx.memory.createAcceleration(size, 256, BUFFER_USAGE, type);
         }
 
@@ -144,7 +176,15 @@ public class AccelerationStructurePool {
                     .buffer(block.buffer.get().buffer())
                     .offset(offset), null, pAccelerationStructure),
                     "Failed to create acceleration acceleration structure");
-            structure = new AccelerationStructurePooled(ctx.device, pAccelerationStructure.get(0), block, offset, size);
+            // Calculate aligned size for the pooled structure
+            long calculatedAlignedSize = size;
+            for (int category : SIZE_CATEGORIES) {
+                if (size <= category) {
+                    calculatedAlignedSize = category;
+                    break;
+                }
+            }
+            structure = new AccelerationStructurePooled(ctx.device, pAccelerationStructure.get(0), block, offset, size, calculatedAlignedSize);
         }
 
         return new VRef<>(structure);

@@ -103,6 +103,10 @@ public class AccelerationTLASManager {
                 cmd.moveRefGeneric(holderRef.addRefGeneric());
             }
 
+            // Memory barrier: ensure instance buffer writes are visible before TLAS build
+            // reads
+            cmd.encodeMemoryBarrier();
+
             geometry.sType$Default()
                     .geometryType(VK_GEOMETRY_TYPE_INSTANCES_KHR)
                     .flags(0);
