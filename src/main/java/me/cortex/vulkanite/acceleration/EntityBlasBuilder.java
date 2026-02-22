@@ -29,9 +29,34 @@ import static org.lwjgl.vulkan.VK10.*;
 
 public class EntityBlasBuilder {
     private final VContext ctx;
+    private final List<VRef<VBuffer>> reusableStagingBuffers = new ArrayList<>();
+    private final List<VRef<VBuffer>> reusableGeometryBuffers = new ArrayList<>();
 
     public EntityBlasBuilder(VContext context) {
         this.ctx = context;
+    }
+
+    private VRef<VBuffer> getBuffer(List<VRef<VBuffer>> pool, long size, int usage, int memoryProperties, long alignment, int allocationFlags) {
+        for (int i = 0; i < pool.size(); i++) {
+            var ref = pool.get(i);
+            if (ref.get().getRefCount() == 1 && ref.get().size() >= size) {
+                return ref.addRef();
+            }
+        }
+        var newBuffer = ctx.memory.createBuffer(size, usage, memoryProperties, alignment, allocationFlags);
+        pool.add(newBuffer.addRef());
+        return newBuffer;
+    }
+
+    public void free() {
+        for (var ref : reusableStagingBuffers) {
+            ref.close();
+        }
+        reusableStagingBuffers.clear();
+        for (var ref : reusableGeometryBuffers) {
+            ref.close();
+        }
+        reusableGeometryBuffers.clear();
     }
 
     private static VRef<VAccelerationStructure> executeBlasBuild(VContext ctx, VCmdBuff cmd, MemoryStack stack, VkAccelerationStructureGeometryKHR.Buffer geometryInfos, int[] prims) {
@@ -108,16 +133,16 @@ public class EntityBlasBuilder {
         //Each render layer gets its own geometry entry in the blas
 
         //TODO: PUT THE BINDLESS TEXTURE REFERENCE AT THE START OF THE render layers geometry buffer
-        var geometryBufferStaging = ctx.memory.createBuffer(
+        var geometryBufferStaging = getBuffer(reusableStagingBuffers,
                 combined_size,
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                 0,
                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
-        var geometryBuffer = ctx.memory.createBuffer(
+        var geometryBuffer = getBuffer(reusableGeometryBuffers,
                 combined_size,
                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, 0);
         long ptr = geometryBufferStaging.get().map();
         long offset = 0;
         List<BuildInfo> infos = new ArrayList<>();
