@@ -182,7 +182,7 @@ public class MemoryManager {
             int glId = glCreateBuffers();
             glNamedBufferStorageMemEXT(glId, size, memoryObject, alloc.ai.offset());
             _CHECK_GL_ERROR_();
-            return VGBuffer.create(alloc, usage, glId);
+            return VGBuffer.create(alloc, usage, properties, glId);
         }
     }
 
@@ -281,9 +281,10 @@ public class MemoryManager {
                             .usage(usage),
                     VmaAllocationCreateInfo.calloc(stack)
                             .usage(VMA_MEMORY_USAGE_AUTO)
-                            .requiredFlags(properties),
+                            .requiredFlags(properties)
+                            .flags(vmaFlags),
                     alignment);
-            return VBuffer.create(alloc, usage);
+            return VBuffer.create(alloc, usage, properties, vmaFlags);
         }
     }
 

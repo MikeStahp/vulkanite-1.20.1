@@ -121,6 +121,7 @@ public class Vulkanite {
     }
 
     public void destroy() {
+        accelerationManager.destroy();
         vkDeviceWaitIdle(ctx.device);
         descriptorPools.clear();
     }
