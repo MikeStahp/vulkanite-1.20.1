@@ -29,12 +29,36 @@ import static org.lwjgl.vulkan.VK10.*;
 
 public class EntityBlasBuilder {
     private final VContext ctx;
+    private final List<VRef<VBuffer>> pool = new ArrayList<>();
 
     public EntityBlasBuilder(VContext context) {
         this.ctx = context;
     }
 
-    private static VRef<VAccelerationStructure> executeBlasBuild(VContext ctx, VCmdBuff cmd, MemoryStack stack, VkAccelerationStructureGeometryKHR.Buffer geometryInfos, int[] prims) {
+    private VRef<VBuffer> getBuffer(long size, int usage, int properties, int vmaFlags, long alignment) {
+        for (var ref : pool) {
+            var buf = ref.get();
+            if (buf.getRefCount() == 1 &&
+                    buf.size() >= size &&
+                    buf.usage() == usage &&
+                    buf.properties == properties &&
+                    buf.vmaFlags == vmaFlags) {
+                return ref.addRef();
+            }
+        }
+        var buf = ctx.memory.createBuffer(size, usage, properties, alignment, vmaFlags);
+        pool.add(buf);
+        return buf.addRef();
+    }
+
+    public void free() {
+        for (var ref : pool) {
+            ref.close();
+        }
+        pool.clear();
+    }
+
+    private VRef<VAccelerationStructure> executeBlasBuild(VCmdBuff cmd, MemoryStack stack, VkAccelerationStructureGeometryKHR.Buffer geometryInfos, int[] prims) {
         var buildInfos = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
         var buildRanges = VkAccelerationStructureBuildRangeInfoKHR.calloc(prims.length, stack);
         for (int primCount : prims) {
@@ -60,12 +84,17 @@ public class EntityBlasBuilder {
                 buildSizesInfo);
 
 
-        var structure = ctx.memory.createAcceleration(buildSizesInfo.accelerationStructureSize(), 256,
-                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+        var buffer = getBuffer(buildSizesInfo.accelerationStructureSize(),
+                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                0,
+                256);
+        var structure = ctx.memory.createAcceleration(buffer, 0, buildSizesInfo.accelerationStructureSize(), VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+        buffer.close();
 
-        var scratch = ctx.memory.createBuffer(buildSizesInfo.buildScratchSize(),
+        var scratch = getBuffer(buildSizesInfo.buildScratchSize(),
                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 256, 0);
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, 256);
 
         bi.scratchData(VkDeviceOrHostAddressKHR.calloc(stack).deviceAddress(scratch.get().deviceAddress()));
         bi.dstAccelerationStructure(structure.get().structure);
@@ -108,16 +137,18 @@ public class EntityBlasBuilder {
         //Each render layer gets its own geometry entry in the blas
 
         //TODO: PUT THE BINDLESS TEXTURE REFERENCE AT THE START OF THE render layers geometry buffer
-        var geometryBufferStaging = ctx.memory.createBuffer(
+        var geometryBufferStaging = getBuffer(
                 combined_size,
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                0,
-                VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
-        var geometryBuffer = ctx.memory.createBuffer(
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+                0);
+        var geometryBuffer = getBuffer(
                 combined_size,
                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                0,
+                0);
         long ptr = geometryBufferStaging.get().map();
         long offset = 0;
         List<BuildInfo> infos = new ArrayList<>();
@@ -142,7 +173,7 @@ public class EntityBlasBuilder {
             int[] primitiveCounts = new int[infos.size()];
             var buildInfo = populateBuildStructs(ctx, stack, cmd, infos, primitiveCounts);
 
-            blas = executeBlasBuild(ctx, cmd, stack, buildInfo, primitiveCounts);
+            blas = executeBlasBuild(cmd, stack, buildInfo, primitiveCounts);
         }
 
         return List.of(new BLASResult(blas, geometryBuffer, offsets));

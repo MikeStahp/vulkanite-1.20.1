@@ -12,13 +12,17 @@ public class VBuffer extends VObject {
     private BufferAllocation allocation;
     private final VkDeviceOrHostAddressConstKHR deviceAddressConst;
     private final int usage;
+    public final int properties;
+    public final int vmaFlags;
 
-    public static VRef<VBuffer> create(BufferAllocation allocation, int usage) {
-        return new VRef<>(new VBuffer(allocation, usage));
+    public static VRef<VBuffer> create(BufferAllocation allocation, int usage, int properties, int vmaFlags) {
+        return new VRef<>(new VBuffer(allocation, usage, properties, vmaFlags));
     }
 
-    protected VBuffer(BufferAllocation allocation, int usage) {
+    protected VBuffer(BufferAllocation allocation, int usage, int properties, int vmaFlags) {
         this.allocation = allocation;
+        this.properties = properties;
+        this.vmaFlags = vmaFlags;
         if (allocation.deviceAddress != -1) {
             this.deviceAddressConst = VkDeviceOrHostAddressConstKHR.calloc()
                     .deviceAddress(allocation.deviceAddress);
