@@ -12,12 +12,16 @@ public class VBuffer extends VObject {
     private BufferAllocation allocation;
     private final VkDeviceOrHostAddressConstKHR deviceAddressConst;
     private final int usage;
+    private final int memoryProperties;
+    private final int vmaFlags;
 
-    public static VRef<VBuffer> create(BufferAllocation allocation, int usage) {
-        return new VRef<>(new VBuffer(allocation, usage));
+    public static VRef<VBuffer> create(BufferAllocation allocation, int usage, int memoryProperties, int vmaFlags) {
+        return new VRef<>(new VBuffer(allocation, usage, memoryProperties, vmaFlags));
     }
 
-    protected VBuffer(BufferAllocation allocation, int usage) {
+    protected VBuffer(BufferAllocation allocation, int usage, int memoryProperties, int vmaFlags) {
+        this.memoryProperties = memoryProperties;
+        this.vmaFlags = vmaFlags;
         this.allocation = allocation;
         if (allocation.deviceAddress != -1) {
             this.deviceAddressConst = VkDeviceOrHostAddressConstKHR.calloc()
@@ -79,5 +83,13 @@ public class VBuffer extends VObject {
 
     public void setDebugUtilsObjectName(String name) {
         Vulkanite.INSTANCE.getCtx().setDebugUtilsObjectName(buffer(), VK_OBJECT_TYPE_BUFFER, name);
+    }
+
+    public int memoryProperties() {
+        return memoryProperties;
+    }
+
+    public int vmaFlags() {
+        return vmaFlags;
     }
 }
