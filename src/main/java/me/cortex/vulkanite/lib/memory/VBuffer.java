@@ -36,6 +36,14 @@ public class VBuffer extends VObject {
         return usage;
     }
 
+    public int memoryProperties() {
+        return allocation.memoryProperties;
+    }
+
+    public int vmaFlags() {
+        return allocation.vmaFlags;
+    }
+
     protected void free() {
         allocation.free();
         allocation = null;
