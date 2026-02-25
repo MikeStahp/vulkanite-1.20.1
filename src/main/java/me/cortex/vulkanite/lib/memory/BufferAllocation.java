@@ -19,12 +19,16 @@ public class BufferAllocation extends Allocation {
     protected final VkDevice device;
     public final long buffer;
     public final long deviceAddress;
+    public final int memoryProperties;
+    public final int vmaFlags;
 
-    protected BufferAllocation(VkDevice device, long allocator, long buffer, long allocation, VmaAllocationInfo info, boolean hasDeviceAddresses, boolean requestAddress) {
+    protected BufferAllocation(VkDevice device, long allocator, long buffer, long allocation, VmaAllocationInfo info, boolean hasDeviceAddresses, boolean requestAddress, int memoryProperties, int vmaFlags) {
         super(allocation, info);
         this.device = device;
         this.allocator = allocator;
         this.buffer = buffer;
+        this.memoryProperties = memoryProperties;
+        this.vmaFlags = vmaFlags;
 
         if (hasDeviceAddresses && requestAddress) {
             try (MemoryStack stack = stackPush()) {
@@ -36,6 +40,11 @@ public class BufferAllocation extends Allocation {
         } else {
             this.deviceAddress = -1;
         }
+    }
+
+    // Constructor without properties/flags for backward compatibility if needed, or update call sites
+    protected BufferAllocation(VkDevice device, long allocator, long buffer, long allocation, VmaAllocationInfo info, boolean hasDeviceAddresses, boolean requestAddress) {
+        this(device, allocator, buffer, allocation, info, hasDeviceAddresses, requestAddress, 0, 0);
     }
 
     @Override

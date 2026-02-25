@@ -21,7 +21,10 @@ public class SharedQuadVkIndexBuffer {
 
     public synchronized static VRef<VBuffer> getIndexBuffer(VContext context, VCmdBuff uploaCmdBuff, int quadCount) {
         if (currentQuadCount < quadCount) {
-            makeNewIndexBuffer(context, uploaCmdBuff, quadCount);
+            // Apply exponential growth strategy to reduce frequency of reallocations
+            // Ensure we allocate at least enough for the request, but grow by 50% + overhead if expanding
+            int newCapacity = Math.max(quadCount, (int)(currentQuadCount * 1.5) + 2048);
+            makeNewIndexBuffer(context, uploaCmdBuff, newCapacity);
         }
 
         return indexBuffer.addRef();
@@ -30,6 +33,11 @@ public class SharedQuadVkIndexBuffer {
     private static void makeNewIndexBuffer(VContext context, VCmdBuff uploaCmdBuff, int quadCount) {
         ByteBuffer buffer = genQuadIdxs(quadCount);
         try {
+            // Close the old buffer if it exists to prevent memory leak
+            if (indexBuffer != null) {
+                indexBuffer.close();
+            }
+
             //TODO: dont harcode VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR and VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
             indexBuffer = context.memory.createBuffer(buffer.remaining(),
                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT

@@ -183,7 +183,7 @@ public class VmaAllocator {
                     "Failed to allocate buffer");
 
             boolean requestAddress = (bufferCreateInfo.usage() & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
-            return new BufferAllocation(device, allocator, pb.get(0), pa.get(0), vai, hasDeviceAddresses, requestAddress);
+            return new BufferAllocation(device, allocator, pb.get(0), pa.get(0), vai, hasDeviceAddresses, requestAddress, allocationCreateInfo.requiredFlags(), allocationCreateInfo.flags());
         }
     }
 
