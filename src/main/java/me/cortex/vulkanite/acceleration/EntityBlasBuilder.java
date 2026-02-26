@@ -30,11 +30,27 @@ import static org.lwjgl.vulkan.VK10.*;
 public class EntityBlasBuilder {
     private final VContext ctx;
 
+    // Cached buffers for reuse to reduce allocation overhead
+    private VRef<VBuffer> reusableGeometryBuffer;
+    private VRef<VBuffer> reusableScratchBuffer;
+
     public EntityBlasBuilder(VContext context) {
         this.ctx = context;
     }
 
-    private static VRef<VAccelerationStructure> executeBlasBuild(VContext ctx, VCmdBuff cmd, MemoryStack stack, VkAccelerationStructureGeometryKHR.Buffer geometryInfos, int[] prims) {
+    // Called to clean up cached buffers if needed
+    public void free() {
+        if (reusableGeometryBuffer != null) {
+            reusableGeometryBuffer.close();
+            reusableGeometryBuffer = null;
+        }
+        if (reusableScratchBuffer != null) {
+            reusableScratchBuffer.close();
+            reusableScratchBuffer = null;
+        }
+    }
+
+    private VRef<VAccelerationStructure> executeBlasBuild(VContext ctx, VCmdBuff cmd, MemoryStack stack, VkAccelerationStructureGeometryKHR.Buffer geometryInfos, int[] prims) {
         var buildInfos = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
         var buildRanges = VkAccelerationStructureBuildRangeInfoKHR.calloc(prims.length, stack);
         for (int primCount : prims) {
@@ -63,11 +79,24 @@ public class EntityBlasBuilder {
         var structure = ctx.memory.createAcceleration(buildSizesInfo.accelerationStructureSize(), 256,
                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR, VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
 
-        var scratch = ctx.memory.createBuffer(buildSizesInfo.buildScratchSize(),
-                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 256, 0);
+        // Resize scratch buffer if needed
+        long scratchSize = buildSizesInfo.buildScratchSize();
+        if (reusableScratchBuffer == null || reusableScratchBuffer.get().size() < scratchSize) {
+            if (reusableScratchBuffer != null) {
+                reusableScratchBuffer.close();
+            }
+            reusableScratchBuffer = ctx.memory.createBuffer(scratchSize,
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 256, 0);
+            reusableScratchBuffer.get().setDebugUtilsObjectName("Entity BLAS Scratch Buffer");
+        } else {
+            // Add barrier to synchronize access to the reused scratch buffer
+            cmd.encodeBufferBarrier(reusableScratchBuffer, 0, reusableScratchBuffer.get().size(),
+                    VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                    VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
+        }
 
-        bi.scratchData(VkDeviceOrHostAddressKHR.calloc(stack).deviceAddress(scratch.get().deviceAddress()));
+        bi.scratchData(VkDeviceOrHostAddressKHR.calloc(stack).deviceAddress(reusableScratchBuffer.get().deviceAddress()));
         bi.dstAccelerationStructure(structure.get().structure);
 
         buildInfos.rewind();
@@ -81,8 +110,9 @@ public class EntityBlasBuilder {
                 .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR), null, null);
 
         cmd.addAccelerationStructureRef(structure);
-        cmd.addBufferRef(scratch);
-        scratch.close();
+        // Important: Keep reference in command buffer so it stays alive during execution
+        cmd.addBufferRef(reusableScratchBuffer);
+        // DO NOT close reusableScratchBuffer here, we keep it for reuse
 
         return structure;
     }
@@ -114,10 +144,37 @@ public class EntityBlasBuilder {
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                 0,
                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
-        var geometryBuffer = ctx.memory.createBuffer(
-                combined_size,
-                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        // Reuse geometry buffer logic
+        if (reusableGeometryBuffer == null || reusableGeometryBuffer.get().size() < combined_size) {
+            if (reusableGeometryBuffer != null) {
+                reusableGeometryBuffer.close();
+            }
+            reusableGeometryBuffer = ctx.memory.createBuffer(
+                    combined_size,
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            reusableGeometryBuffer.get().setDebugUtilsObjectName("Entity BLAS Geometry Buffer");
+        } else {
+            // Add barrier to ensure previous frame's AS build read is complete before we overwrite with transfer
+            // We use a manual barrier here because VCmdBuff helper doesn't support the specific access flags we need for WAR dependency
+            try (var stack = MemoryStack.stackPush()) {
+                var barrier = VkBufferMemoryBarrier.calloc(1, stack);
+                barrier.get(0).sType$Default()
+                        .srcAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR)
+                        .dstAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                        .buffer(reusableGeometryBuffer.get().buffer())
+                        .offset(0)
+                        .size(reusableGeometryBuffer.get().size());
+
+                vkCmdPipelineBarrier(cmd.buffer(),
+                        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        0, null, barrier, null);
+            }
+            cmd.addBufferRef(reusableGeometryBuffer);
+        }
+
         long ptr = geometryBufferStaging.get().map();
         long offset = 0;
         List<BuildInfo> infos = new ArrayList<>();
@@ -125,7 +182,7 @@ public class EntityBlasBuilder {
         for (var pair : renders) {
             offset = VUtil.alignUp(offset, 128);
             MemoryUtil.memCopy(MemoryUtil.memAddress(pair.getRight().getVertexBuffer()), ptr + offset, pair.getRight().getVertexBuffer().remaining());
-            infos.add(new BuildInfo(pair.getRight().getParameters().format(), pair.getRight().getParameters().indexCount() / 6, geometryBuffer.get().deviceAddress() + offset));
+            infos.add(new BuildInfo(pair.getRight().getParameters().format(), pair.getRight().getParameters().indexCount() / 6, reusableGeometryBuffer.get().deviceAddress() + offset));
             offsets.add(offset);
 
             offset += pair.getRight().getVertexBuffer().remaining();
@@ -133,8 +190,8 @@ public class EntityBlasBuilder {
         cmd.addBufferRef(geometryBufferStaging);
         geometryBufferStaging.get().unmap();
 
-        cmd.encodeBufferCopy(geometryBufferStaging, 0, geometryBuffer, 0, combined_size);
-        cmd.encodeBufferBarrier(geometryBuffer, 0, combined_size, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
+        cmd.encodeBufferCopy(geometryBufferStaging, 0, reusableGeometryBuffer, 0, combined_size);
+        cmd.encodeBufferBarrier(reusableGeometryBuffer, 0, combined_size, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
         geometryBufferStaging.close();
 
         VRef<VAccelerationStructure> blas;
@@ -145,7 +202,9 @@ public class EntityBlasBuilder {
             blas = executeBlasBuild(ctx, cmd, stack, buildInfo, primitiveCounts);
         }
 
-        return List.of(new BLASResult(blas, geometryBuffer, offsets));
+        // Return a NEW reference to the reused buffer so the caller can close it without affecting our cached reference
+        // Note: The caller (AccelerationTLASManager) will close this reference, but we still hold ours in `reusableGeometryBuffer`
+        return List.of(new BLASResult(blas, reusableGeometryBuffer.addRef(), offsets));
     }
 
     private VkAccelerationStructureGeometryKHR.Buffer populateBuildStructs(VContext ctx, MemoryStack stack, VCmdBuff cmdBuff, List<BuildInfo> geometries, int[] primitiveCounts) {
