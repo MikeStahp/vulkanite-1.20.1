@@ -38,9 +38,19 @@ public class TLASInstanceBuffer {
 
     private final List<VkAccelerationStructureInstanceKHR> ephemeralInstances = new ArrayList<>();
 
+    // We assume 3 frames in flight as that's typical for vulkan renderers including this one (VInitializer uses 3)
+    private static final int FRAMES_IN_FLIGHT = 3;
+    private final List<VRef<VBuffer>> reusableBuffers;
+    private int bufferIndex = 0;
+
     public TLASInstanceBuffer(VContext context) {
         this.context = context;
         resize(32768);
+
+        reusableBuffers = new ArrayList<>(FRAMES_IN_FLIGHT);
+        for (int i = 0; i < FRAMES_IN_FLIGHT; i++) {
+            reusableBuffers.add(null);
+        }
     }
 
     private static int roundUpPow2(int v) {
@@ -168,13 +178,21 @@ public class TLASInstanceBuffer {
             size = VkAccelerationStructureInstanceKHR.SIZEOF;
         }
 
-        VRef<VBuffer> data = context.memory.createBuffer(size,
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT
-                        | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
-                        | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR,
-                VK_MEMORY_HEAP_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                0, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
-        data.get().setDebugUtilsObjectName("TLAS Instance Buffer");
+        // Reuse buffer logic
+        VRef<VBuffer> data = reusableBuffers.get(bufferIndex);
+        if (data == null || data.get().size() < size) {
+            if (data != null) {
+                data.close();
+            }
+            data = context.memory.createBuffer(size,
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                            | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+                            | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR,
+                    VK_MEMORY_HEAP_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                    0, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+            data.get().setDebugUtilsObjectName("TLAS Instance Buffer");
+            reusableBuffers.set(bufferIndex, data);
+        }
 
         long persistentSize = VkAccelerationStructureInstanceKHR.SIZEOF * (long) this.count;
         long ptr = data.get().map();
@@ -193,6 +211,26 @@ public class TLASInstanceBuffer {
         data.get().unmap();
         data.get().flush();
 
-        return new Pair<>(data, totalCount);
+        // Increment buffer index for next frame
+        bufferIndex = (bufferIndex + 1) % FRAMES_IN_FLIGHT;
+
+        return new Pair<>(data.addRef(), totalCount);
+    }
+
+    /**
+     * Clean up resources.
+     */
+    public void free() {
+        if (instances != null) {
+            instances.free();
+            instances = null;
+        }
+        for (int i = 0; i < reusableBuffers.size(); i++) {
+            if (reusableBuffers.get(i) != null) {
+                reusableBuffers.get(i).close();
+                reusableBuffers.set(i, null);
+            }
+        }
+        reusableBuffers.clear();
     }
 }
