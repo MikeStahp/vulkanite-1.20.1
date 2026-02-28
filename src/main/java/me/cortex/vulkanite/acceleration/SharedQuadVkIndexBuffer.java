@@ -21,13 +21,21 @@ public class SharedQuadVkIndexBuffer {
 
     public synchronized static VRef<VBuffer> getIndexBuffer(VContext context, VCmdBuff uploaCmdBuff, int quadCount) {
         if (currentQuadCount < quadCount) {
-            makeNewIndexBuffer(context, uploaCmdBuff, quadCount);
+            // ⚡ Bolt: Implement exponential growth strategy to minimize expensive GPU buffer reallocations
+            // Allocates 1.5x the requested amount + 2048 to prevent frequent resizing when quad count grows
+            int newQuadCount = quadCount + (quadCount >> 1) + 2048;
+            makeNewIndexBuffer(context, uploaCmdBuff, newQuadCount);
         }
 
         return indexBuffer.addRef();
     }
 
     private static void makeNewIndexBuffer(VContext context, VCmdBuff uploaCmdBuff, int quadCount) {
+        // ⚡ Bolt: Close the previous buffer to prevent memory leaks before replacing it
+        if (indexBuffer != null) {
+            indexBuffer.close();
+        }
+
         ByteBuffer buffer = genQuadIdxs(quadCount);
         try {
             //TODO: dont harcode VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR and VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
