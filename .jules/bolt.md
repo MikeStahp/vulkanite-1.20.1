@@ -1,0 +1,3 @@
+## 2024-05-24 - Entity Rendering Lambda Allocations
+**Learning:** In Minecraft rendering, entity rendering loops execute frequently per frame (once per entity). Using capturing lambdas (like `HashMap.compute` capturing local variables, or `Map.forEach`) inside these hot paths causes continuous object allocations leading to GC pressure.
+**Action:** Replace functional programming constructs (like `.compute` and `.forEach`) with standard imperative loops and conditional logic (`get`/`put` and `for-each` loops) in frequently executed rendering methods. Re-use generic collections (like `ArrayList`) as class fields instead of allocating them locally, but explicitly document that their lifetime is bounded (e.g., must be processed before the next frame).
