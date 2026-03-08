@@ -39,11 +39,13 @@ public abstract class MixinGlResource {
         }
     }
 
-    @Overwrite
     /**
      * Gets the OpenGL ID of this resource.
+     * @author Cortex
+     * @reason Intercept for Vulkanite
      * @return the OpenGL ID
      */
+    @Overwrite
     protected int getGlId(){
         assertValid();
         return this.newId;

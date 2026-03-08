@@ -18,38 +18,43 @@ import static org.lwjgl.vulkan.VK10.*;
  */
 public class RtxResourceManager {
     private final VContext ctx;
-    
+
     // ReSTIR reservoirs - now managed by ImageOverflowManager
     private VRef<VImage> reservoirA;
     private VRef<VImage> reservoirB;
     private VRef<VImageView> reservoirAView;
     private VRef<VImageView> reservoirBView;
-    
+
     // Reference to the ImageOverflowManager
     private ImageOverflowManager overflowManager;
-    
+
     // Flag to indicate if ReSTIR is being used
     private boolean restirEnabled = false;
-    
+
     public RtxResourceManager(VContext ctx) {
         this.ctx = ctx;
     }
-    
+
     /**
      * Initialize ReSTIR reservoirs if needed
      */
-    public void initializeRestirReservoirs(boolean enabled, List<VRef<VGImage>> providedReservoirs, int displayWidth, int displayHeight) {
+    public void initializeRestirReservoirs(boolean enabled, List<VRef<VGImage>> providedReservoirs, int displayWidth,
+            int displayHeight) {
         // Use config setting to override enabled flag
         VulkaniteConfig config = VulkaniteConfig.getInstance();
-        this.restirEnabled = enabled && config.enableRestir;
-        System.out.println("[Vulkanite] Setting restirEnabled to: " + this.restirEnabled + " (enabled: " + enabled + ", config.enableRestir: " + config.enableRestir + ")");
-        
+        me.cortex.vulkanite.client.config.DLSSConfig dlssConfig = me.cortex.vulkanite.client.config.DLSSConfig.load();
+        this.restirEnabled = enabled && dlssConfig.isReSTIREnabled();
+        System.out.println("[Vulkanite] Setting restirEnabled to: " + this.restirEnabled + " (enabled: " + enabled
+                + ", dlssConfig.enableReSTIR: " + dlssConfig.isReSTIREnabled() + ")");
+
         // If we have an overflow manager, try to get reservoirs from there first
-        System.out.println("[Vulkanite] Checking for overflow manager reservoirs: overflowManager=" + overflowManager + ", hasRestirReservoirs=" + (overflowManager != null ? overflowManager.hasRestirReservoirs() : "N/A"));
+        System.out.println("[Vulkanite] Checking for overflow manager reservoirs: overflowManager=" + overflowManager
+                + ", hasRestirReservoirs=" + (overflowManager != null ? overflowManager.hasRestirReservoirs() : "N/A"));
         if (overflowManager != null && overflowManager.hasRestirReservoirs()) {
             this.reservoirAView = overflowManager.getReservoirA();
             this.reservoirBView = overflowManager.getReservoirB();
-            System.out.println("[Vulkanite] Got reservoir views from overflow manager: A=" + this.reservoirAView + ", B=" + this.reservoirBView);
+            System.out.println("[Vulkanite] Got reservoir views from overflow manager: A=" + this.reservoirAView
+                    + ", B=" + this.reservoirBView);
             // Get the underlying images from the views
             if (reservoirAView != null && reservoirAView.get() != null) {
                 this.reservoirA = new VRef<>(reservoirAView.get().image.get());
@@ -65,31 +70,35 @@ public class RtxResourceManager {
                 // Use provided reservoirs
                 this.reservoirA = new VRef<>(providedReservoirs.get(0).get());
                 this.reservoirB = new VRef<>(providedReservoirs.get(1).get());
-                System.out.println("[Vulkanite] Using provided reservoirs: A=" + this.reservoirA + ", B=" + this.reservoirB);
+                System.out.println(
+                        "[Vulkanite] Using provided reservoirs: A=" + this.reservoirA + ", B=" + this.reservoirB);
             } else {
                 // Create reservoirs with proper size from config or display size
                 int width = config.restirReservoirWidth;
                 int height = config.restirReservoirHeight;
-                
+
                 if (width == -1 || height == -1) {
                     width = displayWidth;
                     height = displayHeight;
-                    System.out.println("[Vulkanite] Using display resolution for ReSTIR reservoirs: " + width + "x" + height);
+                    System.out.println(
+                            "[Vulkanite] Using display resolution for ReSTIR reservoirs: " + width + "x" + height);
                 } else {
-                    System.out.println("[Vulkanite] Using config resolution for ReSTIR reservoirs: " + width + "x" + height);
+                    System.out.println(
+                            "[Vulkanite] Using config resolution for ReSTIR reservoirs: " + width + "x" + height);
                 }
-                
+
                 this.reservoirA = ctx.memory.createImage2D(width, height, 1,
-                    VK_FORMAT_R32G32B32A32_SFLOAT,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                        VK_FORMAT_R32G32B32A32_SFLOAT,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 this.reservoirB = ctx.memory.createImage2D(width, height, 1,
-                    VK_FORMAT_R32G32B32A32_SFLOAT,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                System.out.println("[Vulkanite] Created ReSTIR reservoirs: A=" + this.reservoirA + ", B=" + this.reservoirB);
+                        VK_FORMAT_R32G32B32A32_SFLOAT,
+                        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                System.out.println(
+                        "[Vulkanite] Created ReSTIR reservoirs: A=" + this.reservoirA + ", B=" + this.reservoirB);
             }
-            
+
             // Create image views if we didn't get them from overflow manager
             if (this.reservoirAView == null) {
                 this.reservoirAView = VImageView.create(ctx, reservoirA);
@@ -103,35 +112,35 @@ public class RtxResourceManager {
             System.out.println("[Vulkanite] ReSTIR not enabled, skipping reservoir initialization");
         }
     }
-    
+
     /**
      * Get ReSTIR reservoir A
      */
     public VRef<VImageView> getReservoirA() {
         return reservoirAView;
     }
-    
+
     /**
      * Get ReSTIR reservoir B
      */
     public VRef<VImageView> getReservoirB() {
         return reservoirBView;
     }
-    
+
     /**
      * Check if ReSTIR is enabled
      */
     public boolean isRestirEnabled() {
         return restirEnabled;
     }
-    
+
     /**
      * Set the overflow manager for managing images beyond Iris limit
      */
     public void setOverflowManager(ImageOverflowManager overflowManager) {
         this.overflowManager = overflowManager;
     }
-    
+
     /**
      * Clean up resources
      */

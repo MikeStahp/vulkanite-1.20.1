@@ -57,7 +57,7 @@ public class AccelerationBlasBuilder {
         gpuVertexDecodePipeline = decodePipeBuilder.build(context);
 
         // Create job enqueuer
-        this.jobEnqueuer = new BLASJobEnqueuer(context, awaitingJobBatches, batchedJobs);
+        this.jobEnqueuer = new BLASJobEnqueuer(context, asyncQueue, awaitingJobBatches, batchedJobs);
 
         // Start worker thread
         var worker = new BLASBuildWorker(
@@ -69,8 +69,8 @@ public class AccelerationBlasBuilder {
                 accelerationStructurePool,
                 awaitingJobBatches,
                 batchedJobs);
-        Thread workerThread = new Thread(worker);
-        workerThread.setName("Acceleration blas worker");
+        // Use 8MB stack size for the BLAS worker thread to prevent LWJGL MemoryStack overflow
+        Thread workerThread = new Thread(null, worker, "Acceleration blas worker", 8 * 1024 * 1024);
         workerThread.start();
     }
 

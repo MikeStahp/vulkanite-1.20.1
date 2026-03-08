@@ -19,6 +19,9 @@ import net.irisshaders.iris.gl.buffer.ShaderStorageBuffer;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import static org.lwjgl.vulkan.VK10.*;
 
 /**
@@ -26,6 +29,7 @@ import static org.lwjgl.vulkan.VK10.*;
  * dispatching rays.
  */
 public final class RenderPassExecutor {
+    private static final Logger LOGGER = LoggerFactory.getLogger(RenderPassExecutor.class);
 
     private final VContext ctx;
     private final AccelerationManager accelerationManager;
@@ -47,6 +51,15 @@ public final class RenderPassExecutor {
 
     /**
      * Executes a single ray tracing pipeline pass.
+     *
+     * @param gbufferViews       Array of G-buffer image views for hybrid rendering:
+     *                           [0] = colortex1 (Albedo)
+     *                           [1] = colortex2 (Material Properties)
+     *                           [2] = colortex3 (Normal)
+     *                           [3] = colortex4 (World Position)
+     *                           [4] = colortex5 (Additional Properties)
+     * @param reservoirImageView Optional reservoir image view for ReSTIR (binding
+     *                           6)
      */
     public void execute(
             VCmdBuff cmd,
@@ -64,7 +77,28 @@ public final class RenderPassExecutor {
             List<VRef<VGImage>> vgOutImgs,
             List<VRef<VImage>> outImgs,
             SharedImageViewTracker[] customTextureViews,
-            ShaderStorageBuffer[] ssbos) {
+            ShaderStorageBuffer[] ssbos,
+            VRef<VImageView>[] gbufferViews,
+            int frameIndex,
+            int sampleIndex,
+            float sunDirectionX,
+            float sunDirectionY,
+            float sunDirectionZ,
+            float sunColorR,
+            float sunColorG,
+            float sunColorB,
+            int enableReSTIR, // New parameter for ReSTIR toggle (0/1)
+            int debugMode, // New parameter for Debug Mode (0/1)
+            VRef<VImage> currentReservoirImage,
+            VRef<VImage> prevReservoirImage,
+            VRef<VImage> motionVectorImage,
+            VRef<VImage> linearDepthImage) {
+
+        // Early empty check to avoid unnecessary encoding work
+        if (outImgs.isEmpty()) {
+            LOGGER.warn("No output images found for ray tracing. Skipping pass.");
+            return;
+        }
 
         List<VRef<?>> resourcesToClose = new ArrayList<>();
         try {
@@ -107,22 +141,153 @@ public final class RenderPassExecutor {
                         .imageSampler(4, normalView != null ? normalView : placeholderNormalsView, sampler)
                         .imageSampler(5, specularView != null ? specularView : placeholderSpecularView, sampler);
 
+                // Bind G-buffer textures for hybrid rendering (bindings 7-11)
+                // Binding 7: colortex1 (Albedo) - gbufferViews[0]
+                // Binding 8: colortex2 (Material) - gbufferViews[1]
+                // Binding 9: colortex3 (Normal) - gbufferViews[2]
+                // Binding 10: colortex4 (WorldPos) - gbufferViews[3]
+                // Binding 11: colortex5 (Extra) - gbufferViews[4]
+                if (gbufferViews != null && gbufferViews.length >= 5) {
+                    if (gbufferViews[0] != null) {
+                        LOGGER.info("Binding 7: gbufferAlbedo OK");
+                        updater.imageSampler(7, gbufferViews[0], sampler);
+                    } else {
+                        LOGGER.warn("Binding 7: gbufferAlbedo is NULL! Binding placeholder.");
+                        updater.imageSampler(7, placeholderNormalsView, sampler); // Fallback
+                    }
+
+                    if (gbufferViews[1] != null)
+                        updater.imageSampler(8, gbufferViews[1], sampler);
+                    else
+                        updater.imageSampler(8, placeholderNormalsView, sampler);
+
+                    if (gbufferViews[2] != null)
+                        updater.imageSampler(9, gbufferViews[2], sampler);
+                    else
+                        updater.imageSampler(9, placeholderNormalsView, sampler);
+
+                    if (gbufferViews[3] != null)
+                        updater.imageSampler(10, gbufferViews[3], sampler);
+                    else
+                        updater.imageSampler(10, placeholderNormalsView, sampler);
+
+                    if (gbufferViews[4] != null)
+                        updater.imageSampler(11, gbufferViews[4], sampler);
+                    else
+                        updater.imageSampler(11, placeholderNormalsView, sampler);
+                } else {
+                    LOGGER.error("G-Buffer views array is NULL or too small!");
+                }
+
                 // Reuse cached list
                 outImgViewListCache.clear();
 
-                // Determine image count from reflection
-                var binding6 = setReflection.getBindingAt(6);
-                int maxImages = (binding6 != null && binding6.arraySize() > 0) ? binding6.arraySize() : 1;
-                int imageCount = Math.min(outImgs.size(), maxImages);
+                // Check if binding 12 exists for final output
+                var binding12 = setReflection.getBindingAt(12);
 
-                for (int i = 0; i < imageCount; i++) {
-                    int index = i;
-                    var view = irisRenderTargetViews[i].getView(() -> vgOutImgs.get(index));
-                    if (view != null)
-                        resourcesToClose.add(view);
-                    outImgViewListCache.add(view);
+                // Check if binding 6 is a storage image (ReSTIR reservoir) or an image array
+                var binding6 = setReflection.getBindingAt(6);
+                if (binding6 != null) {
+                    // Check for single image (arraySize == 0 in SpirvParser)
+                    if (binding6.descriptorType() == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && binding6.arraySize() == 0) {
+                        if (binding12 != null) {
+                            // VulkaniteRT/Dirt-RT-Optimized: binding 6 is reservoir/intermediate
+                            if (currentReservoirImage != null) {
+                                LOGGER.info(
+                                        "Binding 6: Binding ReSTIR reservoir image (VulkaniteRT/Dirt-RT-Optimized path)");
+                                var reservoirView = VImageView.create(ctx, currentReservoirImage);
+                                resourcesToClose.add(reservoirView);
+                                updater.imageStore(6, reservoirView);
+                            } else {
+                                LOGGER.warn("Binding 6: Reservoir image is null!");
+                            }
+                        } else {
+                            // dirtrtold: binding 6 is the output
+                            LOGGER.info("Binding 6: Binding final output as fallback (dirtrtold path)");
+                            if (outImgViewListCache.isEmpty() && !outImgs.isEmpty()) {
+                                var view = irisRenderTargetViews[0].getView(() -> vgOutImgs.get(0));
+                                if (view != null)
+                                    resourcesToClose.add(view);
+                                outImgViewListCache.add(view);
+                            }
+                            if (!outImgViewListCache.isEmpty()) {
+                                updater.imageStore(6, outImgViewListCache.get(0));
+                            } else {
+                                LOGGER.warn("Binding 6: No output images available for fallback!");
+                            }
+                        }
+                    } else if (binding6.arraySize() > 0) {
+                        LOGGER.info("Binding 6: Binding array of " + binding6.arraySize() + " images (Legacy path)");
+                        // Traditional use: binding 6 as an array of render targets
+                        int maxImages = binding6.arraySize();
+                        int imageCount = Math.min(outImgs.size(), maxImages);
+
+                        for (int i = 0; i < imageCount; i++) {
+                            int index = i;
+                            var view = irisRenderTargetViews[i].getView(() -> vgOutImgs.get(index));
+                            if (view != null)
+                                resourcesToClose.add(view);
+                            outImgViewListCache.add(view);
+                        }
+
+                        updater.imageStore(6, 0, outImgViewListCache); // Intermediate buffer array
+                    }
                 }
-                updater.imageStore(6, 0, outImgViewListCache);
+                if (binding12 != null) {
+                    // Use the first output image for final output if no dedicated intermediate
+                    // buffer
+                    if (outImgViewListCache.isEmpty() && !outImgs.isEmpty()) {
+                        var view = irisRenderTargetViews[0].getView(() -> vgOutImgs.get(0));
+                        if (view != null)
+                            resourcesToClose.add(view);
+                        outImgViewListCache.add(view);
+                    }
+                    updater.imageStore(12, 0, outImgViewListCache); // Final output
+                }
+
+                // Add Binding 13 for Motion Vectors
+                var binding13 = setReflection.getBindingAt(13);
+                if (binding13 != null) {
+                    if (motionVectorImage != null) {
+                        var mvView = VImageView.create(ctx, motionVectorImage);
+                        resourcesToClose.add(mvView);
+                        updater.imageStore(13, mvView);
+                    } else if (outImgViewListCache.size() > 0) {
+                        // Fallback: use first output image as dummy target if MV image is null
+                        // This prevents validation errors when DLSS is disabled but shader expects
+                        // binding
+                        updater.imageStore(13, outImgViewListCache.get(0));
+                    }
+                }
+
+                // Add Binding 14 for Linear Depth
+                var binding14 = setReflection.getBindingAt(14);
+                if (binding14 != null) {
+                    if (linearDepthImage != null) {
+                        var depthView = VImageView.create(ctx, linearDepthImage);
+                        resourcesToClose.add(depthView);
+                        updater.imageStore(14, depthView);
+                    } else if (outImgViewListCache.size() > 0) {
+                        // Fallback: use first output image as dummy target if depth image is null
+                        // This prevents validation errors when DLSS is disabled but shader expects
+                        // binding
+                        updater.imageStore(14, outImgViewListCache.get(0));
+                    }
+                }
+
+                // Add Binding 15 for Previous Frame Reservoir (ReSTIR ping-pong read)
+                var binding15 = setReflection.getBindingAt(15);
+                if (binding15 != null) {
+                    if (prevReservoirImage != null) {
+                        var prevResView = VImageView.create(ctx, prevReservoirImage);
+                        resourcesToClose.add(prevResView);
+                        updater.imageStore(15, prevResView);
+                    } else if (outImgViewListCache.size() > 0) {
+                        // Fallback: use first output image as dummy target if prev reservoir is null
+                        updater.imageStore(15, outImgViewListCache.get(0));
+                    }
+                }
+
                 updater.apply();
 
                 sets.set(commonSetIdx, commonSet);
@@ -169,16 +334,38 @@ public final class RenderPassExecutor {
 
             cmd.bindDSet(sets);
 
+            // Memory barrier: ensure descriptor set updates (including geometry buffers and
+            // TLAS)
+            // are visible before ray tracing dispatch reads them
+            cmd.encodeMemoryBarrier();
+
+            // Push constants for ray tracing shader
+            // Layout: uint frameIndex, uint sampleIndex, vec3 sunDirection, vec3 sunColor,
+            // int enableReSTIR
+            // Total: 4 + 4 + 12 + 12 + 4 = 36 bytes (9 longs)
+            long[] pushConstants = new long[9];
+            // Pack frameIndex (uint) and sampleIndex (uint) into first long
+            pushConstants[0] = (long) frameIndex & 0xFFFFFFFFL | (((long) sampleIndex & 0xFFFFFFFFL) << 32);
+            // Pack sunDirection (vec3)
+            pushConstants[1] = (long) Float.floatToRawIntBits(sunDirectionX) & 0xFFFFFFFFL |
+                    (((long) Float.floatToRawIntBits(sunDirectionY) & 0xFFFFFFFFL) << 32);
+            pushConstants[2] = (long) Float.floatToRawIntBits(sunDirectionZ) & 0xFFFFFFFFL |
+                    (((long) Float.floatToRawIntBits(sunColorR) & 0xFFFFFFFFL) << 32);
+            pushConstants[3] = (long) Float.floatToRawIntBits(sunColorG) & 0xFFFFFFFFL |
+                    (((long) Float.floatToRawIntBits(sunColorB) & 0xFFFFFFFFL) << 32);
+            // Pack enableReSTIR (int) and debugMode (int)
+            pushConstants[4] = ((long) enableReSTIR & 0xFFFFFFFFL) | (((long) debugMode & 0xFFFFFFFFL) << 32);
+
             VImage firstOutImg = outImgs.get(0).get();
+            cmd.pushConstants(0, pushConstants, VK_SHADER_STAGE_ALL);
             cmd.traceRays(firstOutImg.width, firstOutImg.height, 1);
 
             sets.forEach(VRef::close);
 
-            // Output image barriers
-            for (var img : outImgs) {
-                cmd.encodeImageTransition(img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                        VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
-            }
+            // No need for explicit barriers here since we're transitioning to the same
+            // layout
+            // The synchronization is handled by the semaphore signaling between Vulkan and
+            // OpenGL
         } finally {
             for (var ref : resourcesToClose) {
                 if (ref != null)

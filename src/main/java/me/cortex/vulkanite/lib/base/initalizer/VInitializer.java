@@ -79,17 +79,49 @@ public class VInitializer {
     public void findPhysicalDevice() {
         try (MemoryStack stack = stackPush()) {
             PointerBuffer devices = getPhysicalDevices(stack);
+            VkPhysicalDevice bestDevice = null;
+            int bestScore = -1;
+
             for (int i = 0; i < devices.capacity(); i++) {
+                VkPhysicalDevice dev = new VkPhysicalDevice(devices.get(i), instance);
                 VkPhysicalDeviceProperties props = VkPhysicalDeviceProperties.calloc(stack);
-                vkGetPhysicalDeviceProperties(new VkPhysicalDevice(devices.get(i), instance), props);
-                System.out.println(props.deviceNameString());
-                physicalDevice = new VkPhysicalDevice(devices.get(i), instance);
-                break;
+                vkGetPhysicalDeviceProperties(dev, props);
+
+                int score = 0;
+                if (props.deviceType() == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+                    score += 1000;
+                }
+                // Check if NVIDIA (Vendor ID 0x10DE)
+                if (props.vendorID() == 0x10DE) {
+                    score += 100;
+                }
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestDevice = dev;
+                }
+                System.out.println("Found device: " + props.deviceNameString() + " Score: " + score);
+            }
+
+            if (bestDevice != null) {
+                physicalDevice = bestDevice;
+                VkPhysicalDeviceProperties props = VkPhysicalDeviceProperties.calloc(stack);
+                vkGetPhysicalDeviceProperties(physicalDevice, props);
+                System.out.println("Selected device: " + props.deviceNameString());
+            } else if (devices.capacity() > 0) {
+                physicalDevice = new VkPhysicalDevice(devices.get(0), instance);
             }
         }
     }
 
-    // TODO: add nice queue creation system
+    public VkPhysicalDevice getPhysicalDevice() {
+        return physicalDevice;
+    }
+
+    public VkInstance getInstance() {
+        return instance;
+    }
+
     public void createDevice(List<String> extensions, List<String> layers, float[] queuePriorities,
             Consumer<VkPhysicalDeviceFeatures> deviceFeatures, List<Function<MemoryStack, Struct>> applicators,
             List<Consumer<Struct>> postApplicators) {
@@ -175,7 +207,7 @@ public class VInitializer {
         return devices;
     }
 
-    private List<String> getDeviceExtensionStrings(VkPhysicalDevice device) {
+    public List<String> getDeviceExtensionStrings(VkPhysicalDevice device) {
         List<String> extensions = new ArrayList<>();
         try (var stack = stackPush()) {
             var eb = getDeviceExtensions(stack, device);
@@ -202,6 +234,6 @@ public class VInitializer {
 
     public VContext createContext() {
         // TODO:FIXME: DONT HARDCODE THE FACT IT HAS DEVICE ADDRESSES
-        return new VContext(device, queueCount, true, debugMessenger != 0);
+        return new VContext(device, physicalDevice, instance, queueCount, true, debugMessenger != 0);
     }
 }

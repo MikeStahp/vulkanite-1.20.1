@@ -34,15 +34,49 @@ public class SharedImageViewTracker {
     public VRef<VImageView> getView(Supplier<VRef<VGImage>> imageSupplier) {
         VRef<VGImage> image = imageSupplier.get();
         try {
-            if (view == null || (image != null && !view.get().isDerivedFrom(image.get()))
-                    || (image == null && view != null)) {
+            boolean NeedsUpdate = false;
+            if (view == null && image != null)
+                NeedsUpdate = true;
+            if (view != null && image == null)
+                NeedsUpdate = true;
+            if (view != null && image != null) {
+                // Check for null image or allocation
+                if (view.get() == null || view.get().image == null || view.get().image.get() == null) {
+                    NeedsUpdate = true;
+                } else {
+                    try {
+                        // Check if allocation is null (image was freed)
+                        VImage existingImage = view.get().image.get();
+                        if (existingImage == null) {
+                            NeedsUpdate = true;
+                        } else {
+                            // Try to access the Vulkan image handle - will throw if allocation is null
+                            try {
+                                long existingVkImage = existingImage.image();
+                                if (!view.get().isDerivedFrom(image.get()))
+                                    NeedsUpdate = true;
+                            } catch (NullPointerException e) {
+                                // Allocation is null - image was freed, need to update
+                                System.err.println("[SharedImageViewTracker] Image allocation is null (freed prematurely), forcing update");
+                                NeedsUpdate = true;
+                            }
+                        }
+                    } catch (NullPointerException e) {
+                        // Handle any null pointer in the existing image
+                        System.err.println("[SharedImageViewTracker] Error accessing existing image view: " + e.getMessage());
+                        NeedsUpdate = true;
+                    }
+                }
+            }
+
+            if (NeedsUpdate) {
                 // TODO: move this to like a fence free that you pass in via an arg
                 if (view != null) {
                     view.close();
                     view = null;
                 }
 
-                if (image != null) {
+                if (image != null && image.get() != null) {
                     view = VImageView.create(ctx, (VRef) image);
                 } else {
                     view = null;

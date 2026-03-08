@@ -44,30 +44,36 @@ public abstract class MixinRenderTarget implements IRenderTargetVkGetter {
     @Redirect(method = "setupTexture", at = @At(value = "INVOKE",target = "Lnet/irisshaders/iris/targets/RenderTarget;resizeTexture(III)V"))
     private void redirectResize(RenderTarget instance, int t, int w, int h) {}
 
-    @Overwrite
     /**
      * Gets the main texture ID.
+     * @author Cortex
+     * @reason Intercept for Vulkanite
      * @return the main texture ID
      */
+    @Overwrite
     public int getMainTexture() {
         return vgMainTexture.get().glId;
     }
 
-    @Overwrite
     /**
      * Gets the alternate texture ID.
+     * @author Cortex
+     * @reason Intercept for Vulkanite
      * @return the alternate texture ID
      */
+    @Overwrite
     public int getAltTexture() {
         return vgAltTexture.get().glId;
     }
 
-    @Overwrite
     /**
      * Resizes the render target to the specified dimensions.
+     * @author Cortex
+     * @reason Intercept for Vulkanite
      * @param width the new width
      * @param height the new height
      */
+    @Overwrite
     public void resize(int width, int height) {
         glFinish();
         setupTextures(width, height, !internalFormat.getPixelFormat().isInteger());

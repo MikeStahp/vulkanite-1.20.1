@@ -3,41 +3,55 @@ package me.cortex.vulkanite.acceleration.blas;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.base.VRegistry;
+import me.cortex.vulkanite.lib.cmd.VCmdBuff;
 import me.cortex.vulkanite.lib.memory.AccelerationStructurePool;
 import me.cortex.vulkanite.lib.memory.PoolLinearAllocator;
-import me.cortex.vulkanite.lib.memory.VAccelerationStructure;
 import me.cortex.vulkanite.lib.other.VQueryPool;
 import me.cortex.vulkanite.lib.pipeline.VComputePipeline;
-import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
-import org.lwjgl.vulkan.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.nio.LongBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.List;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.Semaphore;
 import java.util.function.Consumer;
 
-import static org.lwjgl.vulkan.KHRAccelerationStructure.*;
-import static org.lwjgl.vulkan.KHRBufferDeviceAddress.VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR;
-import static org.lwjgl.vulkan.VK10.*;
-import static org.lwjgl.vulkan.VK12.VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-
 /**
  * Worker thread that processes queued BLAS build jobs in batches.
- * Handles vertex decoding, acceleration structure building, and compaction.
+ * Orchestrates BLAS building using specialized components:
+ * - BLASMemoryManager: Buffer allocator management
+ * - BLASBatchProcessor: Batch processing logic
+ * - BLASGeometryProcessor: Geometry processing (external)
+ * 
+ * This class is now a thin orchestrator that delegates to specialized components.
  */
 public class BLASBuildWorker implements Runnable {
+    private static final Logger LOGGER = LoggerFactory.getLogger(BLASBuildWorker.class);
+    
+    // Memory stack size: 16MB reduced from 64MB to prevent MemoryStack exhaustion
+    // Large query results are now allocated on heap via MemoryUtil in VQueryPool
+    private static final int MEMORY_STACK_SIZE = 16_000_000;
+    
     private final VContext context;
     private final int asyncQueue;
     private final Consumer<BLASBatchResult> resultConsumer;
     private final VRef<VQueryPool> queryPool;
     private final VRef<VComputePipeline> gpuVertexDecodePipeline;
     private final AccelerationStructurePool accelerationStructurePool;
-
+    
     private final Semaphore awaitingJobBatches;
     private final ConcurrentLinkedDeque<List<BLASBuildJob>> batchedJobs;
-
+    
+    // Components
+    private final BLASMemoryManager memoryManager;
+    private final BLASBatchProcessor batchProcessor;
+    
+    private long totalBatchesProcessed = 0;
+    
     public BLASBuildWorker(
             VContext context,
             int asyncQueue,
@@ -55,38 +69,53 @@ public class BLASBuildWorker implements Runnable {
         this.accelerationStructurePool = accelerationStructurePool;
         this.awaitingJobBatches = awaitingJobBatches;
         this.batchedJobs = batchedJobs;
+        
+        // Initialize components
+        this.memoryManager = new BLASMemoryManager(context);
+        this.batchProcessor = new BLASBatchProcessor(
+            context, asyncQueue, queryPool, gpuVertexDecodePipeline,
+            accelerationStructurePool, resultConsumer);
+        
+        LOGGER.info("[BLAS Worker] Initialized with {} MB stack size", MEMORY_STACK_SIZE / (1024 * 1024));
     }
-
+    
     @Override
     public void run() {
-        MemoryStack bigStack = MemoryStack.create(20_000_000);
-
-        var buildBufferAllocator = new PoolLinearAllocator(context, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-                | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
-                | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, 0x200_0000L, 16);
-        var scratchAllocator = new PoolLinearAllocator(context,
-                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                0x200_0000L, 256);
-        var initialASBufferAllocator = new PoolLinearAllocator(context,
-                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR,
-                0x200_0000L, 256);
-
+        MemoryStack bigStack = MemoryStack.create(MEMORY_STACK_SIZE);
         List<BLASBuildJob> jobs = new ArrayList<>();
         Deque<Long> priorExecutions = new ArrayDeque<>(3);
+
+        LOGGER.info("[BLAS Worker] Starting worker thread");
 
         while (true) {
             collectJobs(jobs);
             VRegistry.INSTANCE.threadLocalCollect();
-            var sinlgeUsePoolWorker = context.cmd.getSingleUsePool();
+            var singleUsePoolWorker = context.cmd.getSingleUsePool();
+
+            // Log memory usage before processing
+            logMemoryUsage("before batch");
 
             try (var stack = bigStack.push()) {
-                var buildContext = new BLASBuildContext(jobs, stack, buildBufferAllocator, scratchAllocator,
-                        initialASBufferAllocator);
-                processBuildBatch(buildContext, sinlgeUsePoolWorker, priorExecutions);
+                var buildContext = memoryManager.createBuildContext(jobs, stack);
+                batchProcessor.processBatch(buildContext, singleUsePoolWorker, priorExecutions, stack);
+                totalBatchesProcessed++;
             }
+
+            // Reset allocators for next batch
+            memoryManager.reset();
+
+            // Log memory after processing
+            logMemoryUsage("after batch");
+
+            // Check and handle memory pressure
+            checkAndHandleMemoryPressure();
         }
     }
-
+    
+    /**
+     * Collects jobs from the batched queue.
+     * Blocks until at least one job is available, then tries to collect more.
+     */
     private void collectJobs(List<BLASBuildJob> jobs) {
         jobs.clear();
         try {
@@ -94,11 +123,13 @@ public class BLASBuildWorker implements Runnable {
         } catch (InterruptedException e) {
             throw new RuntimeException(e);
         }
+        
         var batch = batchedJobs.poll();
         if (batch != null) {
             jobs.addAll(batch);
         }
-        // Try to collect more without blocking
+        
+        // Try to collect more without blocking (up to 32 jobs total)
         while (jobs.size() < 32 && awaitingJobBatches.tryAcquire()) {
             batch = batchedJobs.poll();
             if (batch != null) {
@@ -106,102 +137,65 @@ public class BLASBuildWorker implements Runnable {
             }
         }
     }
-
-    private void processBuildBatch(BLASBuildContext buildCtx,
-            me.cortex.vulkanite.lib.cmd.VCommandPool sinlgeUsePoolWorker,
-            Deque<Long> priorExecutions) {
-        var jobs = buildCtx.jobs;
-        var stack = buildCtx.stack;
-
-        var buildInfos = VkAccelerationStructureBuildGeometryInfoKHR.calloc(jobs.size(), stack);
-        PointerBuffer buildRanges = stack.mallocPointer(jobs.size());
-        LongBuffer pAccelerationStructures = stack.mallocLong(jobs.size());
-
-        var accelerationStructures = new ArrayList<VRef<VAccelerationStructure>>(jobs.size());
-
-        var uploadBuildCmdRef = sinlgeUsePoolWorker.createCommandBuffer();
-        var uploadBuildCmd = uploadBuildCmdRef.get();
-        uploadBuildCmd.bindCompute(gpuVertexDecodePipeline);
-
-        var geometryProcessor = new BLASGeometryProcessor(context, buildCtx, uploadBuildCmd);
-
-        for (int i = 0; i < jobs.size(); i++) {
-            var job = jobs.get(i);
-            geometryProcessor.processJob(job, i, buildInfos, buildRanges, pAccelerationStructures,
-                    accelerationStructures);
-        }
-
-        buildInfos.rewind();
-        buildRanges.rewind();
-        pAccelerationStructures.rewind();
-
-        // Build acceleration structures
-        vkCmdBuildAccelerationStructuresKHR(uploadBuildCmd.buffer(), buildInfos, buildRanges);
-        uploadBuildCmd.encodeMemoryBarrier();
-        uploadBuildCmd.resetQueryPool(queryPool, 0, jobs.size());
-        vkCmdWriteAccelerationStructuresPropertiesKHR(
-                uploadBuildCmd.buffer(),
-                pAccelerationStructures,
-                VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
-                queryPool.get().pool,
-                0);
-
-        long buildExecution = context.cmd.submit(asyncQueue, uploadBuildCmdRef);
-        context.cmd.hostWaitForExecution(asyncQueue, buildExecution);
-        uploadBuildCmdRef.close();
-
-        // Compact and finalize
-        long[] compactedSizes = queryPool.get().getResultsLong(jobs.size());
-        compactAccelerationStructures(jobs, accelerationStructures, compactedSizes,
-                sinlgeUsePoolWorker, stack, priorExecutions);
-
-        accelerationStructures.forEach(VRef::close);
-    }
-
-    private void compactAccelerationStructures(
-            List<BLASBuildJob> jobs,
-            List<VRef<VAccelerationStructure>> accelerationStructures,
-            long[] compactedSizes,
-            me.cortex.vulkanite.lib.cmd.VCommandPool sinlgeUsePoolWorker,
-            MemoryStack stack,
-            Deque<Long> priorExecutions) {
-
-        List<BLASBuildResult> results = new ArrayList<>();
-        var cmdRef = sinlgeUsePoolWorker.createCommandBuffer();
-
-        for (int idx = 0; idx < compactedSizes.length; idx++) {
-            var compact_as = accelerationStructurePool.createAcceleration(compactedSizes[idx],
-                    VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
-            var fat_as = accelerationStructures.get(idx);
-
-            vkCmdCopyAccelerationStructureKHR(cmdRef.get().buffer(),
-                    VkCopyAccelerationStructureInfoKHR.calloc(stack).sType$Default()
-                            .src(fat_as.get().structure)
-                            .dst(compact_as.get().structure)
-                            .mode(VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR));
-
-            cmdRef.get().addAccelerationStructureRef(fat_as);
-            cmdRef.get().addAccelerationStructureRef(compact_as);
-            fat_as.close();
-
-            var job = jobs.get(idx);
-            results.add(new BLASBuildResult(compact_as, job.data()));
-        }
-
-        long blasExecution = context.cmd.submit(asyncQueue, cmdRef);
-        cmdRef.close();
-
-        resultConsumer.accept(new BLASBatchResult(results, blasExecution));
-
-        priorExecutions.add(blasExecution);
-        if (priorExecutions.size() > 3) {
-            long prior = priorExecutions.poll();
-            context.cmd.hostWaitForExecution(asyncQueue, prior);
+    
+    /**
+     * Checks for memory pressure and handles it by forcing garbage collection.
+     * Called after each batch to prevent memory accumulation.
+     */
+    private void checkAndHandleMemoryPressure() {
+        long freeMemory = Runtime.getRuntime().freeMemory();
+        long maxMemory = Runtime.getRuntime().maxMemory();
+        double freePercent = (freeMemory * 100.0) / maxMemory;
+        
+        // Force cleanup if memory pressure is high (less than 15% free)
+        if (freePercent < 15.0) {
+            LOGGER.warn("[BLAS Worker] Memory pressure detected ({}% free), forcing cleanup",
+                    String.format("%.1f", freePercent));
+            System.gc();
         }
     }
 
     /**
+     * Logs current memory usage.
+     */
+    private void logMemoryUsage(String phase) {
+        if (!LOGGER.isInfoEnabled()) return;
+        
+        long freeMemory = Runtime.getRuntime().freeMemory();
+        long totalMemory = Runtime.getRuntime().totalMemory();
+        long maxMemory = Runtime.getRuntime().maxMemory();
+        
+        LOGGER.info("[BLAS Worker] Memory {}: free={}MB, total={}MB, max={}MB",
+            phase,
+            freeMemory / (1024 * 1024),
+            totalMemory / (1024 * 1024),
+            maxMemory / (1024 * 1024));
+    }
+    
+    /**
+     * Gets the total number of batches processed.
+     */
+    public long getTotalBatchesProcessed() {
+        return totalBatchesProcessed;
+    }
+    
+    /**
+     * Gets the batch processor component.
+     */
+    public BLASBatchProcessor getBatchProcessor() {
+        return batchProcessor;
+    }
+    
+    /**
+     * Gets the memory manager component.
+     */
+    public BLASMemoryManager getMemoryManager() {
+        return memoryManager;
+    }
+    
+    /**
      * Context data for a BLAS build batch operation.
+     * This class is kept for backward compatibility with BLASGeometryProcessor.
      */
     public static class BLASBuildContext {
         public final List<BLASBuildJob> jobs;
@@ -209,11 +203,11 @@ public class BLASBuildWorker implements Runnable {
         public final PoolLinearAllocator buildBufferAllocator;
         public final PoolLinearAllocator scratchAllocator;
         public final PoolLinearAllocator initialASBufferAllocator;
-
+        
         public BLASBuildContext(List<BLASBuildJob> jobs, MemoryStack stack,
-                PoolLinearAllocator buildBufferAllocator,
-                PoolLinearAllocator scratchAllocator,
-                PoolLinearAllocator initialASBufferAllocator) {
+                               PoolLinearAllocator buildBufferAllocator,
+                               PoolLinearAllocator scratchAllocator,
+                               PoolLinearAllocator initialASBufferAllocator) {
             this.jobs = jobs;
             this.stack = stack;
             this.buildBufferAllocator = buildBufferAllocator;

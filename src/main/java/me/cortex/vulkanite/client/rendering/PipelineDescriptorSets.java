@@ -14,20 +14,82 @@ import static org.lwjgl.vulkan.VK10.*;
 public final class PipelineDescriptorSets {
 
     // Cache for geometry set (never changes)
+    // Matches shader Set 1 binding: Quads SSBO array (bindless)
     private static final ShaderReflection.Set GEOM_SET_EXPECTED = new ShaderReflection.Set(
             new ShaderReflection.Binding[] {
                     new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, true)
             });
 
     // Cache for single image common set (never changes)
+    // Includes G-buffer bindings for hybrid rendering
     private static final ShaderReflection.Set COMMON_SET_EXPECTED_SINGLE = new ShaderReflection.Set(
             new ShaderReflection.Binding[] {
                     new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 0, false),
+                    // Binding 2 removed/reserved
                     new ShaderReflection.Binding("", 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
                     new ShaderReflection.Binding("", 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
                     new ShaderReflection.Binding("", 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
                     new ShaderReflection.Binding("", 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    // G-buffer bindings for hybrid rendering
+                    new ShaderReflection.Binding("", 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    // Binding 12: Final output target
+                    new ShaderReflection.Binding("", 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    // Binding 13: Motion vectors for DLSS Ray Reconstruction
+                    new ShaderReflection.Binding("", 13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    // Binding 14: Linear Depth for DLSS Ray Reconstruction
+                    new ShaderReflection.Binding("", 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    // Binding 15: Previous frame reservoir for ReSTIR ping-pong
+                    new ShaderReflection.Binding("", 15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+            });
+
+    // Cache for base common set without G-buffer bindings (for full path tracers)
+    // Matches shader Set 0 bindings: base bindings only (0,1,3,4,5,6,12 - WITHOUT
+    // G-buffer 7-11)
+    private static final ShaderReflection.Set COMMON_SET_EXPECTED_BASE = new ShaderReflection.Set(
+            new ShaderReflection.Binding[] {
+                    new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 0, false),
+                    // Binding 2 removed/reserved
+                    new ShaderReflection.Binding("", 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    // No G-buffer bindings (7-11) for full path tracers
+                    // Binding 12: Final output target
+                    new ShaderReflection.Binding("", 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+            });
+
+    // Cache for VulkaniteRT hybrid set - matches actual bindings used by PBR
+    // shaders
+    // Bindings: 0,1,2,3,4,5,6,7,8,9,10,12 (all PBR textures + G-buffer material,
+    // without 11 gbufferExtra)
+    private static final ShaderReflection.Set COMMON_SET_EXPECTED_VULKANITE_RT = new ShaderReflection.Set(
+            new ShaderReflection.Binding[] {
+                    new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 0, false),
+                    new ShaderReflection.Binding("", 2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    new ShaderReflection.Binding("", 11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                    // Binding 12: Final output target
+                    new ShaderReflection.Binding("", 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    // Binding 13: Motion vectors for DLSS Ray Reconstruction
+                    new ShaderReflection.Binding("", 13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    // Binding 14: Linear Depth for DLSS Ray Reconstruction
+                    new ShaderReflection.Binding("", 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    // Binding 15: Previous frame reservoir for ReSTIR ping-pong
+                    new ShaderReflection.Binding("", 15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
             });
 
     private PipelineDescriptorSets() {
@@ -35,15 +97,36 @@ public final class PipelineDescriptorSets {
 
     /**
      * Creates the expected common descriptor set layout with array support.
+     * Includes G-buffer bindings for hybrid rendering:
+     * - Binding 7: colortex1 (Albedo)
+     * - Binding 8: colortex2 (Material Properties)
+     * - Binding 9: colortex3 (Normal)
+     * - Binding 10: colortex4 (World Position)
+     * - Binding 11: colortex5 (Additional Properties)
      */
     public static ShaderReflection.Set createCommonSetExpected(int maxIrisRenderTargets) {
         return new ShaderReflection.Set(new ShaderReflection.Binding[] {
                 new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, false),
                 new ShaderReflection.Binding("", 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 0, false),
+                // Binding 2 removed/reserved
                 new ShaderReflection.Binding("", 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
                 new ShaderReflection.Binding("", 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
                 new ShaderReflection.Binding("", 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
-                new ShaderReflection.Binding("", 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, maxIrisRenderTargets, false),
+                new ShaderReflection.Binding("", 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                // G-buffer bindings for hybrid rendering
+                new ShaderReflection.Binding("", 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                new ShaderReflection.Binding("", 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                new ShaderReflection.Binding("", 9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                new ShaderReflection.Binding("", 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                new ShaderReflection.Binding("", 11, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false),
+                // Binding 12: Final output target
+                new ShaderReflection.Binding("", 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                // Binding 13: Motion vectors for DLSS Ray Reconstruction
+                new ShaderReflection.Binding("", 13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                // Binding 14: Linear Depth for DLSS Ray Reconstruction
+                new ShaderReflection.Binding("", 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                // Binding 15: Previous frame reservoir for ReSTIR ping-pong
+                new ShaderReflection.Binding("", 15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
         });
     }
 
@@ -52,6 +135,26 @@ public final class PipelineDescriptorSets {
      */
     public static ShaderReflection.Set createCommonSetExpectedSingle() {
         return COMMON_SET_EXPECTED_SINGLE;
+    }
+
+    /**
+     * Returns the cached base common descriptor set layout without G-buffer
+     * bindings.
+     * This is for full path tracers that don't use the hybrid G-buffer approach.
+     * Contains bindings: 0,1,3,4,5,6,12 (WITHOUT G-buffer bindings 7-11)
+     */
+    public static ShaderReflection.Set createCommonSetExpectedBase() {
+        return COMMON_SET_EXPECTED_BASE;
+    }
+
+    /**
+     * Returns the cached VulkaniteRT hybrid descriptor set layout.
+     * This matches the actual bindings used by VulkaniteRT (bindings that are
+     * sampled).
+     * Contains bindings: 0,1,2,3,6,7,9,10,12 (WITHOUT unused PBR bindings 4,5,8,11)
+     */
+    public static ShaderReflection.Set createCommonSetExpectedVulkaniteRT() {
+        return COMMON_SET_EXPECTED_VULKANITE_RT;
     }
 
     /**

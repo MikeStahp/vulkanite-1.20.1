@@ -1,0 +1,139 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+// Ray tracing acceleration structure
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
+
+// Output image
+layout(binding = 1, set = 0, rgba8) uniform image2D outputImage;
+
+// Camera uniforms
+layout(binding = 6, set = 0) uniform CameraData {
+    mat4 viewInverse;
+    mat4 projInverse;
+    vec3 cameraPosition;
+} camera;
+
+// G-buffer textures for hybrid rendering
+layout(binding = 7, set = 0) uniform sampler2D gbufferAlbedo;
+layout(binding = 8, set = 0) uniform sampler2D gbufferMaterial;
+layout(binding = 9, set = 0) uniform sampler2D gbufferNormal;
+layout(binding = 10, set = 0) uniform sampler2D gbufferWorldPos;
+layout(binding = 11, set = 0) uniform sampler2D gbufferExtra;
+
+// Push constants for ray tracing
+layout(push_constant) uniform PushConstant {
+    uint frameIndex;
+    uint sampleIndex;
+} pushConstants;
+
+// Ray payload
+struct RayPayload {
+    vec3 color;
+    vec3 origin;
+    vec3 direction;
+    float distance;
+    uint depth;
+    uint seed;
+};
+
+layout(location = 0) rayPayloadEXT RayPayload payload;
+
+// Helper function to generate random numbers
+uint tea(uint val0, uint val1) {
+    uint v0 = val0;
+    uint v1 = val1;
+    uint s0 = 0;
+    
+    for(uint n = 0; n < 8; n++) { // Reduced iterations for better performance
+        s0 += 0x9e3779b9;
+        v0 += ((v1 << 4) + 0xa341316c) ^ (v1 + s0) ^ ((v1 >> 5) + 0xc8013ea4);
+        v1 += ((v0 << 4) + 0xad90777d) ^ (v0 + s0) ^ ((v0 >> 5) + 0x7e95761e);
+    }
+    
+    return v0;
+}
+
+// Generate random float in [0, 1)
+float rand(inout uint seed) {
+    seed = tea(seed, 12345u);
+    return float(seed & 0x00FFFFFF) / float(0x01000000);
+}
+
+void main() {
+    // Initialize random seed
+    payload.seed = tea(gl_LaunchIDEXT.x + gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x, pushConstants.frameIndex);
+    
+    // Normalized pixel coordinates
+    vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+    vec2 normalizedPixel = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
+    
+    // HYBRID RENDERING:
+    // Instead of launching primary rays, we read surface data from the G-Buffer (rasterized).
+    
+    // Check if we hit anything in the raster pass (using WorldPos or Normal)
+    vec4 worldPosSample = texture(gbufferWorldPos, normalizedPixel);
+    vec3 worldPos = worldPosSample.xyz;
+    // Iris shaders might output 0,0,0 or a very large value for sky.
+    // Assuming 0,0,0 is invalid/sky (adjust if your shader pack uses different convention)
+    // Also checking normal magnitude can help
+    vec3 normal = texture(gbufferNormal, normalizedPixel).xyz;
+    
+    // Check if the pixel is sky or invalid
+    // Many shader packs write a specific value to alpha or use a specific depth for sky
+    bool isSky = length(normal) < 0.1 || worldPosSample.w == 0.0;
+    
+    if (isSky) {
+        // Sky or invalid - use miss shader color
+        payload.color = vec3(0.0);
+        payload.origin = camera.cameraPosition;
+        payload.direction = vec3(0.0);
+        payload.distance = 0.0;
+        payload.depth = 0;
+        
+        // Trace miss ray to get sky color
+        traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, payload);
+        
+        imageStore(outputImage, ivec2(gl_LaunchIDEXT.xy), vec4(payload.color, 1.0));
+        return;
+    }
+    
+    // We have valid geometry from rasterizer.
+    // Launch a shadow ray or GI ray from this position.
+    
+    // Setup ray origin slightly offset along normal to avoid self-intersection
+    vec3 rayOrigin = worldPos + normal * 0.01;
+    
+    // For unlit rendering, we'll trace rays to get lighting information
+    // Generate cosine-weighted random direction in hemisphere around normal
+    vec2 r = vec2(rand(payload.seed), rand(payload.seed));
+    float phi = 2.0 * 3.14159 * r.x;
+    float cosTheta = sqrt(1.0 - r.y);
+    float sinTheta = sqrt(r.y);
+    
+    vec3 w = normal;
+    vec3 u = normalize(cross((abs(w.x) > 0.1 ? vec3(0, 1, 0) : vec3(1, 0, 0)), w));
+    vec3 v = cross(w, u);
+    vec3 rayDirection = normalize(u * cos(phi) * sinTheta + v * sin(phi) * sinTheta + w * cosTheta);
+    
+    // Initialize payload for unlit rendering
+    payload.color = vec3(0.0);
+    payload.origin = rayOrigin;
+    payload.direction = rayDirection;
+    payload.distance = 0.0;
+    payload.depth = 1; // Start at depth 1 since we skipped primary ray
+    
+    // Trace ray (secondary bounce/GI)
+    // Use gl_RayFlagsOpaqueEXT to skip any-hit shaders for performance if alpha test not needed
+    traceRayEXT(topLevelAS, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, payload);
+    
+    // Get albedo from G-buffer for unlit rendering
+    vec3 albedo = texture(gbufferAlbedo, normalizedPixel).rgb;
+    
+    // Combine lighting with albedo for unlit rendering
+    vec3 finalColor = albedo * payload.color;
+    
+    // Output final unlit rendered image
+    imageStore(outputImage, ivec2(gl_LaunchIDEXT.xy), vec4(finalColor, 1.0));
+}

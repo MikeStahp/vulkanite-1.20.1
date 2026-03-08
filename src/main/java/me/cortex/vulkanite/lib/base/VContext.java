@@ -13,15 +13,20 @@ import static org.lwjgl.vulkan.VK10.VK_OBJECT_TYPE_UNKNOWN;
 
 public class VContext {
     public final VkDevice device;
-
+    public final org.lwjgl.vulkan.VkPhysicalDevice physicalDevice;
+    public final org.lwjgl.vulkan.VkInstance instance;
 
     public final MemoryManager memory;
     public final SyncManager sync;
     public final CommandManager cmd;
     public final DeviceProperties properties;
     public final boolean hasDebugUtils;
-    public VContext(VkDevice device, int queueCount, boolean hasDeviceAddresses, boolean hasDebugUtils) {
+
+    public VContext(VkDevice device, org.lwjgl.vulkan.VkPhysicalDevice physicalDevice,
+            org.lwjgl.vulkan.VkInstance instance, int queueCount, boolean hasDeviceAddresses, boolean hasDebugUtils) {
         this.device = device;
+        this.physicalDevice = physicalDevice;
+        this.instance = instance;
         memory = new MemoryManager(device, hasDeviceAddresses);
         sync = new SyncManager(device);
         cmd = new CommandManager(device, queueCount);

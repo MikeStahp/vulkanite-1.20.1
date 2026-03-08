@@ -30,7 +30,9 @@ public class SharedQuadVkIndexBuffer {
     private static void makeNewIndexBuffer(VContext context, VCmdBuff uploaCmdBuff, int quadCount) {
         ByteBuffer buffer = genQuadIdxs(quadCount);
         try {
-            //TODO: dont harcode VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR and VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+            // TODO: dont harcode
+            // VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR and
+            // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
             indexBuffer = context.memory.createBuffer(buffer.remaining(),
                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                             | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
@@ -48,16 +50,16 @@ public class SharedQuadVkIndexBuffer {
     }
 
     public static ByteBuffer genQuadIdxs(int quadCount) {
-        //short[] idxs = {0, 1, 2, 0, 2, 3};
+        // short[] idxs = {0, 1, 2, 0, 2, 3};
 
         int vertexCount = quadCount * 4;
         int indexCount = vertexCount * 3 / 2;
         ByteBuffer buffer = MemoryUtil.memAlloc(indexCount * Integer.BYTES);
         IntBuffer idxs = buffer.asIntBuffer();
-        //short[] idxs = new short[indexCount];
+        // short[] idxs = new short[indexCount];
 
         int j = 0;
-        for(int i = 0; i < vertexCount; i += 4) {
+        for (int i = 0; i < vertexCount; i += 4) {
 
             idxs.put(j, i);
             idxs.put(j + 1, (i + 1));

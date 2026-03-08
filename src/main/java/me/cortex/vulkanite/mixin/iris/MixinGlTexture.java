@@ -89,10 +89,12 @@ public abstract class MixinGlTexture extends MixinGlResource implements IVGImage
         _CHECK_GL_ERROR_();
     }
 
-    @Overwrite
     /**
      * Destroys the internal resources associated with this texture.
+     * @author Cortex
+     * @reason Intercept for Vulkanite resource management
      */
+    @Overwrite
     protected void destroyInternal() {
         if (sharedImage != null)
             sharedImage.close();

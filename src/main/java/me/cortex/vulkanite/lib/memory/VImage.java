@@ -44,11 +44,15 @@ public class VImage extends VObject {
     }
 
     protected void free() {
+        System.out.println("[VImage] Freeing VImage - width=" + width + ", height=" + height + ", format=" + format);
         allocation.free();
         allocation = null;
     }
 
     public long image() {
+        if (allocation == null) {
+            throw new NullPointerException("VImage.image(): allocation is null! This typically means the VImage was freed prematurely or the allocation was not properly initialized.");
+        }
         return allocation.image;
     }
 

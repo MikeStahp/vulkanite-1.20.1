@@ -44,13 +44,13 @@ public class DescriptorUpdateBuilder {
                         VkDescriptorImageInfo.SIZEOF),
                 VkWriteDescriptorSetAccelerationStructureKHR.SIZEOF);
         objSize = ((objSize + 15) / 16) * 16;
-        
+
         // Add safety margin and better sizing
         long requiredMemory = 2048L + (long) maxUpdates * VkWriteDescriptorSet.SIZEOF + (long) maxUpdates * objSize;
-        
+
         // Ensure we don't exceed reasonable limits
         requiredMemory = Math.min(requiredMemory, 1024L * 1024L); // Cap at 1MB
-        
+
         this.stack = MemoryStack.create((int) requiredMemory);
         this.stack.push();
         this.updates = VkWriteDescriptorSet.calloc(maxUpdates, stack);
@@ -61,13 +61,15 @@ public class DescriptorUpdateBuilder {
         this(ctx, refSet, null);
     }
 
-    public DescriptorUpdateBuilder(VContext ctx, ShaderReflection.Set refSet, final VRef<VImageView> placeholderImageView) {
+    public DescriptorUpdateBuilder(VContext ctx, ShaderReflection.Set refSet,
+            final VRef<VImageView> placeholderImageView) {
         this(ctx, Math.max(refSet.bindings().size(), 8), placeholderImageView); // Minimum of 8 updates
         this.refSet = refSet;
     }
 
     private long viewOrPlaceholder(VRef<VImageView> v) {
-        if (v == null && placeholderImageView == null) return 0;
+        if (v == null && placeholderImageView == null)
+            return 0;
         return v == null ? placeholderImageView.get().view : v.get().view;
     }
 
@@ -136,7 +138,8 @@ public class DescriptorUpdateBuilder {
         return this;
     }
 
-    public DescriptorUpdateBuilder buffer(int binding, int dstArrayElement, final VRef<VBuffer> buffer, List<Long> offsets) {
+    public DescriptorUpdateBuilder buffer(int binding, int dstArrayElement, final VRef<VBuffer> buffer,
+            List<Long> offsets) {
         validateNotApplied();
         validateState();
         if (offsets == null || offsets.isEmpty()) {
@@ -164,19 +167,18 @@ public class DescriptorUpdateBuilder {
         bulkBufferInfos.add(bufInfo);
         return this;
     }
-    
+
     private void validateState() {
         if (setRef == null) {
             throw new IllegalStateException("Descriptor set must be set before adding descriptors");
         }
     }
-    
+
     private void validateNotApplied() {
         if (applied) {
             throw new IllegalStateException("Cannot modify DescriptorUpdateBuilder after apply() has been called");
         }
     }
-
 
     public DescriptorUpdateBuilder uniform(int binding, final VRef<VBuffer> buffer) {
         validateNotApplied();
@@ -207,7 +209,6 @@ public class DescriptorUpdateBuilder {
         return this;
     }
 
-    @SafeVarargs
     public final DescriptorUpdateBuilder acceleration(int binding, VRef<VAccelerationStructure>... structures) {
         validateNotApplied();
         validateState();
@@ -295,7 +296,8 @@ public class DescriptorUpdateBuilder {
         return imageSampler(binding, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, view, sampler);
     }
 
-    public DescriptorUpdateBuilder imageSampler(int binding, int layout, final VRef<VImageView> view, VRef<VSampler> sampler) {
+    public DescriptorUpdateBuilder imageSampler(int binding, int layout, final VRef<VImageView> view,
+            VRef<VSampler> sampler) {
         validateNotApplied();
         validateState();
         if (sampler == null) {
@@ -324,7 +326,7 @@ public class DescriptorUpdateBuilder {
             throw new IllegalStateException("apply() has already been called");
         }
         applied = true;
-        
+
         try {
             updates.limit(updates.position());
             updates.rewind();
@@ -350,26 +352,26 @@ public class DescriptorUpdateBuilder {
                 }
             }
             bulkImageInfos.clear();
-            
+
             if (setRef != null) {
                 setRef.close();
                 setRef = null;
             }
         }
     }
-    
+
     // Allow explicit cleanup if apply() is not called
     public void cleanup() {
         if (applied) {
             return; // Already cleaned up in apply()
         }
-        
+
         try {
             stack.pop();
         } catch (Exception e) {
             System.err.println("Warning: Failed to pop stack: " + e.getMessage());
         }
-        
+
         for (var bufInfo : bulkBufferInfos) {
             try {
                 bufInfo.free();
@@ -378,7 +380,7 @@ public class DescriptorUpdateBuilder {
             }
         }
         bulkBufferInfos.clear();
-        
+
         for (var imgInfo : bulkImageInfos) {
             try {
                 imgInfo.free();
@@ -387,13 +389,13 @@ public class DescriptorUpdateBuilder {
             }
         }
         bulkImageInfos.clear();
-        
+
         if (setRef != null) {
             setRef.close();
             setRef = null;
         }
     }
-    
+
     /**
      * Cleans up resources if not already applied.
      * This should be called explicitly instead of relying on finalize().

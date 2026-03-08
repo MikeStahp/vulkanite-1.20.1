@@ -21,7 +21,8 @@ import static org.lwjgl.vulkan.KHRRayTracingPipeline.*;
 import static org.lwjgl.vulkan.VK10.*;
 
 /**
- * Builder for Vulkan ray tracing pipelines with improved error handling and debugging capabilities.
+ * Builder for Vulkan ray tracing pipelines with improved error handling and
+ * debugging capabilities.
  */
 public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBuilder> {
     private final Set<ShaderModule> shaders = new LinkedHashSet<>();
@@ -60,9 +61,9 @@ public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBui
     /**
      * Adds a hit group to this pipeline.
      *
-     * @param closestHit    The closest hit shader module (can be null)
-     * @param anyHit        The any hit shader module (can be null)
-     * @param intersection  The intersection shader module (can be null)
+     * @param closestHit   The closest hit shader module (can be null)
+     * @param anyHit       The any hit shader module (can be null)
+     * @param intersection The intersection shader module (can be null)
      * @return This builder instance for chaining
      */
     public RaytracePipelineBuilder addHit(ShaderModule closestHit, ShaderModule anyHit, ShaderModule intersection) {
@@ -94,8 +95,8 @@ public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBui
     /**
      * Builds the ray tracing pipeline with the configured settings.
      *
-     * @param context   The Vulkan context
-     * @param maxDepth  Maximum recursion depth for ray tracing
+     * @param context  The Vulkan context
+     * @param maxDepth Maximum recursion depth for ray tracing
      * @return A reference to the created ray tracing pipeline
      * @throws IllegalStateException if required components are missing
      */
@@ -131,21 +132,22 @@ public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBui
                     .pStages(shaderStages)
                     .pGroups(groups)
                     .maxPipelineRayRecursionDepth(maxDepth);
-            
+
             int result = vkCreateRayTracingPipelinesKHR(context.device, 0, 0,
                     VkRayTracingPipelineCreateInfoKHR.create(pipelineCreateInfo.address(), 1),
                     null, pPipeline);
 
             _CHECK_(result, "Failed to create ray tracing pipeline");
 
-            // Generate shader binding table
-            ShaderBindingTable sbt = generateShaderBindingTable(context, stack, pPipeline.get(0));
+            long pipelineHandle = pPipeline.get(0);
 
-            return new VRef<>(new VRaytracePipeline(context, pPipeline.get(0), pipelineLayout, sbt.bufferRef,
-                    sbt.rayGenRegion, sbt.missRegion, sbt.hitRegion, sbt.callableRegion,
+            // Generate shader binding table
+            ShaderBindingTable sbt = generateShaderBindingTable(context, stack, pipelineHandle);
+
+            return new VRef<>(new VRaytracePipeline(context, pipelineHandle, pipelineLayout,
+                    sbt.bufferRef, sbt.rayGenRegion, sbt.missRegion,
+                    sbt.hitRegion, sbt.callableRegion,
                     shaders, reflection));
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to build ray tracing pipeline: " + e.getMessage(), e);
         }
     }
 
@@ -170,7 +172,8 @@ public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBui
         try {
             return ShaderReflection.mergeStages(reflections.toArray(ShaderReflection[]::new));
         } catch (Exception e) {
-            System.err.println("Failed to merge shader reflections, this is likely due to a mismatch in descriptor sets");
+            System.err
+                    .println("Failed to merge shader reflections, this is likely due to a mismatch in descriptor sets");
             throw e;
         }
     }
@@ -182,7 +185,8 @@ public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBui
      * @return Buffer containing shader stage info structures
      */
     private VkPipelineShaderStageCreateInfo.Buffer createShaderStages(MemoryStack stack) {
-        VkPipelineShaderStageCreateInfo.Buffer shaderStages = VkPipelineShaderStageCreateInfo.calloc(shaders.size(), stack);
+        VkPipelineShaderStageCreateInfo.Buffer shaderStages = VkPipelineShaderStageCreateInfo.calloc(shaders.size(),
+                stack);
         int index = 0;
         for (ShaderModule shader : shaders) {
             shader.setupStruct(stack, shaderStages.get(index++));
@@ -211,7 +215,8 @@ public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBui
      * @param shaderToId Mapping from shader modules to indices
      * @return Buffer containing shader group info structures
      */
-    private VkRayTracingShaderGroupCreateInfoKHR.Buffer createShaderGroups(MemoryStack stack, Map<ShaderModule, Integer> shaderToId) {
+    private VkRayTracingShaderGroupCreateInfoKHR.Buffer createShaderGroups(MemoryStack stack,
+            Map<ShaderModule, Integer> shaderToId) {
         int totalGroups = 1 + missShaders.size() + hitGroups.size() + callableShaders.size();
         VkRayTracingShaderGroupCreateInfoKHR.Buffer groups = VkRayTracingShaderGroupCreateInfoKHR
                 .calloc(totalGroups, stack);
@@ -245,12 +250,12 @@ public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBui
         // Set hit shader groups
         for (HitGroup hit : hitGroups) {
             groups.get(groupIndex++)
-                    .type(hit.intersection == null ?
-                            VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR :
-                            VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR)
+                    .type(hit.intersection == null ? VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR
+                            : VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR)
                     .closestHitShader(hit.closestHit == null ? VK_SHADER_UNUSED_KHR : shaderToId.get(hit.closestHit))
                     .anyHitShader(hit.anyHit == null ? VK_SHADER_UNUSED_KHR : shaderToId.get(hit.anyHit))
-                    .intersectionShader(hit.intersection == null ? VK_SHADER_UNUSED_KHR : shaderToId.get(hit.intersection));
+                    .intersectionShader(
+                            hit.intersection == null ? VK_SHADER_UNUSED_KHR : shaderToId.get(hit.intersection));
         }
 
         // Set callable shader groups
@@ -266,9 +271,9 @@ public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBui
     /**
      * Generates the shader binding table for this pipeline.
      *
-     * @param context   The Vulkan context
-     * @param stack     The memory stack for allocations
-     * @param pipeline  The pipeline handle
+     * @param context  The Vulkan context
+     * @param stack    The memory stack for allocations
+     * @param pipeline The pipeline handle
      * @return The generated shader binding table
      */
     private ShaderBindingTable generateShaderBindingTable(VContext context, MemoryStack stack, long pipeline) {
@@ -373,10 +378,10 @@ public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBui
         final VkStridedDeviceAddressRegionKHR callableRegion;
 
         ShaderBindingTable(VRef<VBuffer> bufferRef,
-                          VkStridedDeviceAddressRegionKHR rayGenRegion,
-                          VkStridedDeviceAddressRegionKHR missRegion,
-                          VkStridedDeviceAddressRegionKHR hitRegion,
-                          VkStridedDeviceAddressRegionKHR callableRegion) {
+                VkStridedDeviceAddressRegionKHR rayGenRegion,
+                VkStridedDeviceAddressRegionKHR missRegion,
+                VkStridedDeviceAddressRegionKHR hitRegion,
+                VkStridedDeviceAddressRegionKHR callableRegion) {
             this.bufferRef = bufferRef;
             this.rayGenRegion = rayGenRegion;
             this.missRegion = missRegion;
