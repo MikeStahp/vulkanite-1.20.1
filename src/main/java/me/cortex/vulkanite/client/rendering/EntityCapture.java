@@ -58,58 +58,62 @@ public class EntityCapture {
 
     private static class VertexCaptureProvider implements VertexConsumerProvider {
         private final Map<RenderLayer, BufferBuilder> builderMap = new HashMap<>();
+        private final List<Pair<RenderLayer, BufferBuilder.BuiltBuffer>> reusableBuffersList = new ArrayList<>();
 
         @Override
         public VertexConsumer getBuffer(RenderLayer layer) {
-            return builderMap.compute(layer, (layer1, builder)-> {
-                if (builder == null) {
-                    builder = new BufferBuilder(420);
-                }
-                if (!builder.isBuilding()) {
-                    builder.reset();
-                    builder.begin(layer1.getDrawMode(), layer1.getVertexFormat());
-                }
-                return builder;
-            });
+            BufferBuilder builder = builderMap.get(layer);
+            if (builder == null) {
+                builder = new BufferBuilder(420);
+                builderMap.put(layer, builder);
+            }
+            if (!builder.isBuilding()) {
+                builder.reset();
+                builder.begin(layer.getDrawMode(), layer.getVertexFormat());
+            }
+            return builder;
         }
 
         public List<Pair<RenderLayer, BufferBuilder.BuiltBuffer>> end() {
-            List<Pair<RenderLayer, BufferBuilder.BuiltBuffer>> buffers = new ArrayList<>();
-            builderMap.forEach((layer,buffer)->{
+            reusableBuffersList.clear();
+            for (Map.Entry<RenderLayer, BufferBuilder> entry : builderMap.entrySet()) {
+                RenderLayer layer = entry.getKey();
+                BufferBuilder buffer = entry.getValue();
+
                 if (buffer.isBuilding()) {
                     var builtBuffer = buffer.end();
                     if (builtBuffer.getParameters().getBufferSize() == 0) {
-                        return;//Dont add empty buffers
+                        continue; //Dont add empty buffers
                     }
                     //TODO: Doesnt support terrian vertex format yet, requires a second blas so that the instance offset can be the same
                     // as terrain instance offset
                     if (builtBuffer.getParameters().format().equals(IrisVertexFormats.TERRAIN)) {
                         System.out.println("Skipping block entities (TERRAIN format)");
-                        return;
+                        continue;
                     }
 
                     // TODO: Support anything other than ENTITY
                     if (!builtBuffer.getParameters().format().equals(IrisVertexFormats.ENTITY)) {
                         System.out.println("Skipping non-Entity format: " + builtBuffer.getParameters().format().toString());
-                        return;
+                        continue;
                     }
 
                     //Dont support no texture things
 //                    if (!(layer instanceof OuterWrappedRenderType)) {
 //                        System.out.println("Skipping render layer that's not a MultiPhase, is " + layer.getClass().getName() + " instead");
-//                        return;
+//                        continue;
 //                    }
 //
 //                    var texture = ((RenderLayer.MultiPhase)layer).phases.texture;
 //                    if ((texture == null) || (texture.getId().isEmpty())) {
 //                        System.out.println("Skipping render layer with no texture");
-//                        return;
+//                        continue;
 //                    }
 
-                    buffers.add(new Pair<>(layer, builtBuffer));
+                    reusableBuffersList.add(new Pair<>(layer, builtBuffer));
                 }
-            });
-            return buffers;
+            }
+            return reusableBuffersList.isEmpty() ? Collections.emptyList() : new ArrayList<>(reusableBuffersList);
         }
     }
 }
