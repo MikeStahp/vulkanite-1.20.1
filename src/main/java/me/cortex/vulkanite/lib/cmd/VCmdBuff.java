@@ -116,15 +116,29 @@ public class VCmdBuff extends VObject {
     }
 
     public void bindDSet(VRef<VDescriptorSet>... sets) {
-        long[] vkSets = Arrays.stream(sets).mapToLong(s -> s.get().set).toArray();
+        // ⚡ Bolt: Replace stream().mapToLong() and stream().map() with manual loops for hot paths
+        int numSets = sets.length;
+        long[] vkSets = new long[numSets];
+        for (int i = 0; i < numSets; i++) {
+            vkSets[i] = sets[i].get().set;
+        }
         vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
-        refs.addAll(Arrays.stream(sets).map(s -> new VRef<VObject>(s.get())).toList());
+        for (int i = 0; i < numSets; i++) {
+            refs.add(new VRef<VObject>(sets[i].get()));
+        }
     }
 
     public void bindDSet(List<VRef<VDescriptorSet>> sets) {
-        long[] vkSets = sets.stream().mapToLong(s -> s.get().set).toArray();
+        // ⚡ Bolt: Replace stream().mapToLong() and stream().map() with manual loops for hot paths
+        int numSets = sets.size();
+        long[] vkSets = new long[numSets];
+        for (int i = 0; i < numSets; i++) {
+            vkSets[i] = sets.get(i).get().set;
+        }
         vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
-        refs.addAll(sets.stream().map(s -> new VRef<VObject>(s.get())).toList());
+        for (int i = 0; i < numSets; i++) {
+            refs.add(new VRef<VObject>(sets.get(i).get()));
+        }
     }
 
     public void pushConstants(int offset, int size, long dataPtr) {
@@ -310,7 +324,11 @@ public class VCmdBuff extends VObject {
 
     protected void free() {
         vkFreeCommandBuffers(pool.get().device, pool.get().pool, buffer == null ? finalizedBuffer : buffer);
-        refs.forEach(VRef::close);
+        // ⚡ Bolt: Removed refs.forEach(VRef::close) to avoid iterator and lambda allocations
+        int numRefs = refs.size();
+        for (int i = 0; i < numRefs; i++) {
+            refs.get(i).close();
+        }
         refs.clear();
     }
 
