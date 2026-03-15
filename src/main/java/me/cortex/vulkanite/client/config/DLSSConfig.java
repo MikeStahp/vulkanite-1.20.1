@@ -32,6 +32,9 @@ import java.nio.file.Paths;
  */
 public class DLSSConfig {
 
+    // Singleton instance - ensures all code uses the same configuration
+    private static DLSSConfig INSTANCE = null;
+    
     // Configuration file path
     private static final Path CONFIG_PATH = Paths.get("vulkanite", "dlss_config.json");
 
@@ -104,9 +107,35 @@ public class DLSSConfig {
     }
 
     /**
-     * Load configuration from file
+     * Get the singleton instance of the configuration.
+     * This ensures all code uses the same configuration object.
+     */
+    public static DLSSConfig getInstance() {
+        if (INSTANCE == null) {
+            INSTANCE = loadFromFile();
+        }
+        return INSTANCE;
+    }
+    
+    /**
+     * Reload configuration from file (useful for GUI changes)
+     */
+    public static void reload() {
+        INSTANCE = loadFromFile();
+    }
+    
+    /**
+     * Load configuration - returns the singleton instance.
+     * This method exists for backward compatibility.
      */
     public static DLSSConfig load() {
+        return getInstance();
+    }
+
+    /**
+     * Load configuration from file (internal method)
+     */
+    private static DLSSConfig loadFromFile() {
         DLSSConfig config = new DLSSConfig();
 
         try {
@@ -203,8 +232,8 @@ public class DLSSConfig {
                 if (jsonObject.has("restirSpatialSamples")) {
                     config.restirSpatialSamples = jsonObject.get("restirSpatialSamples").getAsInt();
                 }
-
-                System.out.println("[Vulkanite] Loaded DLSS configuration from " + CONFIG_PATH);
+    
+                System.out.println("[Vulkanite] Loaded DLSS configuration from " + CONFIG_PATH + " [debugMode=" + config.debugMode + "]");
             } else {
                 // Create default config file
                 config.save();
@@ -268,7 +297,7 @@ public class DLSSConfig {
             Gson gson = new GsonBuilder().setPrettyPrinting().create();
             Files.writeString(CONFIG_PATH, gson.toJson(jsonObject));
 
-            System.out.println("[Vulkanite] Saved DLSS configuration to " + CONFIG_PATH);
+            System.out.println("[Vulkanite] Saved DLSS configuration to " + CONFIG_PATH + " [debugMode=" + debugMode + "]");
         } catch (IOException e) {
             System.err.println("[Vulkanite] Failed to save DLSS configuration: " + e.getMessage());
         }
@@ -374,10 +403,13 @@ public class DLSSConfig {
     }
 
     public boolean isDebugMode() {
+        // DEBUG LOG: Track when debugMode is read
         return debugMode;
     }
 
     public void setDebugMode(boolean debugMode) {
+        // DEBUG LOG: Track when debugMode is changed
+        System.out.println("[Vulkanite DLSSConfig] setDebugMode called: " + this.debugMode + " -> " + debugMode);
         this.debugMode = debugMode;
     }
 

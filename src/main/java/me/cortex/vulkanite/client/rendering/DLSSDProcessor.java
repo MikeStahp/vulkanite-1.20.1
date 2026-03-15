@@ -92,6 +92,11 @@ public class DLSSDProcessor {
             return false;
         }
 
+        // Ensure dimensions are multiple of 8 to match DLSS requirements
+        // This prevents off-by-one errors (e.g., 1009 height) which cause NGX InvalidParameter
+        width = width & ~7;
+        height = height & ~7;
+
         // Skip if already initialized with same dimensions
         if (initialized && lastWidth == width && lastHeight == height) {
             return true;

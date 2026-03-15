@@ -41,8 +41,10 @@ public class JitterManager {
         prevJitterY = jitterY;
 
         // Update render resolution
-        currentRenderWidth = renderWidth;
-        currentRenderHeight = renderHeight;
+        // Always align dimensions to multiple of 8 to match DLSS
+        // This prevents jitter calculation using 1009 height when DLSS uses 1008
+        currentRenderWidth = renderWidth & ~7;
+        currentRenderHeight = renderHeight & ~7;
 
         // Only apply jitter when DLSS is actively processing
         // Otherwise, disable jitter to prevent image shaking

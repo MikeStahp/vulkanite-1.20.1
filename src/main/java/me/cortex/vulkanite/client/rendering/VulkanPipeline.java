@@ -559,6 +559,12 @@ public class VulkanPipeline {
                 var dlssConfig = me.cortex.vulkanite.client.config.DLSSConfig.load();
                 int enableReSTIR = dlssConfig.isReSTIREnabled() ? 1 : 0;
                 int debugMode = dlssConfig.isDebugMode() ? 1 : 0;
+                
+                // DEBUG LOG: Log debug mode status every 60 frames to avoid spam
+                if (frameIndex % 60 == 0) {
+                    LOGGER.info("[Vulkanite Debug] frameIndex={}, debugMode={}, enableReSTIR={}, config.enabled={}, config.debugMode={}",
+                        frameIndex, debugMode, enableReSTIR, dlssConfig.isEnabled(), dlssConfig.isDebugMode());
+                }
 
                 // Determine ping-pong indices for reservoir double-buffering
                 int currentReservoirIdx = frameIndex % 2;
@@ -782,6 +788,12 @@ public class VulkanPipeline {
             width = 1920;
             height = 1080;
         }
+
+        // IMPORTANT: DLSS requires even dimensions (often multiples of 8/16/32 preferred)
+        // Odd dimensions like 853x480 cause InvalidParameter errors in NGX
+        // We align to 8 pixels to match DLSS requirements
+        width = width & ~7;
+        height = height & ~7;
 
         // Create storage images for lightmaps
         // Format: RGBA32F for high dynamic range lighting data

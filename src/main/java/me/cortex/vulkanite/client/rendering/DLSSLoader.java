@@ -49,11 +49,11 @@ public class DLSSLoader {
         */
         
         // Then load our bridge library
-        if (NativeLibraryLoader.loadLibrary("vulkanite_dlss_bridge")) {
+        if (NativeLibraryLoader.loadLibrary("vulkanite_dlss_bridge_v2")) {
             try {
                 // Map the JNA interface
-                instance = Native.load("vulkanite_dlss_bridge", DLSSBridge.class);
-                System.out.println("[Vulkanite DLSS] DLSS Bridge loaded successfully.");
+                instance = Native.load("vulkanite_dlss_bridge_v2", DLSSBridge.class);
+                System.out.println("[Vulkanite DLSS] DLSS Bridge V2 loaded successfully.");
             } catch (UnsatisfiedLinkError e) {
                  System.err.println("[Vulkanite DLSS] Failed to map JNA interface: " + e.getMessage());
                  instance = null;
@@ -61,8 +61,8 @@ public class DLSSLoader {
         } else {
             // Fallback to JNA default loading if manual loading failed
             try {
-                instance = Native.load("vulkanite_dlss_bridge", DLSSBridge.class);
-                System.out.println("[Vulkanite DLSS] DLSS Bridge loaded via JNA default.");
+                instance = Native.load("vulkanite_dlss_bridge_v2", DLSSBridge.class);
+                System.out.println("[Vulkanite DLSS] DLSS Bridge V2 loaded via JNA default.");
             } catch (UnsatisfiedLinkError e) {
                 System.err.println("[Vulkanite DLSS] Failed to load vulkanite_dlss_bridge: " + e.getMessage());
                 instance = null;
