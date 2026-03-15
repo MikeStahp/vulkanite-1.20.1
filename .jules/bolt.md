@@ -1,0 +1,3 @@
+## 2024-05-01 - Avoid Java Streams in hot loops
+**Learning:** In hot rendering paths like `VulkanPipeline.renderPostShadows`, `VCmdBuff.bindDSet`, and `CommandManager.Queue.waitForExecutions`, using Java Streams causes unnecessary object allocation (lambdas, iterators, `ArrayList` backing arrays). This leads to increased Garbage Collection pressure per frame.
+**Action:** Replace `stream().map()` and `stream().mapToInt()` calls with basic `for` loops and manually sized primitive arrays or lists in high-frequency methods.
