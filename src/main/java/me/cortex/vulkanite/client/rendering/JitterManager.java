@@ -17,6 +17,7 @@ import org.joml.Matrix4f;
  */
 public class JitterManager {
     private static int frameIndex = 0;
+    private static int frameCounter = 0;
     private static float jitterX = 0; // Pixel space jitter X
     private static float jitterY = 0; // Pixel space jitter Y
     private static int phaseCount = 8; // Reduced from 16 for faster convergence
@@ -36,6 +37,7 @@ public class JitterManager {
 
     // Call this once per frame before rendering
     public static void updateJitter(int renderWidth, int renderHeight) {
+        frameCounter++;
         // Store previous jitter before updating (for DLSS motion vectors)
         prevJitterX = jitterX;
         prevJitterY = jitterY;
@@ -43,8 +45,8 @@ public class JitterManager {
         // Update render resolution
         // Always align dimensions to multiple of 8 to match DLSS
         // This prevents jitter calculation using 1009 height when DLSS uses 1008
-        currentRenderWidth = renderWidth & ~7;
-        currentRenderHeight = renderHeight & ~7;
+        currentRenderWidth = Math.max(8, renderWidth & ~7);
+        currentRenderHeight = Math.max(8, renderHeight & ~7);
 
         // Only apply jitter when DLSS is actively processing
         // Otherwise, disable jitter to prevent image shaking
@@ -62,7 +64,7 @@ public class JitterManager {
         jitterY = halton(frameIndex + 1, 3) - 0.5f;
 
         // DIAGNOSTIC: Log jitter values every 60 frames to validate
-        if (frameIndex % 60 == 0) {
+        if (frameCounter % 60 == 0) {
             System.out.println("[JitterManager DIAGNOSTIC] frameIndex=" + frameIndex +
                     ", jitterX(pixels)=" + jitterX + ", jitterY(pixels)=" + jitterY +
                     ", renderWidth=" + renderWidth + ", renderHeight=" + renderHeight +
@@ -126,6 +128,9 @@ public class JitterManager {
 
     public static void setEnabled(boolean enabled) {
         isEnabled = enabled;
+        if (!enabled) {
+            reset();
+        }
     }
 
     public static boolean isJitterEnabled() {
@@ -133,7 +138,7 @@ public class JitterManager {
     }
 
     public static int getFrameIndex() {
-        return frameIndex;
+        return frameCounter;
     }
 
     /**
@@ -143,12 +148,11 @@ public class JitterManager {
      * @param active true if DLSS is processing frames, false otherwise
      */
     public static void setDLSSActive(boolean active) {
-        dlssActive = active;
-        if (!active) {
-            // Reset jitter when DLSS is disabled
-            jitterX = 0;
-            jitterY = 0;
+        if (dlssActive == active) {
+            return;
         }
+        dlssActive = active;
+        reset();
     }
 
     /**
@@ -156,6 +160,22 @@ public class JitterManager {
      */
     public static boolean isDLSSActive() {
         return dlssActive;
+    }
+
+    /**
+     * Get the current render width (aligned to multiple of 8).
+     * Used by UBODataEncoder to compute NDC jitter offsets.
+     */
+    public static int getCurrentRenderWidth() {
+        return currentRenderWidth;
+    }
+
+    /**
+     * Get the current render height (aligned to multiple of 8).
+     * Used by UBODataEncoder to compute NDC jitter offsets.
+     */
+    public static int getCurrentRenderHeight() {
+        return currentRenderHeight;
     }
 
     /**
@@ -172,6 +192,14 @@ public class JitterManager {
      */
     public static float getPrevJitterY() {
         return prevJitterY;
+    }
+
+    public static float getJitterDeltaX() {
+        return jitterX - prevJitterX;
+    }
+
+    public static float getJitterDeltaY() {
+        return jitterY - prevJitterY;
     }
 
     /**

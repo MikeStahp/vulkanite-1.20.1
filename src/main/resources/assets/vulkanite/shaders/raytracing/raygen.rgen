@@ -72,8 +72,8 @@ layout(binding = 11, set = 0) uniform sampler2D colortex5;
 // Binding 12: Final Output Target (storage image array)
 layout(binding = 12, set = 0, rgba16f) uniform image2D RayTraceData[];
 
-// Binding 13: Motion Vectors for DLSS (RG16F)
-layout(binding = 13, set = 0, rg16f) uniform image2D MotionVectors;
+// Binding 13: Motion Vectors for DLSS (RG32F)
+layout(binding = 13, set = 0, rg32f) uniform image2D MotionVectors;
 
 // Binding 14: Linear Depth for DLSS (R32F)
 layout(binding = 14, set = 0, r32f) uniform image2D LinearDepth;
@@ -96,6 +96,14 @@ const float SUN_ANGULAR_RADIUS = 0.0047; // Sun angular radius in radians (~0.27
 /// @return Normalized UV coordinates in [0, 1] range
 vec2 calculateUV(vec2 launchID, vec2 launchSize) {
     return (launchID + 0.5) / launchSize;
+}
+
+vec2 getJitterDelta() {
+    return cam.jitter.xy - cam.jitter.zw;
+}
+
+vec2 computeMotionVector(vec2 currentUV, vec2 previousUV, vec2 launchSize) {
+    return ((currentUV - previousUV) * launchSize) - getJitterDelta();
 }
 
 /// Calculates the primary ray direction from camera corners
@@ -275,9 +283,12 @@ void main() {
         vec4 prevClipSky = cam.prevViewProj * vec4(farPos, 1.0);
         vec3 prevNDCSky = prevClipSky.xyz / prevClipSky.w;
         vec2 prevUVSky = prevNDCSky.xy * 0.5 + 0.5;
-        vec2 skyMotion = (uv - prevUVSky);
         
-        // Store UV space difference (bridge wrapper scales to pixel space)
+        // Convert to Pixel Space displacement (DLSS expects native pixel scale)
+        // DLSS expects: MV = Previous - Current (pure geometric motion only)
+        vec2 skyMotion = computeMotionVector(uv, prevUVSky, launchSize);
+        
+        // Store Pixel space difference
         imageStore(MotionVectors, ivec2(launchID), vec4(skyMotion, 0.0, 0.0));
         
         // Write Linear Depth for Sky (Far Plane)
@@ -322,7 +333,13 @@ void main() {
     // --- Layer 2: Sunlight with Ray-Traced Shadows ---
     // Trace shadow ray toward sun
     vec3 sunDir = normalize(cam.sunPosition.xyz);
-    vec3 rayOrigin = worldPos + normal * BIAS;
+    
+    // Improved ray origin calculation to avoid self-intersection artifacts on distant geometry
+    // Use a view-dependent bias that scales with distance
+    float viewDist = length(worldPos - cameraPos);
+    float adaptiveBias = max(BIAS, viewDist * 0.0001); // Scale bias slightly with distance
+    
+    vec3 rayOrigin = worldPos + normal * adaptiveBias;
     
     // Use global payload for shadow ray
     payload.color = vec3(1.0);
@@ -353,7 +370,9 @@ void main() {
     // --- Optional: GI Ray (cosine-weighted hemisphere sampling) ---
     // Trace one bounce GI ray for indirect diffuse
     vec3 giDir = cosineWeightedHemisphere(normal, seed);
-    vec3 giOrigin = worldPos + normal * BIAS;
+    
+    // Use the same adaptive bias for GI ray origin
+    vec3 giOrigin = worldPos + normal * adaptiveBias;
     
     // Use global payload for GI ray
     payload.color = vec3(0.0);
@@ -406,10 +425,17 @@ void main() {
     imageStore(RayTraceData[0], ivec2(launchID), vec4(finalColor, 1.0));
     
     // Calculate and write Motion Vectors for Geometry
-    vec4 prevClip = cam.prevViewProj * vec4(worldPos, 1.0);
+    // CRITICAL: worldPos from G-buffer is CAMERA-RELATIVE (Minecraft renders centered on camera).
+    // prevViewProj transforms from ABSOLUTE world space to clip space.
+    // We must convert to absolute world space before reprojecting.
+    vec3 absWorldPos = worldPos + getCameraPosition();
+    vec4 prevClip = cam.prevViewProj * vec4(absWorldPos, 1.0);
     vec3 prevNDC = prevClip.xyz / prevClip.w;
     vec2 prevUV = prevNDC.xy * 0.5 + 0.5;
-    vec2 motion = (uv - prevUV);
+    
+    // Scale to Pixel Space as required by DLSS
+    // DLSS expects MV = Previous - Current (pure geometric motion only)
+    vec2 motion = computeMotionVector(uv, prevUV, launchSize);
     
     imageStore(MotionVectors, ivec2(launchID), vec4(motion, 0.0, 0.0));
     

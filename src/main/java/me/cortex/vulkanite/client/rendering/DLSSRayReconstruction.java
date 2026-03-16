@@ -4,9 +4,6 @@ import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.memory.VImage;
 import me.cortex.vulkanite.lib.other.VImageView;
-import org.lwjgl.system.MemoryUtil;
-
-import java.nio.ByteBuffer;
 
 import me.cortex.vulkanite.lib.cmd.VCmdBuff;
 import static org.lwjgl.vulkan.VK10.*;
@@ -48,6 +45,7 @@ import static org.lwjgl.vulkan.VK10.*;
  *      DLSS Ray Reconstruction</a>
  */
 public class DLSSRayReconstruction {
+    private static final int RESET_WARMUP_FRAMES = 5;
     private final VContext context;
 
     // DLSS state
@@ -90,7 +88,10 @@ public class DLSSRayReconstruction {
     // Frame tracking
     private int frameIndex;
     private boolean reset;
+    private int resetCountdown = RESET_WARMUP_FRAMES; // Warmup frames to clear artifacts
     private float lastFrameTimeDelta;
+    private boolean internalInputsInitialized;
+    private boolean outputLayoutInitialized;
 
     // Performance metrics
     private long lastProcessingTimeNs;
@@ -153,8 +154,11 @@ public class DLSSRayReconstruction {
         this.outputHeight = 1080;
         this.frameIndex = 0;
         this.reset = true;
+        this.resetCountdown = RESET_WARMUP_FRAMES;
         this.lastFrameTimeDelta = 16.67f; // ~60fps default
         this.lastProcessingTimeNs = 0;
+        this.internalInputsInitialized = false;
+        this.outputLayoutInitialized = false;
 
         if (isDLSSDSupported) {
             System.out.println("[Vulkanite] DLSS Ray Reconstruction (DLSSD) Library Loaded");
@@ -312,6 +316,9 @@ public class DLSSRayReconstruction {
 
         this.initialized = true;
         this.reset = true;
+        this.resetCountdown = RESET_WARMUP_FRAMES;
+        this.internalInputsInitialized = false;
+        this.outputLayoutInitialized = false;
 
         return true;
     }
@@ -348,14 +355,6 @@ public class DLSSRayReconstruction {
 
         // Create G-buffer inputs for DLSSD (Ray Reconstruction)
         if (useRayReconstruction) {
-            // Noisy Input (Color) - Internal Buffer for SFLOAT conversion
-            noisyInputImage = context.memory.createImage2D(
-                    renderWidth, renderHeight, 1,
-                    VK_FORMAT_R16G16B16A16_SFLOAT,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            noisyInputView = VImageView.create(context, noisyInputImage);
-
             // Diffuse Albedo (RGB surface color)
             // NGX DLSSD expects HDR (floating point) input, or UNORM if flagged correctly.
             // But to be safe and match Ray Tracing pipeline, we use R16G16B16A16_SFLOAT.
@@ -404,6 +403,55 @@ public class DLSSRayReconstruction {
         outputView = VImageView.create(context, outputImage);
     }
 
+    private void transitionImage(VCmdBuff cmd, VRef<VImage> image, int oldLayout, int newLayout) {
+        if (image == null) {
+            return;
+        }
+        cmd.encodeImageTransition(image, oldLayout, newLayout, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+    }
+
+    @SafeVarargs
+    private final void transitionImages(VCmdBuff cmd, int oldLayout, int newLayout, VRef<VImage>... images) {
+        for (VRef<VImage> image : images) {
+            transitionImage(cmd, image, oldLayout, newLayout);
+        }
+    }
+
+    private void blitImage(VCmdBuff cmd, VRef<VImage> source, VRef<VImage> target) {
+        if (source == null || target == null) {
+            return;
+        }
+        cmd.blitImage(source, target, renderWidth, renderHeight, VK_FILTER_NEAREST);
+    }
+
+    private void transitionOutputForEvaluation(VCmdBuff cmd) {
+        if (!outputLayoutInitialized) {
+            cmd.encodeImageTransition(outputImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT,
+                    1);
+            outputLayoutInitialized = true;
+        }
+    }
+
+    @SafeVarargs
+    private final void transitionInternalInputsForWrite(VCmdBuff cmd, VRef<VImage>... images) {
+        transitionImages(cmd, internalInputsInitialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, images);
+        internalInputsInitialized = true;
+    }
+
+    private float toFrameTimeMs(float deltaTime) {
+        return Math.max(1.0f, Math.min(100.0f, deltaTime * 1000.0f));
+    }
+
+    private void advanceResetState() {
+        if (resetCountdown > 0) {
+            resetCountdown--;
+            reset = true;
+        } else {
+            reset = false;
+        }
+    }
+
     /**
      * Process a frame through DLSS (standard mode)
      * 
@@ -425,86 +473,51 @@ public class DLSSRayReconstruction {
 
         long startTime = System.nanoTime();
         frameIndex++;
-        lastFrameTimeDelta = deltaTime * 1000.0f; // Convert to milliseconds
+        lastFrameTimeDelta = toFrameTimeMs(deltaTime);
 
-        // Create views for the external images passed as parameters
-        // NOTE: These views are temporary and will be closed after the DLSS call
-        VRef<VImageView> extNoisyInputView = VImageView.create(context, noisyInput);
-        VRef<VImageView> extDepthView = VImageView.create(context, depth);
-        VRef<VImageView> extMotionVectorView = VImageView.create(context, motionVectors);
+        // =================================================================================================
+        // BLIT CONVERSION: Copy external UNORM/SFLOAT textures into exactly formatted DLSS buffers
+        // =================================================================================================
 
-        try {
-            // =================================================================================================
-            // BLIT CONVERSION: Copy external UNORM/SFLOAT textures into exactly formatted DLSS buffers
-            // =================================================================================================
-            
-            // 1. Transition external images to TRANSFER_SRC
-            cmd.encodeImageTransition(noisyInput, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(depth, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(motionVectors, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+        transitionImages(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, noisyInput, depth, motionVectors);
+        transitionInternalInputsForWrite(cmd, noisyInputImage, depthImage, motionVectorImage);
 
-            // 2. Transition internal images to TRANSFER_DST
-            cmd.encodeImageTransition(noisyInputImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(depthImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(motionVectorImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+        blitImage(cmd, noisyInput, noisyInputImage);
+        blitImage(cmd, depth, depthImage);
+        blitImage(cmd, motionVectors, motionVectorImage);
 
-            // 3. Perform Blit (Copy + Format Conversion)
-            cmd.blitImage(noisyInput, noisyInputImage, renderWidth, renderHeight, VK_FILTER_NEAREST);
-            cmd.blitImage(depth, depthImage, renderWidth, renderHeight, VK_FILTER_NEAREST);
-            cmd.blitImage(motionVectors, motionVectorImage, renderWidth, renderHeight, VK_FILTER_NEAREST);
+        transitionImages(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, noisyInputImage, depthImage,
+                motionVectorImage);
+        transitionImages(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, noisyInput, depth, motionVectors);
 
-            // 4. Transition internal images to GENERAL (for DLSS read)
-            cmd.encodeImageTransition(noisyInputImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(depthImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(motionVectorImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+        cmd.encodeMemoryBarrier();
+        transitionOutputForEvaluation(cmd);
 
-            // 5. Restore external images to GENERAL
-            cmd.encodeImageTransition(noisyInput, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(motionVectors, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            
-            cmd.encodeMemoryBarrier();
+        // Jitter: JitterManager returns Halton subpixel offset in [-0.5, 0.5] pixels.
+        // DLSS expects pixel-space jitter (not NDC, not UV).
+        float subpixelJitterX = JitterManager.getJitterX();
+        float subpixelJitterY = JitterManager.getJitterY();
 
-            // Output: first frame must transition from UNDEFINED, subsequent frames from GENERAL.
-            if (reset) {
-                cmd.encodeImageTransition(outputImage,
-                        VK_IMAGE_LAYOUT_UNDEFINED,
-                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            }
+        int result = bridge.evaluateDLSS(
+                cmd.bufferAddress(),
+                noisyInputView.get().view, noisyInputImage.get().image(), noisyInputImage.get().format,
+                depthView.get().view, depthImage.get().image(), depthImage.get().format,
+                motionVectorView.get().view, motionVectorImage.get().image(), motionVectorImage.get().format,
+                outputView.get().view, outputImage.get().image(), outputImage.get().format,
+                subpixelJitterX,
+                subpixelJitterY);
 
-            // Jitter: JitterManager returns Halton subpixel offset in [-0.5, 0.5] pixels.
-            // DLSS expects pixel-space jitter (not NDC, not UV).
-            float subpixelJitterX = JitterManager.getJitterX();
-            float subpixelJitterY = JitterManager.getJitterY();
+        cmd.encodeMemoryBarrier();
 
-            // Call standard DLSS evaluation using views created for the explicitly formatted internal images
-            int result = bridge.evaluateDLSS(
-                    cmd.bufferAddress(),
-                    noisyInputView.get().view, noisyInputImage.get().image(), noisyInputImage.get().format,
-                    depthView.get().view, depthImage.get().image(), depthImage.get().format,
-                    motionVectorView.get().view, motionVectorImage.get().image(), motionVectorImage.get().format,
-                    outputView.get().view, outputImage.get().image(), outputImage.get().format,
-                    subpixelJitterX,
-                    subpixelJitterY);
-
-            // After evaluate, ensure writes are visible
-            cmd.encodeMemoryBarrier();
-
-            if (result != 1) {
-                System.err.println("[Vulkanite DLSS] evaluateDLSS failed! Error code: " + Integer.toHexString(result));
-                return noisyInput;
-            }
-
-            lastProcessingTimeNs = System.nanoTime() - startTime;
-            reset = false;
-
-            return outputImage;
-        } finally {
-            // Clean up temporary views
-            extNoisyInputView.close();
-            extDepthView.close();
-            extMotionVectorView.close();
+        if (result != 1) {
+            System.err.println("[Vulkanite DLSS] evaluateDLSS failed! Error code: " + Integer.toHexString(result));
+            return noisyInput;
         }
+
+        lastProcessingTimeNs = System.nanoTime() - startTime;
+        advanceResetState();
+
+        return outputImage;
     }
 
     /**
@@ -548,15 +561,8 @@ public class DLSSRayReconstruction {
 
         long startTime = System.nanoTime();
         frameIndex++;
-        lastFrameTimeDelta = deltaTime * 1000.0f; // Convert to milliseconds
+        lastFrameTimeDelta = toFrameTimeMs(deltaTime);
 
-        // Create views for the external images passed as parameters
-        VRef<VImageView> extNoisyInputView = VImageView.create(context, noisyInput);
-        VRef<VImageView> extDepthView = VImageView.create(context, depth);
-        VRef<VImageView> extMotionVectorView = VImageView.create(context, motionVectors);
-        VRef<VImageView> extDiffuseAlbedoView = VImageView.create(context, diffuseAlbedo);
-        VRef<VImageView> extSpecularAlbedoView = VImageView.create(context, specularAlbedo);
-        VRef<VImageView> extNormalsView = VImageView.create(context, normals);
         VRef<VImageView> extRoughnessView = (roughness != null) ? VImageView.create(context, roughness) : null;
 
         try {
@@ -565,62 +571,38 @@ public class DLSSRayReconstruction {
             // This is required because DLSSD (IsHDR=true) expects strictly formatted floating point inputs.
             // =================================================================================================
             
-            // 1. Transition external images to TRANSFER_SRC
-            cmd.encodeImageTransition(noisyInput, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(depth, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(motionVectors, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(diffuseAlbedo, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(specularAlbedo, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(normals, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            
-            // 2. Transition internal images to TRANSFER_DST
-            cmd.encodeImageTransition(noisyInputImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(depthImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(motionVectorImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(diffuseAlbedoImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(specularAlbedoImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(normalsImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+            transitionImages(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, noisyInput, depth, motionVectors,
+                    diffuseAlbedo, specularAlbedo, normals);
+            transitionInternalInputsForWrite(cmd, noisyInputImage, depthImage, motionVectorImage, diffuseAlbedoImage,
+                    specularAlbedoImage, normalsImage);
 
             // 3. Perform Blit (Copy + Format Conversion)
             // Vulkan vkCmdBlitImage handles format conversion (UNORM -> SFLOAT) automatically
-            cmd.blitImage(noisyInput, noisyInputImage, renderWidth, renderHeight, VK_FILTER_NEAREST);
-            cmd.blitImage(depth, depthImage, renderWidth, renderHeight, VK_FILTER_NEAREST);
-            cmd.blitImage(motionVectors, motionVectorImage, renderWidth, renderHeight, VK_FILTER_NEAREST);
-            cmd.blitImage(diffuseAlbedo, diffuseAlbedoImage, renderWidth, renderHeight, VK_FILTER_NEAREST);
-            cmd.blitImage(specularAlbedo, specularAlbedoImage, renderWidth, renderHeight, VK_FILTER_NEAREST);
-            cmd.blitImage(normals, normalsImage, renderWidth, renderHeight, VK_FILTER_NEAREST);
+            blitImage(cmd, noisyInput, noisyInputImage);
+            blitImage(cmd, depth, depthImage);
+            blitImage(cmd, motionVectors, motionVectorImage);
+            blitImage(cmd, diffuseAlbedo, diffuseAlbedoImage);
+            blitImage(cmd, specularAlbedo, specularAlbedoImage);
+            blitImage(cmd, normals, normalsImage);
 
-            // 4. Transition internal images to GENERAL (for DLSS read)
-            cmd.encodeImageTransition(noisyInputImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(depthImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(motionVectorImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(diffuseAlbedoImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(specularAlbedoImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(normalsImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+            transitionImages(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, noisyInputImage, depthImage,
+                    motionVectorImage, diffuseAlbedoImage, specularAlbedoImage, normalsImage);
 
-            // 5. Restore external images to GENERAL (so we don't break subsequent passes)
-            cmd.encodeImageTransition(noisyInput, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(motionVectors, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(diffuseAlbedo, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(specularAlbedo, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            cmd.encodeImageTransition(normals, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+            transitionImages(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, noisyInput, depth, motionVectors,
+                    diffuseAlbedo, specularAlbedo, normals);
             
             // Ensure writes are visible
             cmd.encodeMemoryBarrier();
 
             // Output: first frame must transition from UNDEFINED, subsequent frames stay GENERAL.
-            if (reset) {
-                cmd.encodeImageTransition(outputImage,
-                        VK_IMAGE_LAYOUT_UNDEFINED,
-                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            }
+            transitionOutputForEvaluation(cmd);
 
             // Jitter: pixel-space Halton offset, [-0.5, 0.5] pixels.
             float subpixelJitterX = JitterManager.getJitterX();
             float subpixelJitterY = JitterManager.getJitterY();
 
-            System.out.println("[Vulkanite DLSSD] Calling native evaluateDLSSD...");
+            // Throttle per-frame logging to avoid flooding stdout
+            boolean shouldLogFrame = (frameIndex % 300 == 1) || (reset && resetCountdown == RESET_WARMUP_FRAMES);
             
             // Call DLSSD evaluation with explicit formatted SFLOAT internal image views
             int result = bridge.evaluateDLSSD(
@@ -644,7 +626,9 @@ public class DLSSRayReconstruction {
                     reset ? 1 : 0,
                     lastFrameTimeDelta);
                     
-            System.out.println("[Vulkanite DLSSD] Native evaluateDLSSD returned: " + result);
+            if (shouldLogFrame) {
+                System.out.println("[Vulkanite DLSSD] evaluateDLSSD returned: " + result + " (frame " + frameIndex + ", reset=" + reset + ")");
+            }
 
             // After NGX evaluate, add a memory barrier to ensure NGX writes are visible.
             cmd.encodeMemoryBarrier();
@@ -656,17 +640,10 @@ public class DLSSRayReconstruction {
             }
 
             lastProcessingTimeNs = System.nanoTime() - startTime;
-            reset = false;
+            advanceResetState();
 
             return outputImage;
         } finally {
-            // Clean up temporary views
-            extNoisyInputView.close();
-            extDepthView.close();
-            extMotionVectorView.close();
-            extDiffuseAlbedoView.close();
-            extSpecularAlbedoView.close();
-            extNormalsView.close();
             if (extRoughnessView != null) {
                 extRoughnessView.close();
             }
@@ -679,7 +656,10 @@ public class DLSSRayReconstruction {
      */
     public void resetTemporalState() {
         this.reset = true;
+        this.resetCountdown = RESET_WARMUP_FRAMES;
         this.frameIndex = 0;
+        this.internalInputsInitialized = false;
+        this.outputLayoutInitialized = false;
     }
 
     /**
@@ -724,6 +704,7 @@ public class DLSSRayReconstruction {
         if (this.qualityPreset != preset) {
             this.qualityPreset = preset;
             this.reset = true;
+            this.resetCountdown = RESET_WARMUP_FRAMES;
         }
     }
 
@@ -874,5 +855,7 @@ public class DLSSRayReconstruction {
             outputImage.close();
 
         initialized = false;
+        internalInputsInitialized = false;
+        outputLayoutInitialized = false;
     }
 }

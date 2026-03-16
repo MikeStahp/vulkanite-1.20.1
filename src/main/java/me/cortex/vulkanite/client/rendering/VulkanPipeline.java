@@ -80,10 +80,16 @@ public class VulkanPipeline {
     private VRef<VImage>[] reservoirImages = new VRef[2]; // Ping-pong ReSTIR reservoir buffers (binding 6 + 15)
     private VRef<VImage> motionVectorImage; // Motion vectors for DLSS (binding 13)
     private boolean reservoirImagesInitialized = false; // Tracks first-frame UNDEFINED→GENERAL transition
+    private boolean motionVectorsInitialized = false; // Tracks first-frame clear
     private boolean depthImageInitialized = false; // Tracks first-frame UNDEFINED→GENERAL for DLSS depth buffer
 
     // DLSSD (Ray Reconstruction) processor
     private DLSSDProcessor dlssdProcessor;
+    private net.minecraft.world.World lastWorld;
+    private boolean wasPaused = false;
+    private net.minecraft.client.gui.screen.Screen lastScreen;
+    private long lastDlssFrameTimeNs = -1L;
+    private boolean dlssTemporalPathActive = false;
 
     public VulkanPipeline(VContext ctx, AccelerationManager accelerationManager, RaytracingShaderSet[] passes,
             int[] ssboIds, List<VRef<VGImage>> customTextures) {
@@ -328,8 +334,28 @@ public class VulkanPipeline {
                 : null);
     }
 
+    private void clearColorImage(VCmdBuff cmd, VRef<VImage> image) {
+        try (var stack = org.lwjgl.system.MemoryStack.stackPush()) {
+            var clearColor = org.lwjgl.vulkan.VkClearColorValue.calloc(stack);
+            clearColor.float32(0, 0.0f);
+            clearColor.float32(1, 0.0f);
+            clearColor.float32(2, 0.0f);
+            clearColor.float32(3, 0.0f);
+
+            var range = org.lwjgl.vulkan.VkImageSubresourceRange.calloc(stack);
+            range.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT);
+            range.baseMipLevel(0);
+            range.levelCount(1);
+            range.baseArrayLayer(0);
+            range.layerCount(1);
+
+            vkCmdClearColorImage(cmd.buffer(), image.get().image(), VK_IMAGE_LAYOUT_GENERAL, clearColor, range);
+        }
+    }
+
     public void renderPostShadows(List<VRef<VGImage>> vgOutImgs, Camera camera, ShaderStorageBuffer[] ssbos,
             MixinCelestialUniforms celestialUniforms, VRef<VImageView>[] gbufferViews) {
+        checkWorldChange();
         var prof = MinecraftClient.getInstance().getProfiler();
 
         for (int i = 0; i < 15; i++) {
@@ -535,9 +561,19 @@ public class VulkanPipeline {
                     if (reservoirImage != null) {
                         rtCmd.encodeImageTransition(reservoirImage, VK_IMAGE_LAYOUT_UNDEFINED,
                                 VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+                        // Clear to black to prevent garbage data
+                        clearColorImage(rtCmd, reservoirImage);
                     }
                 }
                 reservoirImagesInitialized = true;
+            }
+            
+            // Initialize Motion Vectors (Clear to black on first frame)
+            if (!motionVectorsInitialized && motionVectorImage != null) {
+                rtCmd.encodeImageTransition(motionVectorImage, VK_IMAGE_LAYOUT_UNDEFINED,
+                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+                clearColorImage(rtCmd, motionVectorImage);
+                motionVectorsInitialized = true;
             }
 
             // Execute render passes
@@ -601,8 +637,11 @@ public class VulkanPipeline {
             boolean dlssEnabled = dlssConfig.isEnabled(); // Remove isRayReconstructionEnabled() requirement to allow
                                                           // standard DLSS fallback
 
-            if (dlssEnabled && dlssdProcessor != null && dlssdProcessor.isSupported() && !outImgs.isEmpty()
-                    && !debugModeEnabled) {
+            MinecraftClient mc = MinecraftClient.getInstance();
+            boolean dlssFrameActive = shouldProcessDlssFrame(mc, dlssEnabled, debugModeEnabled, outImgs);
+            updateTemporalPathState(dlssFrameActive);
+
+            if (dlssFrameActive) {
                 prof.push("vulkanite_dlssd_process");
                 try {
                     // Get dimensions from the output image
@@ -635,18 +674,13 @@ public class VulkanPipeline {
 
                             if (noisyOutput != null && depthImage != null && depthImage.get() != null
                                     && hasValidGBuffer) {
-                                // Enable jitter for DLSS temporal stability
-                                JitterManager.setDLSSActive(true);
-
                                 // Log G-buffer configuration only occasionally
                                 int logFrame = net.irisshaders.iris.uniforms.SystemTimeUniforms.COUNTER.getAsInt();
                                 if (logFrame % 300 == 0) {
                                     GBufferDLSSDAdapter.logGBufferConfiguration(gbufferViews);
                                 }
 
-                                // Process through DLSSD
-                                // Note: deltaTime is estimated as 1/60s for now; could be passed from caller
-                                float deltaTime = 1.0f / 60.0f;
+                                float deltaTime = computeDLSSDeltaTimeSeconds();
                                 var denoisedOutput = dlssdProcessor.processFrame(
                                         rtCmd, noisyOutput, motionVectorImage, depthImage, gbufferViews, deltaTime);
 
@@ -700,11 +734,7 @@ public class VulkanPipeline {
                     e.printStackTrace();
                 }
                 prof.pop();
-            } else {
-                // DLSSD not available - disable jitter
-                JitterManager.setDLSSActive(false);
             }
-
             prof.pop();
 
             // Submit ray tracing command buffer after TLAS is built
@@ -732,6 +762,87 @@ public class VulkanPipeline {
         }
 
         tlas.close();
+    }
+
+    private boolean shouldProcessDlssFrame(MinecraftClient mc, boolean dlssEnabled, boolean debugModeEnabled,
+            List<?> outImgs) {
+        if (mc == null || outImgs == null || outImgs.isEmpty()) {
+            return false;
+        }
+        if (!dlssEnabled || debugModeEnabled) {
+            return false;
+        }
+        if (mc.world == null || mc.currentScreen != null || mc.isPaused()) {
+            return false;
+        }
+        return dlssdProcessor != null && dlssdProcessor.isSupported();
+    }
+
+    private void resetTemporalHistory() {
+        if (dlssdProcessor != null) {
+            dlssdProcessor.resetTemporalState();
+        }
+        UBODataEncoder.resetTemporalHistory();
+        reservoirImagesInitialized = false;
+        motionVectorsInitialized = false;
+        depthImageInitialized = false;
+        lastDlssFrameTimeNs = -1L;
+    }
+
+    private void updateTemporalPathState(boolean active) {
+        if (active != dlssTemporalPathActive) {
+            resetTemporalHistory();
+            dlssTemporalPathActive = active;
+        }
+        JitterManager.setDLSSActive(active);
+    }
+
+    private void forceDisableTemporalPath() {
+        resetTemporalHistory();
+        dlssTemporalPathActive = false;
+        JitterManager.setDLSSActive(false);
+    }
+
+    private void checkWorldChange() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        boolean shouldReset = false;
+
+        // 1. Check for World Change (Dimension/Server/Save)
+        if (mc.world != lastWorld) {
+            LOGGER.info("World changed from {} to {}, resetting temporal state", lastWorld, mc.world);
+            lastWorld = mc.world;
+            shouldReset = true;
+        }
+
+        // 2. Check for Pause/Unpause
+        boolean isPaused = mc.isPaused();
+        if (isPaused != wasPaused) {
+            LOGGER.info("Pause state changed ({} -> {}), resetting temporal state", wasPaused, isPaused);
+            wasPaused = isPaused;
+            shouldReset = true;
+        }
+
+            // 3. Check for Screen Change (e.g. inventory/menu transitions)
+        if (mc.currentScreen != lastScreen) {
+                LOGGER.info("Screen changed ({} -> {}), resetting temporal state", lastScreen, mc.currentScreen);
+                shouldReset = true;
+            lastScreen = mc.currentScreen;
+        }
+
+        if (shouldReset) {
+            forceDisableTemporalPath();
+        }
+    }
+
+    private float computeDLSSDeltaTimeSeconds() {
+        long now = System.nanoTime();
+        if (lastDlssFrameTimeNs <= 0L) {
+            lastDlssFrameTimeNs = now;
+            return 1.0f / 60.0f;
+        }
+        float deltaSeconds = (now - lastDlssFrameTimeNs) / 1_000_000_000.0f;
+        lastDlssFrameTimeNs = now;
+        return Math.max(1.0f / 240.0f, Math.min(0.1f, deltaSeconds));
     }
 
     public void destroy() {

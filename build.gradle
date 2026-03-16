@@ -81,7 +81,13 @@ tasks.withType(JavaCompile).configureEach {
 
 tasks.withType(JavaExec).configureEach {
     javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
-    jvmArgs "-Dorg.lwjgl.system.stackSize=8192", "-Xmx6G"
+    jvmArgs "-Dorg.lwjgl.system.stackSize=8192", "-Xmx6G",
+            "--add-opens=java.base/java.nio=ALL-UNNAMED",
+            "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED",
+            "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+            "--add-opens=java.base/java.lang=ALL-UNNAMED",
+            "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+            "--add-opens=java.base/java.util=ALL-UNNAMED"
 }
 
 java {
