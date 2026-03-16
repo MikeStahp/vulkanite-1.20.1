@@ -794,7 +794,7 @@ public class VulkanPipeline {
             resetTemporalHistory();
             dlssTemporalPathActive = active;
         }
-        JitterManager.setDLSSActive(active);
+        JitterManager.setDLSSActive(false);
     }
 
     private void forceDisableTemporalPath() {

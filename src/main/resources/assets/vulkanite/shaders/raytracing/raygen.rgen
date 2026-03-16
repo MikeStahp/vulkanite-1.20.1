@@ -103,7 +103,7 @@ vec2 getJitterDelta() {
 }
 
 vec2 computeMotionVector(vec2 currentUV, vec2 previousUV, vec2 launchSize) {
-    return ((currentUV - previousUV) * launchSize) - getJitterDelta();
+    return (previousUV - currentUV) * launchSize;
 }
 
 /// Calculates the primary ray direction from camera corners

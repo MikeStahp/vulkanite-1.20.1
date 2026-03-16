@@ -495,8 +495,8 @@ public class DLSSRayReconstruction {
 
         // Jitter: JitterManager returns Halton subpixel offset in [-0.5, 0.5] pixels.
         // DLSS expects pixel-space jitter (not NDC, not UV).
-        float subpixelJitterX = JitterManager.getJitterX();
-        float subpixelJitterY = JitterManager.getJitterY();
+        float subpixelJitterX = 0.0f;
+        float subpixelJitterY = 0.0f;
 
         int result = bridge.evaluateDLSS(
                 cmd.bufferAddress(),
@@ -598,8 +598,8 @@ public class DLSSRayReconstruction {
             transitionOutputForEvaluation(cmd);
 
             // Jitter: pixel-space Halton offset, [-0.5, 0.5] pixels.
-            float subpixelJitterX = JitterManager.getJitterX();
-            float subpixelJitterY = JitterManager.getJitterY();
+            float subpixelJitterX = 0.0f;
+            float subpixelJitterY = 0.0f;
 
             // Throttle per-frame logging to avoid flooding stdout
             boolean shouldLogFrame = (frameIndex % 300 == 1) || (reset && resetCountdown == RESET_WARMUP_FRAMES);
