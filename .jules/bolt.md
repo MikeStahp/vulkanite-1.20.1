@@ -1,0 +1,3 @@
+## 2024-05-18 - Avoid `.stream()` in hot rendering loops
+**Learning:** In hot rendering paths like `renderPostShadows`, `bindDSet`, and `waitForExecutions`, Java Streams (e.g., `.stream().mapToInt()`, `Arrays.stream()`, `.stream().map().toList()`) cause excessive object allocation per frame (Iterators, Spliterators, and lambdas). Over time, this creates severe garbage collection pressure and framerate stutter in rendering mods.
+**Action:** Always replace `.stream()` operations with standard explicit `for` loops in hot loops, and explicitly size new collections (e.g. `ArrayList(numItems)`) or arrays.
