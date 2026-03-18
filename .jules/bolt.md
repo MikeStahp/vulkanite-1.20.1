@@ -1,0 +1,3 @@
+## 2024-05-24 - Remove Java Streams in hot rendering paths
+**Learning:** Java Streams (e.g., `.stream().mapToInt()`, `.stream().map()`) introduce hidden garbage collection overhead by allocating iterators, lambda captures, and intermediary stream objects. In high-frequency render loops (like `VulkanPipeline.renderPostShadows`, `VCmdBuff.bindDSet`, or `CommandManager.Queue.waitForExecutions`), this small per-frame overhead accumulates into noticeable GC stutter and CPU latency.
+**Action:** Always replace Java Streams and functional paradigms (`.forEach`, `.map`, etc.) with simple `for` loops and basic arrays/lists in hot paths. This eliminates unnecessary per-frame boxing and allocations, making execution predictably fast.
