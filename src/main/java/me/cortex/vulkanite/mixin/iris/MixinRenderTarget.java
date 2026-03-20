@@ -20,15 +20,15 @@ import static org.lwjgl.vulkan.VK10.*;
 
 @Mixin(value = RenderTarget.class, remap = false)
 public abstract class MixinRenderTarget implements IRenderTargetVkGetter {
-    @Shadow @Final private PixelFormat format;
-    @Shadow @Final private InternalTextureFormat internalFormat;
+@Shadow @Final private PixelFormat format;
+@Shadow @Final private InternalTextureFormat internalFormat;
 
-    @Shadow protected abstract void setupTexture(int i, int i1, int i2, boolean b);
+@Shadow protected abstract void setupTexture(int i, int i1, int i2, boolean b);
 
-    @Unique private VRef<VGImage> vgMainTexture;
-    @Unique private VRef<VGImage> vgAltTexture;
+@Unique private VRef<VGImage> vgMainTexture;
+@Unique private VRef<VGImage> vgAltTexture;
 
-    @Redirect(method = "<init>", at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/platform/GlStateManager;_genTextures([I)V"))
+@Redirect(method = "<init>", at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/platform/GlStateManager;_genTextures([I)V"))
     private void redirectGen(int[] textures) {
 
     }

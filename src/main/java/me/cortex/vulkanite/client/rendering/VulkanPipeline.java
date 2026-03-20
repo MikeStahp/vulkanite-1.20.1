@@ -641,6 +641,18 @@ public class VulkanPipeline {
             boolean dlssFrameActive = shouldProcessDlssFrame(mc, dlssEnabled, debugModeEnabled, outImgs);
             updateTemporalPathState(dlssFrameActive);
 
+            // DIAGNOSTIC: Log why DLSSD frame processing is skipped (every 300 frames)
+            int diagFrame = net.irisshaders.iris.uniforms.SystemTimeUniforms.COUNTER.getAsInt();
+            if (!dlssFrameActive && diagFrame % 300 == 0) {
+                LOGGER.info("[DLSSD Diag] Frame skipped: dlssEnabled={}, debugMode={}, world={}, screen={}, paused={}, processor={}, supported={}",
+                    dlssEnabled, debugModeEnabled,
+                    mc != null && mc.world != null,
+                    mc != null && mc.currentScreen != null,
+                    mc != null && mc.isPaused(),
+                    dlssdProcessor != null,
+                    dlssdProcessor != null && dlssdProcessor.isSupported());
+            }
+
             if (dlssFrameActive) {
                 prof.push("vulkanite_dlssd_process");
                 try {
@@ -652,6 +664,16 @@ public class VulkanPipeline {
                     if (!dlssdProcessor.isInitialized()) {
                         LOGGER.info("Initializing DLSSD with dimensions: {}x{}", imgWidth, imgHeight);
                         dlssdProcessor.initialize(imgWidth, imgHeight);
+                    }
+
+                    // DIAGNOSTIC: Log DLSSD processing attempt (every 300 frames)
+                    if (diagFrame % 300 == 0) {
+                        LOGGER.info("[DLSSD Diag] Processing: initialized={}, motionVec={}, outImgs={}, gbufferViews={}, RR={}",
+                            dlssdProcessor.isInitialized(),
+                            motionVectorImage != null,
+                            outImgs.size(),
+                            gbufferViews != null ? gbufferViews.length : "null",
+                            dlssdProcessor.isRayReconstructionEnabled());
                     }
 
                     if (dlssdProcessor.isInitialized() && motionVectorImage != null) {
@@ -772,7 +794,10 @@ public class VulkanPipeline {
         if (!dlssEnabled || debugModeEnabled) {
             return false;
         }
-        if (mc.world == null || mc.currentScreen != null || mc.isPaused()) {
+        // Only require a world to exist. Do NOT block on currentScreen or isPaused:
+        // the renderer still runs while paused or with a screen open (chat, inventory,
+        // pause menu), and DLSS must keep processing to avoid raw noisy output.
+        if (mc.world == null) {
             return false;
         }
         return dlssdProcessor != null && dlssdProcessor.isSupported();
@@ -790,11 +815,12 @@ public class VulkanPipeline {
     }
 
     private void updateTemporalPathState(boolean active) {
-        if (active != dlssTemporalPathActive) {
-            resetTemporalHistory();
-            dlssTemporalPathActive = active;
-        }
-        JitterManager.setDLSSActive(false);
+    	if (active != dlssTemporalPathActive) {
+    		resetTemporalHistory();
+    		dlssTemporalPathActive = active;
+    	}
+    	// Enable jitter when DLSS is active, disable when inactive
+    	JitterManager.setDLSSActive(active && dlssdProcessor != null && dlssdProcessor.isInitialized());
     }
 
     private void forceDisableTemporalPath() {
@@ -927,17 +953,18 @@ public class VulkanPipeline {
         // eliminating the data race that causes shadow flickering.
         for (int i = 0; i < 2; i++) {
             reservoirImages[i] = ctx.memory.createImage2D(width, height, 1, VK_FORMAT_R32G32B32A32_SFLOAT,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        }
+VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+}
 
-        // Create motion vector image for DLSS Ray Reconstruction (binding 13)
-        // RG16F format for screen-space motion vectors (R = horizontal, G = vertical)
-        motionVectorImage = ctx.memory.createImage2D(width, height, 1, VK_FORMAT_R16G16_SFLOAT,
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+// Create motion vector image for DLSS Ray Reconstruction (binding 13)
+// RGBA16F format for screen-space motion vectors (R = horizontal, G = vertical, BA = 0)
+// DLSSD requires R16G16B16A16_SFLOAT for all color buffers
+motionVectorImage = ctx.memory.createImage2D(width, height, 1, VK_FORMAT_R16G16B16A16_SFLOAT,
+VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-        LOGGER.info("Created VulkaniteRT lightmap render targets: {}x{} + motion vectors (RG32F)", width, height);
+LOGGER.info("Created VulkaniteRT lightmap render targets: {}x{} + motion vectors (RGBA16F, DLSSD-compatible)", width, height);
     }
 
     /**
@@ -962,7 +989,7 @@ public class VulkanPipeline {
 
     /**
      * Returns the motion vector image for DLSS Ray Reconstruction.
-     * Format: RG32F (R = horizontal motion, G = vertical motion)
+     * Format: RG16F (R = horizontal motion, G = vertical motion)
      */
     public VRef<VImage> getMotionVectorImage() {
         return motionVectorImage;

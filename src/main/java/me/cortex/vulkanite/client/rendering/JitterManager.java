@@ -26,6 +26,10 @@ public class JitterManager {
     // Track if DLSS is actively processing frames
     // Jitter should only be applied when DLSS is running to stabilize the image
     private static boolean dlssActive = false;
+    
+    // Track if this is the first frame after DLSS becomes active
+    // Used to skip temporal operations on the first frame
+    private static boolean firstFrameAfterActivation = true;
 
     // Previous frame jitter for DLSS motion vector calculation
     private static float prevJitterX = 0;
@@ -56,6 +60,14 @@ public class JitterManager {
             return;
         }
 
+        // On first frame after activation, set prevJitter to current to avoid
+        // spurious motion from invalid previous state
+        if (firstFrameAfterActivation) {
+            prevJitterX = 0;
+            prevJitterY = 0;
+            firstFrameAfterActivation = false;
+        }
+
         frameIndex = (frameIndex + 1) % phaseCount;
 
         // Halton generates [0,1); shift to [-0.5, 0.5] pixel space.
@@ -63,12 +75,12 @@ public class JitterManager {
         jitterX = halton(frameIndex + 1, 2) - 0.5f;
         jitterY = halton(frameIndex + 1, 3) - 0.5f;
 
-        // DIAGNOSTIC: Log jitter values every 60 frames to validate
-        if (frameCounter % 60 == 0) {
-            System.out.println("[JitterManager DIAGNOSTIC] frameIndex=" + frameIndex +
-                    ", jitterX(pixels)=" + jitterX + ", jitterY(pixels)=" + jitterY +
-                    ", renderWidth=" + renderWidth + ", renderHeight=" + renderHeight +
-                    ", dlssActive=" + dlssActive + ", isEnabled=" + isEnabled);
+        // DIAGNOSTIC: Log jitter values every 300 frames to reduce spam
+        if (frameCounter % 300 == 0) {
+            System.out.println("[JitterManager] frameIndex=" + frameIndex +
+                ", jitter=(" + jitterX + ", " + jitterY + ")" +
+                ", renderRes=" + currentRenderWidth + "x" + currentRenderHeight +
+                ", dlssActive=" + dlssActive);
         }
     }
 
@@ -145,6 +157,10 @@ public class JitterManager {
      * Set whether DLSS is actively processing frames.
      * Jitter is only applied when DLSS is active to prevent image shaking.
      * 
+     * Note: This method does NOT reset the jitter state. The jitter sequence
+     * continues uninterrupted to maintain temporal consistency. Only the
+     * dlssActive flag is toggled to control whether jitter is actually applied.
+     *
      * @param active true if DLSS is processing frames, false otherwise
      */
     public static void setDLSSActive(boolean active) {
@@ -152,7 +168,12 @@ public class JitterManager {
             return;
         }
         dlssActive = active;
-        reset();
+        // Mark first frame after activation to handle temporal state properly
+        if (active) {
+            firstFrameAfterActivation = true;
+        }
+        // Do NOT reset jitter state here - let the sequence continue
+        // to maintain temporal consistency for DLSS motion vectors
     }
 
     /**
@@ -160,6 +181,14 @@ public class JitterManager {
      */
     public static boolean isDLSSActive() {
         return dlssActive;
+    }
+
+    /**
+     * Check if this is the first frame after DLSS activation.
+     * Used to skip temporal operations that would have invalid history.
+     */
+    public static boolean isFirstFrameAfterActivation() {
+        return firstFrameAfterActivation;
     }
 
     /**

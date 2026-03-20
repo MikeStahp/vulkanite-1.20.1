@@ -32,7 +32,7 @@ import static org.lwjgl.vulkan.VK10.*;
 public class MotionVectorsGenerator {
     private final VContext context;
     
-    // Motion vector render target (RG32F format for high precision)
+    // Motion vector render target (RG16F format, DLSS-recommended)
     private VRef<VImage> motionVectorImage;
     private VRef<VImageView> motionVectorView;
     
@@ -153,34 +153,36 @@ public class MotionVectorsGenerator {
     
     /**
      * Create the motion vector render target
-     * Format: RG32F (32-bit float per component for high precision)
+     * Format: RG16F (16-bit float per component, DLSS-recommended format)
      */
     private void createMotionVectorRenderTarget() {
         MinecraftClient mc = MinecraftClient.getInstance();
         viewportWidth = mc.getWindow().getFramebufferWidth();
-        viewportHeight = mc.getWindow().getFramebufferHeight();
-        
-        if (viewportWidth <= 0 || viewportHeight <= 0) {
-            viewportWidth = 1920;
-            viewportHeight = 1080;
-        }
-        
-        // Create motion vector image with RG32F format
-        // RG format: R = horizontal motion, G = vertical motion
-        motionVectorImage = context.memory.createImage2D(
-            viewportWidth,
-            viewportHeight,
-            1,
-            VK_FORMAT_R32G32_SFLOAT,  // RG32F format for motion vectors
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-        );
-        
-        // Create image view for shader access
-        motionVectorView = VImageView.create(context, motionVectorImage);
-        
-        System.out.println("[Vulkanite] Created motion vector render target: " + 
-                          viewportWidth + "x" + viewportHeight + " (RG32F)");
+viewportHeight = mc.getWindow().getFramebufferHeight();
+
+if (viewportWidth <= 0 || viewportHeight <= 0) {
+viewportWidth = 1920;
+viewportHeight = 1080;
+}
+
+// Create motion vector image with RGBA16F format (DLSSD-required)
+// DLSSD requires R16G16B16A16_SFLOAT for all color buffers
+// RG format: R = horizontal motion, G = vertical motion, BA = 0
+// This matches DLSSD requirements for Ray Reconstruction
+motionVectorImage = context.memory.createImage2D(
+viewportWidth,
+viewportHeight,
+1,
+VK_FORMAT_R16G16B16A16_SFLOAT, // RGBA16F format (DLSSD-required for all color buffers)
+VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+);
+
+// Create image view for shader access
+motionVectorView = VImageView.create(context, motionVectorImage);
+
+System.out.println("[Vulkanite] Created motion vector render target: " +
+viewportWidth + "x" + viewportHeight + " (RGBA16F, DLSSD-compatible)");
     }
     
     /**

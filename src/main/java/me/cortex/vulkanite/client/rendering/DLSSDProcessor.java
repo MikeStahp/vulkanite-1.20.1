@@ -13,10 +13,10 @@ import me.cortex.vulkanite.client.config.DLSSConfig;
 
 /**
  * Integrates DLSSD (Ray Reconstruction) into the Vulkanite render pipeline.
- * 
+ *
  * This class manages the DLSSD processing step that occurs after ray tracing,
  * denoising the noisy ray-traced output using AI-powered reconstruction.
- * 
+ *
  * Usage flow:
  * 1. Initialize with VContext and output dimensions
  * 2. Call processFrame() after ray tracing to denoise the output
@@ -25,9 +25,13 @@ import me.cortex.vulkanite.client.config.DLSSConfig;
 public class DLSSDProcessor {
     private final VContext context;
     private final DLSSRayReconstruction dlssd;
+    private final DLSSBufferConverter bufferConverter;
     private boolean initialized = false;
     private int lastWidth = 0;
     private int lastHeight = 0;
+
+    // Frame counter for throttled logging
+    private int frameCount = 0;
 
     // Configuration
     private DLSSRayReconstruction.DLSSConfig config;
@@ -36,6 +40,7 @@ public class DLSSDProcessor {
     public DLSSDProcessor(VContext context) {
         this.context = context;
         this.dlssd = new DLSSRayReconstruction(context);
+        this.bufferConverter = new DLSSBufferConverter(context);
         this.config = new DLSSRayReconstruction.DLSSConfig();
 
         // Load settings from user configuration
@@ -57,9 +62,10 @@ public class DLSSDProcessor {
             // Map quality preset
             this.config.preset = userConfig.getQualityPreset();
 
-            // For now, we force roughnessPacked to true as it depends on the shader pack
-            // Ideally this should be configurable or detected from the shader pack
-            this.config.roughnessPacked = true;
+            // Dynamically determine if roughness is packed based on the shader pack
+            // For now, we assume it's packed if the shader pack provides it in normals.w
+            // This could be improved by querying the shader pack configuration directly
+            this.config.roughnessPacked = userConfig.isRoughnessPacked();
 
             // Force re-initialization if settings changed
             this.initialized = false;
@@ -161,7 +167,7 @@ public class DLSSDProcessor {
 
         // Extract G-buffer inputs for DLSSD
         GBufferDLSSDAdapter.DLSSDGBufferInputs gbufferInputs = GBufferDLSSDAdapter.extractDLSSDInputs(gbufferViews,
-                config.roughnessPacked);
+            config.roughnessPacked);
 
         // Validate inputs
         if (!GBufferDLSSDAdapter.validateInputs(gbufferInputs)) {
@@ -170,33 +176,90 @@ public class DLSSDProcessor {
             return dlssd.processFrame(cmd, noisyOutput, motionVectors, depth, deltaTime);
         }
 
-        // Get image references from views for DLSSD processing
-        // Note: We need to extract the underlying images from the views
-        VRef<VImage> diffuseAlbedo = extractImageFromView(gbufferInputs.diffuseAlbedoView);
-        VRef<VImage> specularAlbedo = extractImageFromView(gbufferInputs.specularAlbedoView);
-        VRef<VImage> normals = extractImageFromView(gbufferInputs.normalsView);
-        VRef<VImage> roughness = config.roughnessPacked ? null : extractImageFromView(gbufferInputs.roughnessView);
+    // Get image references from views for DLSSD processing
+    // Note: We need to extract the underlying images from the views
+    VRef<VImage> diffuseAlbedoRaw = extractImageFromView(gbufferInputs.diffuseAlbedoView);
+    VRef<VImage> specularAlbedoRaw = extractImageFromView(gbufferInputs.specularAlbedoView);
+    VRef<VImage> normalsRaw = extractImageFromView(gbufferInputs.normalsView);
+    VRef<VImage> roughnessRaw = config.roughnessPacked ? null : extractImageFromView(gbufferInputs.roughnessView);
 
-        // Process through DLSSD
-        VRef<VImage> denoisedRef = dlssd.processFrameDLSSD(
-                cmd,
-                noisyOutput,
-                motionVectors,
-                depth,
-                diffuseAlbedo,
-                specularAlbedo,
-                normals,
-                roughness,
-                deltaTime);
+    // =====================================================================
+    // FORMAT CONVERSION: Convert G-buffer images to DLSSD-compatible formats
+    // DLSSD requires R16G16B16A16_SFLOAT for all color buffers
+    // =====================================================================
+    VRef<VImage> diffuseAlbedo = bufferConverter.convertToRGBA16F(cmd, diffuseAlbedoRaw, "diffuseAlbedo");
+    VRef<VImage> specularAlbedo = bufferConverter.convertToRGBA16F(cmd, specularAlbedoRaw, "specularAlbedo");
+    VRef<VImage> normals = bufferConverter.convertToRGBA16F(cmd, normalsRaw, "normals");
+    VRef<VImage> roughness = config.roughnessPacked ? null : bufferConverter.convertToRGBA16F(cmd, roughnessRaw, "roughness");
+    
+    // Also convert noisy output if needed
+    VRef<VImage> noisyOutputConverted = bufferConverter.convertToRGBA16F(cmd, noisyOutput, "noisyOutput");
 
-        // If DLSSD failed (e.g. native DLL error but isSupported returned true
-        // previously),
-        // we must fallback to the noisy output to avoid rendering black screens.
-        if (denoisedRef == null || denoisedRef.get() == null) {
-            System.err.println("[DLSSDProcessor] DLSSD evaluate failed, falling back to noisy output.");
-            return noisyOutput;
+    // =====================================================================
+    // DLSS BUFFER VALIDATION: Detect and validate buffer formats/usage
+    // =====================================================================
+        int renderWidth = dlssd.getRenderWidth();
+        int renderHeight = dlssd.getRenderHeight();
+        VRef<VImage> outputImage = dlssd.getOutputImage();
+        
+    // Validate all buffers for DLSSD (using converted images)
+    DLSSBufferValidator.ValidationResult[] bufferResults = DLSSBufferValidator.validateAllBuffers(
+        noisyOutputConverted,
+        depth,
+        motionVectors,
+        diffuseAlbedo,
+        specularAlbedo,
+        normals,
+        roughness,
+        outputImage,
+        renderWidth,
+        renderHeight
+    );
+        
+        // Log validation results (throttled to every 300 frames)
+        if (frameCount % 300 == 0) {
+            DLSSBufferValidator.logValidationResults(bufferResults);
         }
+        
+        // Check if all required buffers are valid
+        if (!DLSSBufferValidator.allBuffersValid(bufferResults)) {
+            System.err.println("[DLSSDProcessor] Buffer validation failed! Check format/usage flags.");
+            System.err.println("[DLSSDProcessor] Required formats:");
+            System.err.println("  - Color buffers: R16G16B16A16_SFLOAT");
+            System.err.println("  - Depth buffer: R32_SFLOAT");
+            System.err.println("  - Required usage: STORAGE, SAMPLED, TRANSFER_SRC, TRANSFER_DST");
+            // Fall back to standard DLSS if buffer validation fails
+            return dlssd.processFrame(cmd, noisyOutput, motionVectors, depth, deltaTime);
+        }
+        // =====================================================================
 
+        // DIAGNOSTIC: Log before calling processFrameDLSSD
+        boolean useRR = dlssd.isRayReconstructionEnabled();
+        System.out.println("[DLSSDProcessor] Calling processFrameDLSSD: useRR=" + useRR +
+            ", diffAlb=" + (diffuseAlbedo != null) + ", specAlb=" + (specularAlbedo != null) +
+            ", normals=" + (normals != null) + ", roughness=" + (roughness != null));
+
+    // Process through DLSSD (using converted images)
+    VRef<VImage> denoisedRef = dlssd.processFrameDLSSD(
+        cmd,
+        noisyOutputConverted,
+        motionVectors,
+        depth,
+        diffuseAlbedo,
+        specularAlbedo,
+        normals,
+        roughness,
+        deltaTime);
+
+    // If DLSSD failed (e.g. native DLL error but isSupported returned true
+    // previously),
+    // we must fallback to the noisy output to avoid rendering black screens.
+    if (denoisedRef == null || denoisedRef.get() == null) {
+        System.err.println("[DLSSDProcessor] DLSSD evaluate failed, falling back to noisy output.");
+        return noisyOutput;
+    }
+
+        frameCount++;
         return denoisedRef;
     }
 

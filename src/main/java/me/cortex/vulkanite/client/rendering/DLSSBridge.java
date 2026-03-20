@@ -139,57 +139,57 @@ public interface DLSSBridge extends Library {
          */
         void destroyDLSSD(long vkDevice);
 
-        /**
-         * Evaluates DLSSD (Ray Reconstruction) for a single frame.
-         * 
-         * This function takes the noisy ray-traced output along with G-buffer data
-         * and produces a denoised, high-quality image using AI.
-         * 
-         * @param vkCommandBuffer         Vulkan command buffer pointer
-         * @param colorImageView          Noisy ray-traced color input image view
-         * @param colorImage              Noisy ray-traced color input image
-         * @param depthImageView          Depth buffer image view
-         * @param depthImage              Depth buffer image
-         * @param mvImageView             Motion vectors image view
-         * @param mvImage                 Motion vectors image
-         * @param diffuseAlbedoImageView  Diffuse albedo (RGB surface color) image view
-         * @param diffuseAlbedoImage      Diffuse albedo image
-         * @param specularAlbedoImageView Specular albedo (F0 reflectance) image view
-         * @param specularAlbedoImage     Specular albedo image
-         * @param normalsImageView        World-space normals image view (roughness in
-         *                                .w if packed)
-         * @param normalsImage            Normals image
-         * @param roughnessImageView      Roughness image view (only if unpacked mode)
-         * @param roughnessImage          Roughness image
-         * @param outputImageView         Denoised output image view
-         * @param outputImage             Denoised output image
-         * @param jitterX                 Jitter offset X in sub-pixel space (-0.5 to
-         *                                0.5)
-         * @param jitterY                 Jitter offset Y in sub-pixel space (-0.5 to
-         *                                0.5)
-         * @param reset                   Set to 1 when scene changes completely (new
-         *                                level, teleport, etc.)
-         * @param frameTimeDeltaMs        Frame time in milliseconds for temporal
-         *                                stability
-         * @return 1 on success, 0 on failure
-         */
-        int evaluateDLSSD(
-                        long vkCommandBuffer,
-                        // Standard inputs
-                        long colorImageView, long colorImage, int colorFormat,
-                        long depthImageView, long depthImage, int depthFormat,
-                        long mvImageView, long mvImage, int mvFormat,
-                        // G-buffer inputs for Ray Reconstruction
-                        long diffuseAlbedoImageView, long diffuseAlbedoImage, int diffuseAlbedoFormat,
-                        long specularAlbedoImageView, long specularAlbedoImage, int specularAlbedoFormat,
-                        long normalsImageView, long normalsImage, int normalsFormat,
-                        long roughnessImageView, long roughnessImage, int roughnessFormat,
-                        // Output
-                        long outputImageView, long outputImage, int outputFormat,
-                        // Parameters
-                        float jitterX, float jitterY,
-                        int reset,
-                        float frameTimeDeltaMs);
+    /**
+     * Evaluates DLSSD (Ray Reconstruction) for a single frame.
+     *
+     * This function takes the noisy ray-traced output along with G-buffer data
+     * and produces a denoised, high-quality image using AI.
+     *
+     * @param vkCommandBuffer Vulkan command buffer pointer
+     * @param colorImageView Noisy ray-traced color input image view
+     * @param colorImage Noisy ray-traced color input image
+     * @param depthImageView Depth buffer image view
+     * @param depthImage Depth buffer image
+     * @param mvImageView Motion vectors image view
+     * @param mvImage Motion vectors image
+     * @param diffuseAlbedoImageView Diffuse albedo (RGB surface color) image view
+     * @param diffuseAlbedoImage Diffuse albedo image
+     * @param specularAlbedoImageView Specular albedo (F0 reflectance) image view
+     * @param specularAlbedoImage Specular albedo image
+     * @param normalsImageView World-space normals image view (roughness in
+     * .w if packed)
+     * @param normalsImage Normals image
+     * @param roughnessImageView Roughness image view (only if unpacked mode)
+     * @param roughnessImage Roughness image
+     * @param outputImageView Denoised output image view
+     * @param outputImage Denoised output image
+     * @param jitterX Jitter offset X in sub-pixel space (-0.5 to
+     * 0.5)
+     * @param jitterY Jitter offset Y in sub-pixel space (-0.5 to
+     * 0.5)
+     * @param reset Set to 1 when scene changes completely (new
+     * level, teleport, etc.)
+     * @param frameTimeDeltaMs Frame time in milliseconds for temporal
+     * stability
+     * @return 1 on success, 0 on failure
+     */
+    int evaluateDLSSD(
+        long vkCommandBuffer,
+        // Standard inputs
+        long colorImageView, long colorImage, int colorFormat,
+        long depthImageView, long depthImage, int depthFormat,
+        long mvImageView, long mvImage, int mvFormat,
+        // G-buffer inputs for Ray Reconstruction
+        long diffuseAlbedoImageView, long diffuseAlbedoImage, int diffuseAlbedoFormat,
+        long specularAlbedoImageView, long specularAlbedoImage, int specularAlbedoFormat,
+        long normalsImageView, long normalsImage, int normalsFormat,
+        long roughnessImageView, long roughnessImage, int roughnessFormat,
+        // Output
+        long outputImageView, long outputImage, int outputFormat,
+        // Parameters
+        float jitterX, float jitterY,
+        int reset,
+        float frameTimeDeltaMs);
 
         /**
          * Check if DLSSD (Ray Reconstruction) is available on this system.

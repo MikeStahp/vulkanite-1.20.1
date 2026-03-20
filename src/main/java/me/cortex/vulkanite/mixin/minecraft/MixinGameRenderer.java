@@ -16,18 +16,17 @@ public class MixinGameRenderer {
     /**
      * Update the Halton jitter sequence every frame so JitterManager stays in sync.
      * The jitter values are passed directly to DLSS as explicit parameters.
+     * Note: Jitter activation state is controlled by VulkanPipeline.updateTemporalPathState()
+     * to avoid race conditions with DLSS processing state.
      */
     @Inject(method = "render", at = @At("HEAD"))
     private void onRenderUpdateJitter(float tickDelta, long startTime, boolean tick, CallbackInfo ci) {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client.getWindow() != null) {
-            boolean temporalGameplay = client.world != null && client.currentScreen == null && !client.isPaused();
-            if (!temporalGameplay && JitterManager.isDLSSActive()) {
-                JitterManager.setDLSSActive(false);
-            }
-            JitterManager.updateJitter(client.getWindow().getFramebufferWidth(),
-                    client.getWindow().getFramebufferHeight());
-        }
+    	MinecraftClient client = MinecraftClient.getInstance();
+    	if (client.getWindow() != null) {
+    		// Only update jitter values; activation state is managed by VulkanPipeline
+    		JitterManager.updateJitter(client.getWindow().getFramebufferWidth(),
+    			client.getWindow().getFramebufferHeight());
+    	}
     }
 
     /**

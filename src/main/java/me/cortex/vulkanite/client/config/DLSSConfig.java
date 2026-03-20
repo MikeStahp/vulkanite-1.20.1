@@ -51,6 +51,7 @@ public class DLSSConfig {
     private String qualityPreset;
     private boolean rayReconstructionEnabled;
     private float sharpening;
+    private boolean roughnessPacked;
 
     // FSR settings
     private String fsrQualityPreset;
@@ -82,6 +83,7 @@ public class DLSSConfig {
         this.qualityPreset = "QUALITY";
         this.rayReconstructionEnabled = true;
         this.sharpening = 0.5f;
+        this.roughnessPacked = true;
 
         // FSR defaults
         this.fsrQualityPreset = "QUALITY";
@@ -182,6 +184,9 @@ public class DLSSConfig {
                 if (jsonObject.has("sharpening")) {
                     config.sharpening = jsonObject.get("sharpening").getAsFloat();
                 }
+                if (jsonObject.has("roughnessPacked")) {
+                    config.roughnessPacked = jsonObject.get("roughnessPacked").getAsBoolean();
+                }
 
                 // Parse FSR settings
                 if (jsonObject.has("fsrQualityPreset")) {
@@ -270,6 +275,7 @@ public class DLSSConfig {
             jsonObject.addProperty("qualityPreset", qualityPreset);
             jsonObject.addProperty("rayReconstructionEnabled", rayReconstructionEnabled);
             jsonObject.addProperty("sharpening", sharpening);
+            jsonObject.addProperty("roughnessPacked", roughnessPacked);
 
             // FSR settings
             jsonObject.addProperty("fsrQualityPreset", fsrQualityPreset);
@@ -380,6 +386,14 @@ public class DLSSConfig {
 
     public void setSharpening(float sharpening) {
         this.sharpening = Math.max(0.0f, Math.min(1.0f, sharpening));
+    }
+
+    public boolean isRoughnessPacked() {
+        return roughnessPacked;
+    }
+
+    public void setRoughnessPacked(boolean roughnessPacked) {
+        this.roughnessPacked = roughnessPacked;
     }
 
     public FSRQualityPreset getFsrQualityPreset() {
