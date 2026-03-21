@@ -237,17 +237,38 @@ public class DLSSRayReconstruction {
         // Calculate render resolution
         // FIX: Ensure dimensions are EVEN (multiple of 2). Odd dimensions (like 1009)
         // often cause InvalidParameter (bad00005) in NGX feature creation.
-        // We also force 1:1 resolution (Native DLAA mode) for hybrid rendering compatibility.
+        //
+        // DIAGNOSTIC: Log the quality preset scale factor to verify if it should be applied
+        // For Quality mode (0.667 scale), render resolution should be ~66.67% of output.
+        // Example: 848x480 output -> ~565x320 render (Quality mode)
+        // Currently: Forces 1:1 resolution (Native DLAA mode) for hybrid rendering compatibility.
+        //
+        // TODO: To enable lower-resolution G-buffer rendering:
+        // 1. Apply qualityPreset.getScale() to calculate renderWidth/renderHeight
+        // 2. Ensure Iris G-buffers are created at this lower resolution
+        // 3. Pass correct render dimensions to DLSSD
+        float scaleX = qualityPreset.getScale();
+        float scale = scaleX; // Scale factor from quality preset (e.g., 0.667 for Quality)
+        
+        // DIAGNOSTIC: Log what resolution we WOULD be rendering at if scale was applied
+        int scaledWidth = (int)(outputWidth * scale) & ~7;
+        int scaledHeight = (int)(outputHeight * scale) & ~7;
+        System.out.println("[DIAG-DLSS] Quality preset: " + qualityPreset + " (scale=" + scale + ")");
+        System.out.println("[DIAG-DLSS] Output resolution: " + outputWidth + "x" + outputHeight);
+        System.out.println("[DIAG-DLSS] Scaled render resolution WOULD BE: " + scaledWidth + "x" + scaledHeight);
+        System.out.println("[DIAG-DLSS] ACTUAL render resolution (forced 1:1): " + (outputWidth & ~7) + "x" + (outputHeight & ~7));
+        
+        // Currently forcing 1:1 resolution (Native DLAA mode) for hybrid rendering compatibility
         this.renderWidth = outputWidth & ~7;
         this.renderHeight = outputHeight & ~7;
         this.outputWidth = this.renderWidth;
         this.outputHeight = this.renderHeight;
-
+       
         String mode = useRayReconstruction ? "DLSSD (Ray Reconstruction)" : "DLSS (Standard)";
         System.out.println("[Vulkanite] " + mode + " initialized: " +
-                renderWidth + "x" + renderHeight + " -> " +
-                outputWidth + "x" + outputHeight +
-                " (preset: " + qualityPreset + ")");
+        	renderWidth + "x" + renderHeight + " -> " +
+        	outputWidth + "x" + outputHeight +
+        	" (preset: " + qualityPreset + ", scale applied: NO - using 1:1 native mode)");
 
         // Create input/output buffers
         createBuffers();
@@ -500,11 +521,13 @@ public class DLSSRayReconstruction {
             cmd.encodeMemoryBarrier();
             transitionOutputForEvaluation(cmd);
 
-            // Jitter: JitterManager returns Halton subpixel offset in [-0.5, 0.5] pixels.
-            // DLSS expects pixel-space jitter (not NDC, not UV).
-            float subpixelJitterX = JitterManager.getJitterX();
-            float subpixelJitterY = JitterManager.getJitterY();
-          
+ // NVIDIA DLSS REQUIREMENT: Pass jitter offsets to DLSS for internal compensation.
+ // Motion vectors do NOT include jitter - they represent pure geometric motion.
+ // DLSS uses InJitterOffsetX/Y to handle jitter compensation internally.
+ // The jitter values are in pixel space [-0.5, 0.5] as required by DLSS.
+ float subpixelJitterX = JitterManager.getJitterX();
+ float subpixelJitterY = JitterManager.getJitterY();
+           
             int result = bridge.evaluateDLSS(
                     cmd.bufferAddress(),
                     extNoisyInputView.get().view, noisyInput.get().image(), noisyInput.get().format,
@@ -611,9 +634,12 @@ public class DLSSRayReconstruction {
             // Output: first frame must transition from UNDEFINED, subsequent frames stay GENERAL.
             transitionOutputForEvaluation(cmd);
 
-        // Jitter: pixel-space Halton offset, [-0.5, 0.5] pixels.
-        float subpixelJitterX = JitterManager.getJitterX();
-        float subpixelJitterY = JitterManager.getJitterY();
+ // NVIDIA DLSSD REQUIREMENT: Pass jitter offsets to DLSSD for internal compensation.
+ // Motion vectors do NOT include jitter - they represent pure geometric motion.
+ // DLSSD uses InJitterOffsetX/Y to handle jitter compensation internally.
+ // The jitter values are in pixel space [-0.5, 0.5] as required by DLSSD.
+ float subpixelJitterX = JitterManager.getJitterX();
+ float subpixelJitterY = JitterManager.getJitterY();
 
         // Throttle per-frame logging to avoid flooding stdout
         boolean shouldLogFrame = (frameIndex % 300 == 1) || (reset && resetCountdown == RESET_WARMUP_FRAMES);
@@ -675,15 +701,26 @@ public class DLSSRayReconstruction {
     }
 
     /**
-     * Reset DLSS temporal state
-     * Call this when the camera teleports or scene changes dramatically
+     * Reset DLSS temporal state.
+     *
+     * NVIDIA DLSS REQUIREMENT: Reset flag must be set to 1 on camera cuts/scene changes.
+     * This ensures DLSS discards invalid history and prevents ghosting artifacts.
+     *
+     * Call this when:
+     * - Camera teleports
+     * - Scene changes dramatically
+     * - Dimension change (e.g., Nether portal)
+     * - Any situation where temporal history is invalid
      */
     public void resetTemporalState() {
-        this.reset = true;
-        this.resetCountdown = RESET_WARMUP_FRAMES;
-        this.frameIndex = 0;
-        this.internalInputsInitialized = false;
-        this.outputLayoutInitialized = false;
+    	this.reset = true;
+    	this.resetCountdown = RESET_WARMUP_FRAMES;
+    	this.frameIndex = 0;
+    	this.internalInputsInitialized = false;
+    	this.outputLayoutInitialized = false;
+    	// Also reset jitter state to ensure clean temporal history
+    	JitterManager.reset();
+    	System.out.println("[DLSSRayReconstruction] Temporal state reset - history invalidated");
     }
 
     /**

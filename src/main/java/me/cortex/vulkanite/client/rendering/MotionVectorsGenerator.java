@@ -15,19 +15,25 @@ import static org.lwjgl.vulkan.VK10.*;
 
 /**
  * Motion Vectors Generator for DLSS Ray Reconstruction
- * 
+ *
  * This class generates screen-space motion vectors required by DLSS RR for temporal reprojection.
  * Motion vectors represent the pixel movement from the previous frame to the current frame.
- * 
+ *
+ * NVIDIA DLSS REQUIREMENTS:
+ * - Motion vectors MUST be in pixel units (not NDC)
+ * - Motion vectors MUST represent pure geometric motion WITHOUT jitter
+ * - Jitter is passed separately to DLSS via InJitterOffsetX/Y parameters
+ * - DLSS handles jitter compensation internally
+ *
  * Motion Vector Calculation:
- * - For camera movement: Uses view/projection matrices to compute screen-space motion
+ * - For camera movement: Uses UNJITTERED view/projection matrices
  * - For entity movement: Transforms entity positions between frames
  * - For block animations: Tracks animated texture coordinates
- * 
- * Format: vec2 (2D screen-space vectors)
- * - X component: Horizontal pixel movement (normalized to [-1, 1])
- * - Y component: Vertical pixel movement (normalized to [-1, 1])
- * - Formula: (currentPosition - previousPosition) / viewportSize
+ *
+ * Format: vec2 (2D screen-space vectors in pixel units)
+ * - X component: Horizontal pixel movement
+ * - Y component: Vertical pixel movement
+ * - Formula: (currentClipPos/currentW - previousClipPos/previousW) * renderResolution
  */
 public class MotionVectorsGenerator {
     private final VContext context;
@@ -57,71 +63,76 @@ public class MotionVectorsGenerator {
     // UBO for motion vector computation
     private MotionVectorUBO motionVectorUBO;
     
-    // Jitter compensation
-    // DLSS requires motion vectors WITHOUT jitter offset
-    // The jitter delta must be subtracted from motion vectors
+    // NVIDIA DLSS REQUIREMENT: Motion vectors must NOT include jitter.
+    // Jitter is passed separately to DLSS via InJitterOffsetX/Y parameters.
+    // DLSS handles jitter compensation internally - we do NOT subtract it from motion vectors.
+    // These fields are kept for diagnostic purposes only.
     private float jitterDeltaX = 0;
     private float jitterDeltaY = 0;
-    
+   
     /**
      * Uniform Buffer Object for motion vector data
      * Passed to shaders for motion vector computation
-     * 
+     *
+     * NVIDIA DLSS REQUIREMENTS:
+     * - Motion vectors must be in pixel units
+     * - Motion vectors must represent pure geometric motion (NO jitter)
+     * - Jitter is passed separately to DLSS, NOT subtracted from motion vectors
+     *
      * Layout:
-     * - 0: currentViewProjection (64 bytes, 16 floats)
-     * - 64: previousViewProjection (64 bytes, 16 floats)
+     * - 0: currentViewProjection (64 bytes, 16 floats) - UNJITTERED
+     * - 64: previousViewProjection (64 bytes, 16 floats) - UNJITTERED
      * - 128: inverseCurrentVP (64 bytes, 16 floats)
      * - 192: inversePreviousVP (64 bytes, 16 floats)
      * - 256: viewportWidth (4 bytes)
      * - 260: viewportHeight (4 bytes)
      * - 264: frameId (4 bytes)
      * - 268: padding (4 bytes)
-     * - 272: jitterDeltaX (4 bytes)
-     * - 276: jitterDeltaY (4 bytes)
+     * - 272: reserved (4 bytes)
+     * - 276: reserved (4 bytes)
      * - 280: padding (16 bytes for alignment)
      */
     private static class MotionVectorUBO {
-        private ByteBuffer buffer;
-        private long address;
-        
-        public MotionVectorUBO() {
-            // Allocate 296 bytes for motion vector uniforms + jitter delta
-            buffer = MemoryUtil.memAlloc(296);
-            address = MemoryUtil.memAddress(buffer);
-        }
-        
-        public void update(Matrix4f currentVP, Matrix4f previousVP, 
-                          Matrix4f inverseCurrentVP, Matrix4f inversePreviousVP,
-                          int width, int height, int frameId,
-                          float jitterDeltaX, float jitterDeltaY) {
-            buffer.clear();
-            
-            // Current view-projection matrix (64 bytes)
-            currentVP.get(buffer);
-            
-            // Previous view-projection matrix (64 bytes)
-            previousVP.get(buffer);
-            
-            // Inverse current view-projection matrix (64 bytes)
-            inverseCurrentVP.get(buffer);
-            
-            // Inverse previous view-projection matrix (64 bytes)
-            inversePreviousVP.get(buffer);
-            
-            // Viewport dimensions and frame info (16 bytes)
-            buffer.putInt(width);
-            buffer.putInt(height);
-            buffer.putInt(frameId);
-            buffer.putInt(0); // padding
-            
-            // Jitter delta for DLSS compensation (8 bytes)
-            buffer.putFloat(jitterDeltaX);
-            buffer.putFloat(jitterDeltaY);
-            buffer.putInt(0); // padding
-            buffer.putInt(0); // padding
-            
-            buffer.flip();
-        }
+    	private ByteBuffer buffer;
+    	private long address;
+   
+    	public MotionVectorUBO() {
+    		// Allocate 296 bytes for motion vector uniforms
+    		buffer = MemoryUtil.memAlloc(296);
+    		address = MemoryUtil.memAddress(buffer);
+    	}
+   
+    	public void update(Matrix4f currentVP, Matrix4f previousVP,
+    			Matrix4f inverseCurrentVP, Matrix4f inversePreviousVP,
+    			int width, int height, int frameId) {
+    		buffer.clear();
+   
+    		// Current view-projection matrix (64 bytes) - MUST be UNJITTERED
+    		currentVP.get(buffer);
+   
+    		// Previous view-projection matrix (64 bytes) - MUST be UNJITTERED
+    		previousVP.get(buffer);
+   
+    		// Inverse current view-projection matrix (64 bytes)
+    		inverseCurrentVP.get(buffer);
+   
+    		// Inverse previous view-projection matrix (64 bytes)
+    		inversePreviousVP.get(buffer);
+   
+    		// Viewport dimensions and frame info (16 bytes)
+    		buffer.putInt(width);
+    		buffer.putInt(height);
+    		buffer.putInt(frameId);
+    		buffer.putInt(0); // padding
+   
+    		// Reserved for future use (8 bytes)
+    		buffer.putFloat(0); // reserved
+    		buffer.putFloat(0); // reserved
+    		buffer.putInt(0); // padding
+    		buffer.putInt(0); // padding
+   
+    		buffer.flip();
+    	}
         
         public ByteBuffer getBuffer() {
             return buffer;
@@ -187,64 +198,79 @@ viewportWidth + "x" + viewportHeight + " (RGBA16F, DLSSD-compatible)");
     
     /**
      * Update motion vectors for the current frame
-     * 
-     * CRITICAL: This method calculates motion vectors WITHOUT jitter offset.
-     * The jitter delta is subtracted from motion vectors so DLSS can properly
-     * correlate frames temporally.
-     * 
+     *
+     * NVIDIA DLSS REQUIREMENT: Motion vectors must represent pure geometric motion
+     * WITHOUT jitter. Jitter is passed separately to DLSS via InJitterOffsetX/Y.
+     *
+     * This method computes motion vectors using UNJITTERED projection matrices.
+     * The input projection matrix may be jittered, so we remove the jitter before
+     * calculating motion vectors.
+     *
      * @param currentView Current frame view matrix
-     * @param currentProjection Current frame projection matrix
+     * @param currentProjection Current frame projection matrix (may be jittered)
      * @param tickDelta Interpolation factor for smooth motion
      */
     public void updateMotionVectors(Matrix4f currentView, Matrix4f currentProjection, float tickDelta) {
-        frameIndex++;
-        
-        // Calculate jitter delta BEFORE updating matrices
-        // JitterManager stores jitter in pixel space [-0.5, 0.5]
-        float currentJitterX = JitterManager.getJitterX();
-        float currentJitterY = JitterManager.getJitterY();
-        float prevJitterX = JitterManager.getPrevJitterX();
-        float prevJitterY = JitterManager.getPrevJitterY();
-        
-        // Store jitter delta in PIXEL SPACE for shader to subtract
-        this.jitterDeltaX = currentJitterX - prevJitterX;
-        this.jitterDeltaY = currentJitterY - prevJitterY;
-        
-        // Store current matrices
-        this.currentViewMatrix.set(currentView);
-        this.currentProjectionMatrix.set(currentProjection);
-        this.currentViewProjectionMatrix = new Matrix4f(currentProjection).mul(currentView);
-        
-        // Compute inverse matrices for reprojection
-        Matrix4f inverseCurrentVP = new Matrix4f(currentViewProjectionMatrix).invert();
-        Matrix4f inversePreviousVP = new Matrix4f(previousViewProjectionMatrix).invert();
-        
-        // Update UBO with motion vector data INCLUDING jitter delta
-        motionVectorUBO.update(
-            currentViewProjectionMatrix,
-            previousViewProjectionMatrix,
-            inverseCurrentVP,
-            inversePreviousVP,
-            viewportWidth,
-            viewportHeight,
-            frameIndex,
-            jitterDeltaX,
-            jitterDeltaY);
-        
-        // DIAGNOSTIC: Log jitter compensation
-        if (frameIndex % 60 == 0) {
-            System.out.println("[MotionVectors] JitterDelta: (" + jitterDeltaX + ", " + jitterDeltaY + ") pixels");
-            System.out.println("[MotionVectors] CurrentJitter: (" + currentJitterX + ", " + currentJitterY + ")");
-            System.out.println("[MotionVectors] PrevJitter: (" + prevJitterX + ", " + prevJitterY + ")");
-        }
-        
-        // Mark that we have previous frame data for next frame
-        hasPreviousFrame = true;
-        
-        // Store current matrices as previous for next frame
-        previousViewMatrix.set(currentView);
-        previousProjectionMatrix.set(currentProjection);
-        previousViewProjectionMatrix.set(currentViewProjectionMatrix);
+    	frameIndex++;
+   
+    	// Get current jitter values for diagnostic purposes
+    	float currentJitterX = JitterManager.getJitterX();
+    	float currentJitterY = JitterManager.getJitterY();
+    	float prevJitterX = JitterManager.getPrevJitterX();
+    	float prevJitterY = JitterManager.getPrevJitterY();
+   
+    	// Store jitter delta for diagnostic purposes only
+    	// NOTE: We do NOT subtract this from motion vectors - DLSS handles jitter internally
+    	this.jitterDeltaX = currentJitterX - prevJitterX;
+    	this.jitterDeltaY = currentJitterY - prevJitterY;
+   
+    	// CRITICAL: Create UNJITTERED projection matrix for motion vector calculation
+    	// Motion vectors must represent pure geometric motion without jitter
+    	Matrix4f unjitteredProjection = new Matrix4f(currentProjection);
+    	if (viewportWidth > 0 && viewportHeight > 0 && (currentJitterX != 0 || currentJitterY != 0)) {
+    		// Remove jitter from projection matrix
+    		// Jitter is applied to m20 (x offset) and m21 (y offset) in NDC space
+    		float ndcJitterX = (currentJitterX * 2.0f) / viewportWidth;
+    		float ndcJitterY = (currentJitterY * 2.0f) / viewportHeight;
+    		unjitteredProjection.m20(unjitteredProjection.m20() - ndcJitterX);
+    		unjitteredProjection.m21(unjitteredProjection.m21() - ndcJitterY);
+    	}
+   
+    	// Store current matrices (UNJITTERED for motion vector calculation)
+    	this.currentViewMatrix.set(currentView);
+    	this.currentProjectionMatrix.set(unjitteredProjection);
+    	this.currentViewProjectionMatrix = new Matrix4f(unjitteredProjection).mul(currentView);
+   
+    	// Compute inverse matrices for reprojection
+    	Matrix4f inverseCurrentVP = new Matrix4f(currentViewProjectionMatrix).invert();
+    	Matrix4f inversePreviousVP = new Matrix4f(previousViewProjectionMatrix).invert();
+   
+    	// Update UBO with UNJITTERED motion vector data
+    	// NOTE: No jitter delta is passed - motion vectors are already jitter-free
+    	motionVectorUBO.update(
+    			currentViewProjectionMatrix,
+    			previousViewProjectionMatrix,
+    			inverseCurrentVP,
+    			inversePreviousVP,
+    			viewportWidth,
+    			viewportHeight,
+    			frameIndex);
+   
+    	// DIAGNOSTIC: Log motion vector info
+    	if (frameIndex % 60 == 0) {
+    		System.out.println("[MotionVectors] Using UNJITTERED matrices for motion vectors");
+    		System.out.println("[MotionVectors] JitterDelta (diagnostic): (" + jitterDeltaX + ", " + jitterDeltaY + ") pixels");
+    		System.out.println("[MotionVectors] CurrentJitter: (" + currentJitterX + ", " + currentJitterY + ")");
+    		System.out.println("[MotionVectors] PrevJitter: (" + prevJitterX + ", " + prevJitterY + ")");
+    	}
+   
+    	// Mark that we have previous frame data for next frame
+    	hasPreviousFrame = true;
+   
+    	// Store current UNJITTERED matrices as previous for next frame
+    	previousViewMatrix.set(currentView);
+    	previousProjectionMatrix.set(unjitteredProjection);
+    	previousViewProjectionMatrix.set(currentViewProjectionMatrix);
     }
     
     /**
@@ -276,19 +302,29 @@ viewportWidth + "x" + viewportHeight + " (RGBA16F, DLSSD-compatible)");
     }
     
     /**
-     * Get the current jitter delta X in pixel space.
-     * This should be subtracted from motion vectors before passing to DLSS.
+     * Get the current jitter delta X in pixel space (DIAGNOSTIC ONLY).
+     *
+     * NOTE: This is for diagnostic purposes only. Motion vectors are calculated
+     * WITHOUT jitter, so there is no need to subtract jitter delta from them.
+     * DLSS receives jitter offsets separately via InJitterOffsetX/Y parameters.
+     *
+     * @return Jitter delta X in pixel space (diagnostic only)
      */
     public float getJitterDeltaX() {
-        return jitterDeltaX;
+    	return jitterDeltaX;
     }
-    
+   
     /**
-     * Get the current jitter delta Y in pixel space.
-     * This should be subtracted from motion vectors before passing to DLSS.
+     * Get the current jitter delta Y in pixel space (DIAGNOSTIC ONLY).
+     *
+     * NOTE: This is for diagnostic purposes only. Motion vectors are calculated
+     * WITHOUT jitter, so there is no need to subtract jitter delta from them.
+     * DLSS receives jitter offsets separately via InJitterOffsetX/Y parameters.
+     *
+     * @return Jitter delta Y in pixel space (diagnostic only)
      */
     public float getJitterDeltaY() {
-        return jitterDeltaY;
+    	return jitterDeltaY;
     }
     
     /**

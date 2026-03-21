@@ -80,17 +80,22 @@ public abstract class MixinRenderTarget implements IRenderTargetVkGetter {
     }
 
     private void setupTextures(int width, int height, boolean allowsLinear) {
-        var ctx = Vulkanite.INSTANCE.getCtx();
-
-        int glfmt = internalFormat.getGlFormat();
-        glfmt = (glfmt == GL_RGBA) ? GL_RGBA8 : glfmt;
-
-        int vkfmt = FormatConverter.getVkFormatFromGl(internalFormat);
-
-        vgMainTexture = ctx.memory.createSharedImage(width, height, 1, vkfmt, glfmt, VK_IMAGE_USAGE_STORAGE_BIT , VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        vgAltTexture = ctx.memory.createSharedImage(width, height, 1, vkfmt, glfmt, VK_IMAGE_USAGE_STORAGE_BIT , VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        vgMainTexture.get().setDebugUtilsObjectName("RenderTarget Main");
-        vgAltTexture.get().setDebugUtilsObjectName("RenderTarget Alt");
+    	var ctx = Vulkanite.INSTANCE.getCtx();
+   
+    	int glfmt = internalFormat.getGlFormat();
+    	glfmt = (glfmt == GL_RGBA) ? GL_RGBA8 : glfmt;
+   
+    	int vkfmt = FormatConverter.getVkFormatFromGl(internalFormat);
+   
+    	// DIAGNOSTIC: Log G-buffer render target creation dimensions
+    	// This helps verify if G-buffers are being created at full resolution
+    	System.out.println("[DIAG-RenderTarget] Creating render target: " + width + "x" + height +
+    		" (internalFormat=" + internalFormat.name() + ", vkfmt=" + vkfmt + ")");
+   
+    	vgMainTexture = ctx.memory.createSharedImage(width, height, 1, vkfmt, glfmt, VK_IMAGE_USAGE_STORAGE_BIT , VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    	vgAltTexture = ctx.memory.createSharedImage(width, height, 1, vkfmt, glfmt, VK_IMAGE_USAGE_STORAGE_BIT , VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    	vgMainTexture.get().setDebugUtilsObjectName("RenderTarget Main");
+    	vgAltTexture.get().setDebugUtilsObjectName("RenderTarget Alt");
         Vulkanite.INSTANCE.getCtx().cmd.executeWait(cmdbuf -> {
             cmdbuf.encodeImageTransition(new VRef<>(vgMainTexture.get()), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
             cmdbuf.encodeImageTransition(new VRef<>(vgAltTexture.get()), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);

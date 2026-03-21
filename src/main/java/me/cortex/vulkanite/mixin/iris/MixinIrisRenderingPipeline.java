@@ -173,15 +173,19 @@ public class MixinIrisRenderingPipeline {
         
         // Get colortex1 (Albedo) - render target 1
         if (requirements.needsAlbedo()) {
-        var albedoTarget = renderTargets.getOrCreate(1);
-        var albedoImg = ((IRenderTargetVkGetter) albedoTarget).getMain();
-        if (albedoImg != null && albedoImg.get() != null) {
-        gbufferViews[0] = VImageView.create(ctx, new VRef<>(albedoImg.get()));
-        LOGGER.debug("G-buffer albedo (colortex1) bound: {}x{}", albedoImg.get().width, albedoImg.get().height);
-        } else {
-        LOGGER.warn("G-buffer albedo (colortex1) is null or invalid!");
-        }
-        // Note: Do NOT close albedoImg here - the view holds a reference to it
+        	var albedoTarget = renderTargets.getOrCreate(1);
+        	var albedoImg = ((IRenderTargetVkGetter) albedoTarget).getMain();
+        	if (albedoImg != null && albedoImg.get() != null) {
+        		gbufferViews[0] = VImageView.create(ctx, new VRef<>(albedoImg.get()));
+        		// DIAGNOSTIC: Log G-buffer dimensions to verify full-resolution creation
+        		LOGGER.info("[DIAG-GBuffer] G-buffer albedo (colortex1) bound: {}x{} (window: {}x{})",
+        			albedoImg.get().width, albedoImg.get().height,
+        			MinecraftClient.getInstance().getWindow().getFramebufferWidth(),
+        			MinecraftClient.getInstance().getWindow().getFramebufferHeight());
+        	} else {
+        		LOGGER.warn("G-buffer albedo (colortex1) is null or invalid!");
+        	}
+        	// Note: Do NOT close albedoImg here - the view holds a reference to it
         }
         // Get colortex2 (Material Properties) - render target 2
         if (requirements.needsMaterial()) {

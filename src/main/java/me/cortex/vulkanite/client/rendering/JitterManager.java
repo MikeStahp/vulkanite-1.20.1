@@ -5,14 +5,19 @@ import org.joml.Matrix4f;
 /**
  * Manages subpixel jitter for DLSS temporal stability.
  *
+ * NVIDIA DLSS REQUIREMENTS:
+ * 1. Jitter offsets MUST be in pixel units with range [-0.5, 0.5]
+ * 2. Jitter MUST be applied to the projection matrix for temporal sampling
+ * 3. Jitter offsets are passed to DLSS via InJitterOffsetX/Y parameters
+ * 4. Motion vectors must NOT include jitter - DLSS handles compensation internally
+ *
  * IMPORTANT: Jitter MUST be applied to the projection matrix for DLSS to work!
  * DLSS is a temporal upscaler that needs different sub-pixel samples each
- * frame.
- * The engine applies jitter to the 3D camera (via projection matrix), and DLSS
- * uses the jitter offset values to shift the image back and accumulate details.
+ * frame. The engine applies jitter to the 3D camera (via projection matrix),
+ * and DLSS uses the jitter offset values to shift the image back and accumulate
+ * details from multiple frames.
  *
- * The jitter values stored here are in PIXEL SPACE (typically [-0.5, 0.5]
- * pixels).
+ * The jitter values stored here are in PIXEL SPACE (typically [-0.5, 0.5] pixels).
  * When applying to the projection matrix, they must be converted to NDC space.
  */
 public class JitterManager {
@@ -93,22 +98,14 @@ public class JitterManager {
      *
      * @param projectionMatrix The projection matrix to modify
      */
-    public static void applyJitter(Matrix4f projectionMatrix) {
-        // Only apply jitter when DLSS is actively processing frames
-        // This prevents image shaking when DLSS is not running
-        if (!isEnabled || !dlssActive || (jitterX == 0 && jitterY == 0))
-            return;
-
-        // Convert pixel space to NDC space
-        // NDC range is [-1, 1], so we multiply by 2.0 and divide by resolution
-        float ndcJitterX = (jitterX * 2.0f) / currentRenderWidth;
-        float ndcJitterY = (jitterY * 2.0f) / currentRenderHeight;
-
-        // In OpenGL style projection (where w = -z), adding to m20 and m21
-        // shifts the projected X and Y.
-        projectionMatrix.m20(projectionMatrix.m20() + ndcJitterX);
-        projectionMatrix.m21(projectionMatrix.m21() + ndcJitterY);
-    }
+ public static void applyJitter(Matrix4f projectionMatrix) {
+ if (!isEnabled || !dlssActive || (jitterX == 0 && jitterY == 0))
+ return;
+ float ndcJitterX = (jitterX * 2.0f) / currentRenderWidth;
+ float ndcJitterY = (jitterY * 2.0f) / currentRenderHeight;
+ projectionMatrix.m20(projectionMatrix.m20() + ndcJitterX);
+ projectionMatrix.m21(projectionMatrix.m21() + ndcJitterY);
+ }
 
     private static float halton(int index, int base) {
         float f = 1.0f;
@@ -232,13 +229,30 @@ public class JitterManager {
     }
 
     /**
-     * Reset the jitter state. Call this when DLSS is reinitialized.
+     * Reset the jitter state. Call this when:
+     * - DLSS is reinitialized
+     * - Camera teleport/scene change occurs
+     * - Temporal history needs to be invalidated
+     *
+     * This ensures the next frame starts with a clean state,
+     * preventing ghosting artifacts from invalid history.
      */
     public static void reset() {
-        frameIndex = 0;
-        jitterX = 0;
-        jitterY = 0;
-        prevJitterX = 0;
-        prevJitterY = 0;
+    	frameIndex = 0;
+    	jitterX = 0;
+    	jitterY = 0;
+    	prevJitterX = 0;
+    	prevJitterY = 0;
+    	firstFrameAfterActivation = true;
+    	System.out.println("[JitterManager] Reset performed - temporal history cleared");
     }
-}
+   
+    /**
+     * Check if the jitter system is properly initialized and ready.
+     *
+     * @return true if jitter is enabled and DLSS is active
+     */
+    public static boolean isReady() {
+    	return isEnabled && dlssActive;
+    }
+   }

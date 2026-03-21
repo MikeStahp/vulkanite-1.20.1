@@ -13,10 +13,13 @@ import java.nio.ByteBuffer;
 /**
  * Encodes uniform buffer data for ray tracing shaders.
  * Thread-local storage is used to avoid per-frame allocations.
- * 
- * IMPORTANT: Jitter values are provided for DLSS internal use only.
- * The ray tracing shader does NOT apply jitter to primary rays,
- * as the G-buffer is rendered by Iris without jitter.
+ *
+ * NVIDIA DLSS JITTER HANDLING:
+ * - Jitter values are passed to DLSS via InJitterOffsetX/Y parameters
+ * - Motion vectors do NOT include jitter - they represent pure geometric motion
+ * - DLSS handles jitter compensation internally using the provided jitter offsets
+ * - The ray tracing shader uses unjittered projection for corner vectors
+ *   to avoid visible jitter/shaking in the output
  */
 public final class UBODataEncoder {
 
@@ -93,38 +96,67 @@ public final class UBODataEncoder {
         // Calculate ViewProj for current frame rendering (JITTERED).
         // CapturedRenderingState.INSTANCE.getGbufferProjection() contains the jittered projection.
         curViewProj.set(CapturedRenderingState.INSTANCE.getGbufferProjection())
-                .mul(tempView);
-
-        // CRITICAL FIX: prevViewProj must be JITTERED, not unjittered!
+        	.mul(tempView);
+       
+        // NVIDIA DLSS REQUIREMENT: Motion vectors must NOT include jitter.
+        // The prevViewProj matrix stored here is used for motion vector calculation.
+        // Since motion vectors represent pure geometric motion (no jitter),
+        // we need to store the UNJITTERED view-projection matrix.
         //
-        // The previous frame's G-buffer was rendered WITH jitter, and DLSS temporal
-        // reprojection needs to know exactly where each pixel was in the previous frame.
-        // If we unjitter prevViewProj, the motion vectors will point to wrong locations,
-        // causing ghosting/smearing when the camera moves.
+        // Jitter values are passed separately to DLSS via InJitterOffsetX/Y parameters.
+        // DLSS handles jitter compensation internally - we do NOT subtract jitter from motion vectors.
         //
-        // DLSS handles jitter compensation internally using InJitterOffsetX/Y parameters.
-        // The motion vector calculation in the shader:
-        //   motionVec = (prevUV - currentUV) * resolution
-        // where prevUV comes from prevViewProj (jittered) and currentUV is unjittered.
-        // This gives DLSS the correct information to reproject and denoise.
-        //
-        // We no longer need unjitteredViewProj for motion vectors.
-
-        if (!hasHistory) {
-            prevViewProj.set(curViewProj);
-            TL_HAS_HISTORY.set(true);
+        // Compute unjittered view-projection for motion vector calculation
+        Matrix4f unjitteredProj = new Matrix4f(CapturedRenderingState.INSTANCE.getGbufferProjection());
+        if (renderWidth > 0 && renderHeight > 0 && (curJitterX != 0 || curJitterY != 0)) {
+        	float ndcJitterX = (curJitterX * 2.0f) / renderWidth;
+        	float ndcJitterY = (curJitterY * 2.0f) / renderHeight;
+        	unjitteredProj.m20(unjitteredProj.m20() - ndcJitterX);
+        	unjitteredProj.m21(unjitteredProj.m21() - ndcJitterY);
         }
+        Matrix4f unjitteredViewProj = new Matrix4f(unjitteredProj).mul(tempView);
+       
+ if (!hasHistory) {
+ 	prevViewProj.set(unjitteredViewProj);
+ 	TL_HAS_HISTORY.set(true);
+ }
 
         tempView.invert(invViewMatrix);
 
-        // Encode inverse projection corner vectors (offsets 0-48)
-        // CRITICAL: Use UNJITTERED inverse projection for corner vectors.
-        // The ray tracing shader does NOT apply jitter to primary rays (jitteredP = rayP),
-        // so corners must be unjittered. DLSS receives jitter offsets separately.
-        invProjUnjittered.transformProject(-1, -1, 0, 1, tmpv3).get(bb);
-        invProjUnjittered.transformProject(+1, -1, 0, 1, tmpv3).get(4 * Float.BYTES, bb);
-        invProjUnjittered.transformProject(-1, +1, 0, 1, tmpv3).get(8 * Float.BYTES, bb);
-        invProjUnjittered.transformProject(+1, +1, 0, 1, tmpv3).get(12 * Float.BYTES, bb);
+ // Encode inverse projection corner vectors (offsets 0-48)
+ // DIAGNOSTIC: Log both jittered and unjittered corner vectors to verify the issue.
+ // When camera is stationary, corner vectors should be STABLE (not change every frame).
+ // If they change with jitter, that's the root cause of camera shake.
+ Vector3f corner0_jittered = invProjMatrix.transformProject(-1, -1, 0, 1, tmpv3);
+ Vector3f corner1_jittered = invProjMatrix.transformProject(+1, -1, 0, 1, tmpv3);
+ Vector3f corner2_jittered = invProjMatrix.transformProject(-1, +1, 0, 1, tmpv3);
+ Vector3f corner3_jittered = invProjMatrix.transformProject(+1, +1, 0, 1, tmpv3);
+
+ // Compute unjittered corners for comparison
+ Vector3f corner0_unjittered = invProjUnjittered.transformProject(-1, -1, 0, 1, new Vector3f());
+ Vector3f corner1_unjittered = invProjUnjittered.transformProject(+1, -1, 0, 1, new Vector3f());
+ Vector3f corner2_unjittered = invProjUnjittered.transformProject(-1, +1, 0, 1, new Vector3f());
+ Vector3f corner3_unjittered = invProjUnjittered.transformProject(+1, +1, 0, 1, new Vector3f());
+
+ // Log corner vector differences every 60 frames to verify the issue
+ int frameCounterDiag = SystemTimeUniforms.COUNTER.getAsInt();
+ if (frameCounterDiag % 60 == 0) {
+     float jitteredLen0 = corner0_jittered.length();
+     float unjitteredLen0 = corner0_unjittered.length();
+     float diff0 = Math.abs(jitteredLen0 - unjitteredLen0);
+     System.out.println("[UBODataEncoder DIAGNOSTIC] Frame " + frameCounterDiag);
+     System.out.println("  Jitter: (" + curJitterX + ", " + curJitterY + ")");
+     System.out.println("  Corner0 JITTERED:   len=" + jitteredLen0 + ", vec=" + corner0_jittered);
+     System.out.println("  Corner0 UNJITTERED: len=" + unjitteredLen0 + ", vec=" + corner0_unjittered);
+     System.out.println("  Difference in length: " + diff0 + " (should be ~0 if jitter is handled correctly)");
+     System.out.println("  If difference > 0.001, corner vectors are changing with jitter = CAUSE OF SHAKE");
+ }
+
+        // Use UNJITTERED corners - jitter is already in projection matrix, DLSS handles compensation
+        corner0_unjittered.get(bb);
+        corner1_unjittered.get(4 * Float.BYTES, bb);
+        corner2_unjittered.get(8 * Float.BYTES, bb);
+        corner3_unjittered.get(12 * Float.BYTES, bb);
 
         // Encode inverse view matrix (offset 64)
         invViewMatrix.get(Float.BYTES * 16, bb);
@@ -157,20 +189,21 @@ public final class UBODataEncoder {
         bb.putFloat(Float.BYTES * 63, prevJitterY);
 
         // DIAGNOSTIC: Log jitter values every 300 frames to reduce spam
-        int frameCounter = SystemTimeUniforms.COUNTER.getAsInt();
-        if (frameCounter % 300 == 0) {
-            System.out.println("[UBODataEncoder] Frame " + frameCounter +
-                ": jitter=(" + curJitterX + ", " + curJitterY + ")" +
-                ", renderRes=" + renderWidth + "x" + renderHeight);
+        int frameCounterLog = SystemTimeUniforms.COUNTER.getAsInt();
+        if (frameCounterLog % 300 == 0) {
+            System.out.println("[UBODataEncoder] Frame " + frameCounterLog +
+                    ": jitter=(" + curJitterX + ", " + curJitterY + ")" +
+                    ", renderRes=" + renderWidth + "x" + renderHeight);
         }
 
         bb.rewind();
-
-        // Prepare for next frame: Store the JITTERED view-projection matrix.
-        // This is critical for correct temporal reprojection - the previous frame
-        // was rendered with jitter, so motion vectors must reference the jittered
-        // positions to correctly find where pixels were in the previous frame.
-        prevViewProj.set(curViewProj);
+       
+ // Prepare for next frame: Store the UNJITTERED view-projection matrix.
+ // NVIDIA DLSS REQUIREMENT: Motion vectors must NOT include jitter.
+ // By storing the unjittered matrix, motion vectors will represent
+ // pure geometric motion without jitter effects.
+ // Jitter is passed separately to DLSS via InJitterOffsetX/Y parameters.
+ prevViewProj.set(unjitteredViewProj);
     }
 
     public static void resetTemporalHistory() {
