@@ -1,0 +1,3 @@
+## 2024-11-20 - [Java Streams in Hot Rendering Paths]
+**Learning:** This codebase uses an aggressive update/render loop. The usage of Java Streams (`.stream().map().toList()`, `.stream().mapToInt()`, `Arrays.stream()`) inside these loops incurs significant performance penalties due to iterator allocation, lambda captures, unboxing overhead, and generating short-lived object garbage which forces garbage collection. These paths must rely on direct array instantiation, primitive mapping, and standard `for` loops.
+**Action:** When working in files that implement commands or pipeline hooks (like `VulkanPipeline`, `VCmdBuff`, `CommandManager`), completely avoid Java Streams. Refactor to traditional loops and simple arrays directly to avoid GC churn in `vulkanite` renders.
