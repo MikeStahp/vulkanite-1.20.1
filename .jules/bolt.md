@@ -1,0 +1,3 @@
+## 2024-05-18 - Replacing Streams with For Loops in Hot Paths
+**Learning:** In Java, using the Stream API in hot rendering loops (like command buffer recording and queue submissions) causes significant Garbage Collection (GC) pressure due to the continuous allocation of Stream pipeline objects, lambda function captures, and iterators. Refactoring these to standard `for` loops completely eliminates this overhead.
+**Action:** When working on performance-critical code, especially rendering pipelines, always prefer traditional `for` loops over Java Streams for collections and arrays to minimize GC pauses and improve frame rates.
