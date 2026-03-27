@@ -1,0 +1,3 @@
+## 2024-05-18 - Replacing Java Streams in Render Paths
+**Learning:** In highly performance-critical Vulkan mod codeframes (like `VulkanPipeline`, `VCmdBuff`, and `CommandManager`), Java Streams generate significant GC pressure due to lambda allocation and intermediate collections. The original stream max-finding logic in `CommandManager.waitForExecutions` was also subtly bugged because it could downgrade the maximum execution water mark if incoming values were smaller.
+**Action:** When working in hot rendering paths, avoid using Java Streams. Use simple `for` loops with pre-sized arrays/lists to prevent per-frame allocations and eliminate unnecessary boxing/unboxing overhead.
