@@ -225,7 +225,16 @@ public class CommandManager {
 
         public void waitForExecutions(int execQueue, List<Long> executions) {
             synchronized (waitingFor) {
-                long execMax = executions.stream().mapToLong(Long::longValue).max().orElse(waitingFor.getOrDefault(execQueue, 0));
+                // Bolt: Replaced stream operations with standard for-loop to eliminate
+                // per-frame allocations (stream, spliterator, lambdas) and boxing overhead.
+                // This reduces GC pressure in a hot rendering path and slightly reduces lock hold time.
+                long execMax = waitingFor.getOrDefault(execQueue, 0);
+                for (int i = 0; i < executions.size(); i++) {
+                    long val = executions.get(i);
+                    if (val > execMax) {
+                        execMax = val;
+                    }
+                }
                 waitingFor.put(execQueue, execMax);
             }
         }
