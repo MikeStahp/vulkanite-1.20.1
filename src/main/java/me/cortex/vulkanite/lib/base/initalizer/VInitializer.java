@@ -36,11 +36,20 @@ public class VInitializer {
                     .pApplicationName(memUTF8(appName))
                     .pEngineName(memUTF8(engineName));
 
+            ByteBuffer[] extBuffers = new ByteBuffer[extensions.length];
+            for (int i = 0; i < extensions.length; i++) {
+                extBuffers[i] = stack.UTF8(extensions[i]);
+            }
+            ByteBuffer[] layerBuffers = new ByteBuffer[layers.length];
+            for (int i = 0; i < layers.length; i++) {
+                layerBuffers[i] = stack.UTF8(layers[i]);
+            }
+
             VkInstanceCreateInfo instanceCreateInfo = VkInstanceCreateInfo.calloc(stack)
                     .sType$Default()
                     .pApplicationInfo(appInfo)
-                    .ppEnabledExtensionNames(stack.pointers(Arrays.stream(extensions).map(stack::UTF8).toArray(ByteBuffer[]::new)))
-                    .ppEnabledLayerNames(stack.pointers(Arrays.stream(layers).map(stack::UTF8).toArray(ByteBuffer[]::new)));
+                    .ppEnabledExtensionNames(stack.pointers(extBuffers))
+                    .ppEnabledLayerNames(stack.pointers(layerBuffers));
 
             PointerBuffer result = stack.pointers(0);
             _CHECK_(vkCreateInstance(instanceCreateInfo, null, result));
@@ -97,10 +106,19 @@ public class VInitializer {
                     .pQueuePriorities(stack.floats(queuePriorities))
                     .queueFamilyIndex(0);
 
+            ByteBuffer[] extBuffers = new ByteBuffer[extensions.size()];
+            for (int i = 0; i < extensions.size(); i++) {
+                extBuffers[i] = stack.UTF8(extensions.get(i));
+            }
+            ByteBuffer[] layerBuffers = new ByteBuffer[layers.size()];
+            for (int i = 0; i < layers.size(); i++) {
+                layerBuffers[i] = stack.UTF8(layers.get(i));
+            }
+
             VkDeviceCreateInfo createInfo = VkDeviceCreateInfo.calloc(stack)
                     .sType$Default()
-                    .ppEnabledExtensionNames(stack.pointers(extensions.stream().map(stack::UTF8).toArray(ByteBuffer[]::new)))
-                    .ppEnabledLayerNames(stack.pointers(layers.stream().map(stack::UTF8).toArray(ByteBuffer[]::new)))
+                    .ppEnabledExtensionNames(stack.pointers(extBuffers))
+                    .ppEnabledLayerNames(stack.pointers(layerBuffers))
                     .pQueueCreateInfos(queueCreateInfos);
 
             if (deviceFeatures != null) {
