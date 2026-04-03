@@ -143,10 +143,11 @@ public final class RenderPassExecutor {
             sets.set(ssboSetIdx, ssboSet);
         }
 
-        // Fill gaps with empty descriptor sets
+        // ⚡ Bolt: Fill gaps with empty descriptor sets using cache
+        // to avoid expensive per-frame vkAllocateDescriptorSets calls
         for (int i = 0; i < layoutCount; i++) {
             if (sets.get(i) == null) {
-                sets.set(i, Vulkanite.INSTANCE.getPoolByLayout(layouts.get(i)).get().allocateSet());
+                sets.set(i, Vulkanite.INSTANCE.getEmptySet(layouts.get(i)));
             }
         }
 
