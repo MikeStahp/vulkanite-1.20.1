@@ -5,6 +5,7 @@ import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.base.initalizer.VInitializer;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorPool;
+import me.cortex.vulkanite.lib.descriptors.VDescriptorSet;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorSetLayout;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSection;
 import me.jellysquid.mods.sodium.client.render.chunk.compile.ChunkBuildOutput;
@@ -49,6 +50,7 @@ public class Vulkanite {
 
     private final AccelerationManager accelerationManager;
     private final HashMap<VDescriptorSetLayout, VRef<VDescriptorPool>> descriptorPools = new HashMap<>();
+    private final HashMap<VDescriptorSetLayout, VRef<VDescriptorSet>> emptyDescriptorSets = new HashMap<>();
 
     public Vulkanite() {
         ctx = createVulkanContext();
@@ -93,7 +95,29 @@ public class Vulkanite {
         }
     }
 
+    /**
+     * ⚡ Bolt: Cache empty descriptor sets to avoid per-frame allocations
+     * in hot rendering paths.
+     */
+    public VRef<VDescriptorSet> getEmptySet(VRef<VDescriptorSetLayout> layout) {
+        var key = layout.get();
+        synchronized (emptyDescriptorSets) {
+            if (!emptyDescriptorSets.containsKey(key)) {
+                var pool = getPoolByLayout(layout);
+                emptyDescriptorSets.put(key, pool.get().allocateSet());
+                pool.close();
+            }
+            return emptyDescriptorSets.get(key).addRef();
+        }
+    }
+
     public void removePoolByLayout(VDescriptorSetLayout layout) {
+        synchronized (emptyDescriptorSets) {
+            var set = emptyDescriptorSets.remove(layout);
+            if (set != null) {
+                set.close();
+            }
+        }
         synchronized (descriptorPools) {
             descriptorPools.remove(layout);
         }
@@ -122,6 +146,8 @@ public class Vulkanite {
 
     public void destroy() {
         vkDeviceWaitIdle(ctx.device);
+        emptyDescriptorSets.values().forEach(VRef::close);
+        emptyDescriptorSets.clear();
         descriptorPools.clear();
     }
 
