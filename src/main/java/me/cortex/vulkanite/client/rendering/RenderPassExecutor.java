@@ -146,7 +146,7 @@ public final class RenderPassExecutor {
         // Fill gaps with empty descriptor sets
         for (int i = 0; i < layoutCount; i++) {
             if (sets.get(i) == null) {
-                sets.set(i, Vulkanite.INSTANCE.getPoolByLayout(layouts.get(i)).get().allocateSet());
+                sets.set(i, Vulkanite.INSTANCE.getEmptySet(layouts.get(i)));
             }
         }
 
