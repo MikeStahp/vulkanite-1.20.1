@@ -155,7 +155,9 @@ public final class RenderPassExecutor {
         VImage firstOutImg = outImgs.get(0).get();
         cmd.traceRays(firstOutImg.width, firstOutImg.height, 1);
 
-        sets.forEach(VRef::close);
+        for (var set : sets) {
+            set.close();
+        }
 
         // Output image barriers
         for (var img : outImgs) {
