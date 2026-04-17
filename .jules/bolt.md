@@ -1,0 +1,3 @@
+## 2024-04-17 - Timeline Semaphore Max Calculation Bug
+**Learning:** Using `executions.stream().mapToLong(Long::longValue).max().orElse(...)` to calculate the max value for timeline semaphores in `CommandManager.java` contains a subtle semantic edge-case bug. If the `executions` list provided has a maximum value that is *lower* than the current `waitingFor` map's timestamp, the `orElse` fallback never triggers, and the timeline incorrectly decreases, which can deadlock or crash Vulkan operations.
+**Action:** Always use imperative loops to calculate the maximum monotonic timeline value. Do not rely on stream `.max().orElse()` as it will overwrite higher baseline values with lower stream maximums.
