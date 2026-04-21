@@ -1,0 +1,3 @@
+## 2024-05-19 - Replace Java Streams in hot paths with traditional loops
+**Learning:** Using Java Streams (like `.stream().mapToInt()`, `.stream().mapToLong().max()`, `.stream().map().toList()`) in hot paths like render loops (`VulkanPipeline.renderPostShadows`, `VCmdBuff.bindDSet`, `CommandManager.Queue.waitForExecutions`) causes significant GC pressure and performance degradation due to unnecessary boxing/unboxing and O(N) per-frame memory allocations.
+**Action:** Replace stream usages with traditional `for` loops and basic arrays/lists in performance-critical areas, taking care to manage mutability semantics of replaced `.toList()` calls properly. Avoid `Arrays.stream()` as well.

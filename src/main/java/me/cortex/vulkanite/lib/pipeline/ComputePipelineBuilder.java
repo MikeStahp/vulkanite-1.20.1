@@ -46,7 +46,12 @@ public class ComputePipelineBuilder {
                     .sType$Default();
             {
                 //TODO: cleanup and add push constants
-                layoutCreateInfo.pSetLayouts(stack.longs(layouts.stream().mapToLong(a->a.get().layout).toArray()));
+                long[] layoutArray = new long[layouts.size()];
+                int idx = 0;
+                for (VRef<VDescriptorSetLayout> layout : layouts) {
+                    layoutArray[idx++] = layout.get().layout;
+                }
+                layoutCreateInfo.pSetLayouts(stack.longs(layoutArray));
             }
 
             if (pushConstants.size() > 0) {
