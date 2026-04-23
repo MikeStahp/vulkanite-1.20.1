@@ -248,8 +248,21 @@ public class VulkanPipeline {
         PBRTextureManager.notifyPBRTexturesChanged();
 
         var in = ctx.sync.createSharedBinarySemaphore();
-        var outImgsGlIds = vgOutImgs.stream().mapToInt(i -> i.get().glId).toArray();
-        var outImgsGlLayouts = vgOutImgs.stream().mapToInt(i -> GL_LAYOUT_GENERAL_EXT).toArray();
+
+        // [Bolt] Avoid stream allocations in hot render path
+        int numOutImgs = vgOutImgs.size();
+        var outImgsGlIds = new int[numOutImgs];
+        var outImgsGlLayouts = new int[numOutImgs];
+        var outImgs = new java.util.ArrayList<VRef<VImage>>(numOutImgs);
+
+        int imgIdx = 0;
+        for (var i : vgOutImgs) {
+            outImgsGlIds[imgIdx] = i.get().glId;
+            outImgsGlLayouts[imgIdx] = GL_LAYOUT_GENERAL_EXT;
+            outImgs.add(new VRef<VImage>(i.get()));
+            imgIdx++;
+        }
+
         in.get().glSignal(new int[0], outImgsGlIds, outImgsGlLayouts);
 
         var cmdRef = ctx.cmd.getSingleUsePool().createCommandBuffer();
@@ -264,8 +277,6 @@ public class VulkanPipeline {
             glFinish();
             return;
         }
-
-        var outImgs = vgOutImgs.stream().map(i -> new VRef<VImage>(i.get())).toList();
 
         var out = ctx.sync.createSharedBinarySemaphore();
 
