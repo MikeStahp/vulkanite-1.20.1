@@ -149,7 +149,11 @@ public class RaytracePipelineBuilder {
 
             {
                 // TODO: cleanup and add push constants
-                layoutCreateInfo.pSetLayouts(stack.longs(layouts.stream().mapToLong(a -> a.get().layout).toArray()));
+                long[] pLayouts = new long[layouts.size()];
+                for (int i = 0; i < layouts.size(); i++) {
+                    pLayouts[i] = layouts.get(i).get().layout;
+                }
+                layoutCreateInfo.pSetLayouts(stack.longs(pLayouts));
             }
 
             LongBuffer pLayout = stack.mallocLong(1);

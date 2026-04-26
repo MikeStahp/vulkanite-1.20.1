@@ -97,10 +97,19 @@ public class VInitializer {
                     .pQueuePriorities(stack.floats(queuePriorities))
                     .queueFamilyIndex(0);
 
+            ByteBuffer[] extBufs = new ByteBuffer[extensions.size()];
+            for (int i = 0; i < extensions.size(); i++) {
+                extBufs[i] = stack.UTF8(extensions.get(i));
+            }
+            ByteBuffer[] layerBufs = new ByteBuffer[layers.size()];
+            for (int i = 0; i < layers.size(); i++) {
+                layerBufs[i] = stack.UTF8(layers.get(i));
+            }
+
             VkDeviceCreateInfo createInfo = VkDeviceCreateInfo.calloc(stack)
                     .sType$Default()
-                    .ppEnabledExtensionNames(stack.pointers(extensions.stream().map(stack::UTF8).toArray(ByteBuffer[]::new)))
-                    .ppEnabledLayerNames(stack.pointers(layers.stream().map(stack::UTF8).toArray(ByteBuffer[]::new)))
+                    .ppEnabledExtensionNames(stack.pointers(extBufs))
+                    .ppEnabledLayerNames(stack.pointers(layerBufs))
                     .pQueueCreateInfos(queueCreateInfos);
 
             if (deviceFeatures != null) {
