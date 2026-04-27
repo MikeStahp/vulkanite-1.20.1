@@ -38,7 +38,9 @@ public class VDescriptorSet extends VObject {
     @Override
     protected void free() {
         pool.get().freeSet(this);
-        refs.values().forEach(VRef::close);
+        for (var ref : refs.values()) {
+            ref.close();
+        }
     }
 
     public void copyFrom(VContext ctx, VRef<VDescriptorSet> other, int setCapacity) {

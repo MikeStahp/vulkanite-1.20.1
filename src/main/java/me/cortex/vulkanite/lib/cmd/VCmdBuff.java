@@ -310,7 +310,9 @@ public class VCmdBuff extends VObject {
 
     protected void free() {
         vkFreeCommandBuffers(pool.get().device, pool.get().pool, buffer == null ? finalizedBuffer : buffer);
-        refs.forEach(VRef::close);
+        for (var ref : refs) {
+            ref.close();
+        }
         refs.clear();
     }
 
