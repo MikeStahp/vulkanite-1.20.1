@@ -1,0 +1,3 @@
+## 2024-05-30 - Java Stream Allocations in Rendering Pipelines
+**Learning:** Hot rendering paths in Vulkanite are highly sensitive to object allocations. The extensive use of Java Streams (e.g., `.stream().mapToInt(...)`, `.stream().mapToLong(...).max()`, `.stream().map(...)`) within per-frame render loops (`VulkanPipeline`, `VCmdBuff`, `CommandManager`) generated a significant amount of Garbage Collection overhead (stream objects, pipeline objects, boxing/unboxing wrappers).
+**Action:** Replace Java Streams in hot paths with explicit traditional `for` loops. When collecting elements, use pre-allocated arrays (e.g., `new int[size]`) or pre-sized collections (e.g., `new ArrayList<>(size)`) to guarantee minimal allocation and avoid resizing overheads entirely.
