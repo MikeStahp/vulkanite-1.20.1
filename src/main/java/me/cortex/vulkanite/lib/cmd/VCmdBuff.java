@@ -116,15 +116,34 @@ public class VCmdBuff extends VObject {
     }
 
     public void bindDSet(VRef<VDescriptorSet>... sets) {
-        long[] vkSets = Arrays.stream(sets).mapToLong(s -> s.get().set).toArray();
+        // ⚡ Bolt: Removed stream() for O(N) allocation avoidance in hot rendering loop
+        long[] vkSets = new long[sets.length];
+        for (int i = 0; i < sets.length; i++) {
+            vkSets[i] = sets[i].get().set;
+        }
         vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
-        refs.addAll(Arrays.stream(sets).map(s -> new VRef<VObject>(s.get())).toList());
+        if (refs instanceof ArrayList<?> arrRefs) {
+            arrRefs.ensureCapacity(refs.size() + sets.length);
+        }
+        for (int i = 0; i < sets.length; i++) {
+            refs.add(new VRef<VObject>(sets[i].get()));
+        }
     }
 
     public void bindDSet(List<VRef<VDescriptorSet>> sets) {
-        long[] vkSets = sets.stream().mapToLong(s -> s.get().set).toArray();
+        // ⚡ Bolt: Removed stream() for O(N) allocation avoidance in hot rendering loop
+        long[] vkSets = new long[sets.size()];
+        int idx = 0;
+        for (var set : sets) {
+            vkSets[idx++] = set.get().set;
+        }
         vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
-        refs.addAll(sets.stream().map(s -> new VRef<VObject>(s.get())).toList());
+        if (refs instanceof ArrayList<?> arrRefs) {
+            arrRefs.ensureCapacity(refs.size() + sets.size());
+        }
+        for (var set : sets) {
+            refs.add(new VRef<VObject>(set.get()));
+        }
     }
 
     public void pushConstants(int offset, int size, long dataPtr) {
