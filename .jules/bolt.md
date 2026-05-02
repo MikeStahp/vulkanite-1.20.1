@@ -1,0 +1,3 @@
+## 2024-06-25 - Avoid Java Streams in hot rendering paths
+**Learning:** Using Java Streams (like `.stream().mapToInt().toArray()` or `mapToLong().max()`) inside per-frame hot loops (e.g., `VulkanPipeline.renderPostShadows`, `VCmdBuff.bindDSet`, `CommandManager.Queue.waitForExecutions`) causes significant performance degradation due to unnecessary object allocations, boxing/unboxing overhead, and increased garbage collection (GC) pressure.
+**Action:** Always replace Stream operations in hot paths with standard `for` loops, use pre-allocated collections/arrays when the size is known, and utilize utilities like `Arrays.fill` for initialization.
