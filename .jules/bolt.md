@@ -1,0 +1,3 @@
+## 2024-05-24 - Java Streams in Hot Rendering Paths
+**Learning:** Using Java Streams (`.stream().map()`, `.toList()`) in per-frame rendering hot paths (like `renderPostShadows`, `bindDSet`, `waitForExecutions`) causes significant boxing overhead and O(N) allocations, leading to high GC pressure and stuttering. Additionally, stream-based reductions like `max().orElse()` in semaphore updates contained logical bugs where new wait values could incorrectly decrease if the incoming max was lower than the current wait.
+**Action:** Always use pre-allocated basic arrays/collections and enhanced `for` loops in performance-critical paths (e.g., `new int[source.size()]` or `new ArrayList<>(source.size())`). Avoid Streams entirely for per-frame execution.
