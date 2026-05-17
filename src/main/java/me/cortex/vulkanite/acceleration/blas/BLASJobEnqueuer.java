@@ -9,6 +9,7 @@ import me.jellysquid.mods.sodium.client.render.chunk.terrain.DefaultTerrainRende
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.Semaphore;
@@ -38,7 +39,7 @@ public class BLASJobEnqueuer {
      * Enqueues jobs of section blas builds.
      * NOTE: This is called from a different thread!
      */
-    public void enqueue(List<ChunkBuildOutput> batch) {
+    public void enqueue(Collection<ChunkBuildOutput> batch) {
         var cmd = context.cmd.getSingleUsePool().createCommandBuffer();
         boolean hasJobs = false;
 

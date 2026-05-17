@@ -16,6 +16,7 @@ import net.minecraft.client.render.BufferBuilder;
 import net.minecraft.client.render.RenderLayer;
 import net.minecraft.util.Pair;
 
+import java.util.Collection;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedDeque;
@@ -35,7 +36,7 @@ public class AccelerationManager {
                                                                    // do the blasBuildQueue)
     }
 
-    public void chunkBuilds(List<ChunkBuildOutput> results) {
+    public void chunkBuilds(Collection<ChunkBuildOutput> results) {
         blasBuilder.enqueue(results);
     }
 
