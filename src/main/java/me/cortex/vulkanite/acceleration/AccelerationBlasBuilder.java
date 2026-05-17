@@ -13,6 +13,7 @@ import me.cortex.vulkanite.lib.pipeline.VComputePipeline;
 import me.cortex.vulkanite.lib.shader.VShader;
 import me.jellysquid.mods.sodium.client.render.chunk.compile.ChunkBuildOutput;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.Semaphore;
@@ -82,7 +83,7 @@ public class AccelerationBlasBuilder {
      * Enqueues jobs of section blas builds.
      * NOTE: This is called from a different thread!
      */
-    public void enqueue(List<ChunkBuildOutput> batch) {
+    public void enqueue(Collection<ChunkBuildOutput> batch) {
         jobEnqueuer.enqueue(batch);
     }
 }

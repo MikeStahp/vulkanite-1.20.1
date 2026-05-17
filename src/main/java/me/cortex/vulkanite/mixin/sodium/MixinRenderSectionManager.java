@@ -52,7 +52,8 @@ public abstract class MixinRenderSectionManager {
             }
         }
         if (!map.values().isEmpty()) {
-            Vulkanite.INSTANCE.upload(new ArrayList<>(map.values()));
+            // Bolt: Pass map.values() directly to avoid O(N) ArrayList allocation in hot path
+            Vulkanite.INSTANCE.upload(map.values());
         }
     }
 }

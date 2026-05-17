@@ -13,6 +13,7 @@ import org.lwjgl.opengl.GL20;
 import org.lwjgl.vulkan.*;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 
@@ -73,7 +74,7 @@ public class Vulkanite {
         accelerationManager = new AccelerationManager(ctx, 1);
     }
 
-    public void upload(List<ChunkBuildOutput> results) {
+    public void upload(Collection<ChunkBuildOutput> results) {
         /*
         if (((IAccelerationBuildResult)result).getAccelerationGeometryData() == null)
             return;//TODO: delete the chunk section in this case then or something
