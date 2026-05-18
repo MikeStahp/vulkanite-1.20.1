@@ -1,0 +1,3 @@
+## 2024-05-18 - Replacing Streams with Loops in Hot Paths
+**Learning:** Replaced `.stream().mapToInt(...)` and `.stream().mapToLong(...)` operations with basic `for` loops in hot rendering loops, specifically in `VulkanPipeline`, `VCmdBuff`, and `CommandManager`. `java.util.stream` is extremely slow and allocation-heavy when run every single frame. Pre-allocating arrays and lists based on the known size of the input elements prevents automatic array expansion.
+**Action:** Always prefer basic `for` loops and array manipulation over `Stream` methods inside performance-critical paths (e.g., render loops, execution wait queues, binding loops).
