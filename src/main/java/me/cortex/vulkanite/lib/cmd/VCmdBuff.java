@@ -17,6 +17,8 @@ import me.cortex.vulkanite.lib.pipeline.VRaytracePipeline;
 import org.lwjgl.vulkan.*;
 import org.lwjgl.system.MemoryUtil;
 
+import java.util.ArrayList;
+
 import static org.lwjgl.util.vma.Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.*;
@@ -116,15 +118,32 @@ public class VCmdBuff extends VObject {
     }
 
     public void bindDSet(VRef<VDescriptorSet>... sets) {
-        long[] vkSets = Arrays.stream(sets).mapToLong(s -> s.get().set).toArray();
+        // Bolt: Eliminated stream operations to reduce per-frame allocations in hot path
+        long[] vkSets = new long[sets.length];
+        if (refs instanceof ArrayList<?> arrRefs) {
+            arrRefs.ensureCapacity(arrRefs.size() + sets.length);
+        }
+        for (int i = 0; i < sets.length; i++) {
+            var s = sets[i].get();
+            vkSets[i] = s.set;
+            refs.add(new VRef<VObject>(s));
+        }
         vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
-        refs.addAll(Arrays.stream(sets).map(s -> new VRef<VObject>(s.get())).toList());
     }
 
     public void bindDSet(List<VRef<VDescriptorSet>> sets) {
-        long[] vkSets = sets.stream().mapToLong(s -> s.get().set).toArray();
+        // Bolt: Eliminated stream operations to reduce per-frame allocations in hot path
+        long[] vkSets = new long[sets.size()];
+        if (refs instanceof ArrayList<?> arrRefs) {
+            arrRefs.ensureCapacity(arrRefs.size() + sets.size());
+        }
+        int idx = 0;
+        for (var setRef : sets) {
+            var s = setRef.get();
+            vkSets[idx++] = s.set;
+            refs.add(new VRef<VObject>(s));
+        }
         vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
-        refs.addAll(sets.stream().map(s -> new VRef<VObject>(s.get())).toList());
     }
 
     public void pushConstants(int offset, int size, long dataPtr) {
