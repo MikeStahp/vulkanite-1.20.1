@@ -1,0 +1,3 @@
+## 2024-05-30 - Eliminate Java Stream allocations in hot rendering paths
+**Learning:** Hot paths like VulkanPipeline.renderPostShadows, VCmdBuff.bindDSet, and CommandManager.Queue.waitForExecutions generate excessive garbage per frame due to Java Stream usage (.stream().mapToInt(), .stream().mapToLong().max(), Arrays.stream()). Furthermore, the stream-based max() in CommandManager could cause timeline semaphores to regress if the max of the new executions was lower than the existing wait requirement.
+**Action:** Replace stream usages with simple enhanced for loops, explicitly pre-allocate collections/arrays using known sizes, and utilize Arrays.fill where constant values are needed. Ensure timeline max calculations are strictly monotonically increasing.
