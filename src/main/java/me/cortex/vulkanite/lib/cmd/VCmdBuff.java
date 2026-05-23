@@ -122,9 +122,19 @@ public class VCmdBuff extends VObject {
     }
 
     public void bindDSet(List<VRef<VDescriptorSet>> sets) {
-        long[] vkSets = sets.stream().mapToLong(s -> s.get().set).toArray();
+        // ⚡ Bolt: Removed stream operations (mapToLong, map.toList) in favor of
+        // a simple loop to eliminate boxing, stream allocations, and iterator garbage
+        // during frame generation.
+        int size = sets.size();
+        long[] vkSets = new long[size];
+        var outRefs = new ArrayList<VRef<VObject>>(size);
+        for (int i = 0; i < size; i++) {
+            var set = sets.get(i);
+            vkSets[i] = set.get().set;
+            outRefs.add(new VRef<VObject>(set.get()));
+        }
         vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
-        refs.addAll(sets.stream().map(s -> new VRef<VObject>(s.get())).toList());
+        refs.addAll(outRefs);
     }
 
     public void pushConstants(int offset, int size, long dataPtr) {
