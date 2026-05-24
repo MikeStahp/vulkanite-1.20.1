@@ -116,15 +116,34 @@ public class VCmdBuff extends VObject {
     }
 
     public void bindDSet(VRef<VDescriptorSet>... sets) {
-        long[] vkSets = Arrays.stream(sets).mapToLong(s -> s.get().set).toArray();
+        long[] vkSets = new long[sets.length];
+        for (int i = 0; i < sets.length; i++) {
+            vkSets[i] = sets[i].get().set;
+        }
         vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
-        refs.addAll(Arrays.stream(sets).map(s -> new VRef<VObject>(s.get())).toList());
+
+        if (refs instanceof ArrayList<?> arrRefs) {
+            arrRefs.ensureCapacity(arrRefs.size() + sets.length);
+        }
+        for (var set : sets) {
+            refs.add(new VRef<VObject>(set.get()));
+        }
     }
 
     public void bindDSet(List<VRef<VDescriptorSet>> sets) {
-        long[] vkSets = sets.stream().mapToLong(s -> s.get().set).toArray();
+        int numSets = sets.size();
+        long[] vkSets = new long[numSets];
+        for (int i = 0; i < numSets; i++) {
+            vkSets[i] = sets.get(i).get().set;
+        }
         vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
-        refs.addAll(sets.stream().map(s -> new VRef<VObject>(s.get())).toList());
+
+        if (refs instanceof ArrayList<?> arrRefs) {
+            arrRefs.ensureCapacity(arrRefs.size() + numSets);
+        }
+        for (var set : sets) {
+            refs.add(new VRef<VObject>(set.get()));
+        }
     }
 
     public void pushConstants(int offset, int size, long dataPtr) {
