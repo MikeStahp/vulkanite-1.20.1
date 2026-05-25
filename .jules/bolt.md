@@ -1,0 +1,3 @@
+## 2024-05-18 - Replaced hot path Stream APIs with traditional loops
+**Learning:** Hot rendering paths in `VCmdBuff`, `VulkanPipeline`, and `MixinIrisRenderingPipeline` were using Java Streams (e.g., `sets.stream().mapToLong().toArray()`, `entryList.stream().map().toList()`). This incurs significant boxing and GC allocation overhead per frame. Additionally, creating standard `ArrayList`s and casting to bypass generics (e.g. `if (refs instanceof ArrayList<?> arrRefs) arrRefs.ensureCapacity(...)`) allows safe list pre-allocation.
+**Action:** Always prefer standard arrays and primitive loops with `Arrays.fill` over `.stream()` and `toList()` in per-frame rendering code to eliminate garbage allocation.
