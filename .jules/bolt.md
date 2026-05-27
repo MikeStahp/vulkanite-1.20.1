@@ -1,0 +1,3 @@
+## 2026-05-27 - Replaced streams in hot paths
+**Learning:** In hot rendering loops (e.g., Vulkanite command buffer encoding, wait for execution sync), Java Streams create per-frame allocations for stream wrappers, lambda objects, and intermediate collections which induces unnecessary GC pressure. Replacing them with pre-allocated traditional arrays/lists and enhanced for loops eliminates this boxing and garbage generation.
+**Action:** Always prefer basic arrays, traditional iteration loops (enhanced `for`), and `Arrays.fill` in performance-critical paths instead of Java Streams or closures to maintain low GC latency.
