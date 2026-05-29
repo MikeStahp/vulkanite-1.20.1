@@ -1,0 +1,3 @@
+## 2024-05-24 - Removed Java Stream Overhead in Hot Rendering Paths
+**Learning:** In performance-critical hot paths (like `VulkanPipeline.renderPostShadows`, `VCmdBuff.bindDSet`, `CommandManager.waitForExecutions`, and `MixinIrisRenderingPipeline`), the use of Java Stream API (`.stream().map()`, `.stream().mapToLong()`) introduces unnecessary closures, stream pipelines, and iterators that cause significant object allocations, primitive boxing, and garbage collection pressure every frame.
+**Action:** Always replace Stream operations in hot paths with traditional `for` loops, pre-allocate destination lists using `ensureCapacity()`, and utilize primitive arrays directly to ensure N per-frame allocations are eliminated.
