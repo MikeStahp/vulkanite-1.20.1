@@ -1,0 +1,3 @@
+## 2026-05-30 - Replaced Hot-Path Streams with Standard Loops
+**Learning:** Java Streams in performance-critical areas (like renderPostShadows, VCmdBuff binding, and command queues) incur overhead due to boxing, unboxing, and excessive O(N) object allocation for lambdas/results. Also, replacing stream list creation in iris rendering mixin with regular lists highlighted the fact that `getVGImage()` yields a `VRef<VGImage>`, requiring explicit type generics mapping rather than assuming it's unboxed.
+**Action:** Use simple arrays, pre-allocated collections with `.size()`, and loops in fast paths to reduce memory allocation per frame and decrease JVM garbage collection pressure.
