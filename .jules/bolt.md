@@ -1,0 +1,3 @@
+## 2024-05-18 - Removing Java Streams in hot paths
+**Learning:** In the Vulkanite architecture, methods executing per-frame or during hot rendering loops (like `VulkanPipeline.renderPostShadows`, `VCmdBuff.bindDSet`, etc.) were causing unnecessary garbage collection pressure and boxing overhead due to Java Stream usage (`.stream().mapToInt()`, `toList()`, `.max()`, etc.).
+**Action:** Replaced stream operations with standard `for` loops and pre-allocated arrays (`new int[size]`, `new long[size]`, `ArrayList<>(size)`). Fixed a bug in `CommandManager` stream-based `max()` where the value could incorrectly decrease. Ensure we use explicit `Arrays.fill` for static arrays.
