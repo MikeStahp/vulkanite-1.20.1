@@ -1,0 +1,3 @@
+## 2024-05-24 - Stream Refactoring and Hidden Bugs
+**Learning:** Refactoring Java Streams to explicit loops in hot paths (like `CommandManager.Queue.waitForExecutions`) not only improves performance by removing allocation overhead but can also uncover latent bugs. The original stream-based implementation `max().orElse(waitingFor.getOrDefault(...))` allowed the maximum wait value to decrease if subsequent updates had smaller values, violating timeline semaphore guarantees.
+**Action:** When removing streams, pay close attention to the logical accumulation operations (like `max`, `min`, `reduce`). Explicitly verify that the hand-written loop enforces the correct invariants (e.g., ensuring a monotonic increase for timeline maximums).
