@@ -116,15 +116,32 @@ public class VCmdBuff extends VObject {
     }
 
     public void bindDSet(VRef<VDescriptorSet>... sets) {
-        long[] vkSets = Arrays.stream(sets).mapToLong(s -> s.get().set).toArray();
+        // ⚡ Bolt: Refactored descriptor set binding to use raw arrays and loops, reducing object creation and GC.
+        int size = sets.length;
+        long[] vkSets = new long[size];
+        List<VRef<VObject>> mappedRefs = new ArrayList<>(size);
+        for (int i = 0; i < size; i++) {
+            var s = sets[i].get();
+            vkSets[i] = s.set;
+            mappedRefs.add(new VRef<VObject>(s));
+        }
         vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
-        refs.addAll(Arrays.stream(sets).map(s -> new VRef<VObject>(s.get())).toList());
+        refs.addAll(mappedRefs);
     }
 
     public void bindDSet(List<VRef<VDescriptorSet>> sets) {
-        long[] vkSets = sets.stream().mapToLong(s -> s.get().set).toArray();
+        // ⚡ Bolt: Refactored descriptor set binding to use raw arrays and loops, reducing object creation and GC.
+        int size = sets.size();
+        long[] vkSets = new long[size];
+        List<VRef<VObject>> mappedRefs = new ArrayList<>(size);
+        int i = 0;
+        for (var ref : sets) {
+            var s = ref.get();
+            vkSets[i++] = s.set;
+            mappedRefs.add(new VRef<VObject>(s));
+        }
         vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
-        refs.addAll(sets.stream().map(s -> new VRef<VObject>(s.get())).toList());
+        refs.addAll(mappedRefs);
     }
 
     public void pushConstants(int offset, int size, long dataPtr) {
