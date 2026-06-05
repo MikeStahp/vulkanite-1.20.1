@@ -1,0 +1,3 @@
+## 2026-06-05 - Avoid Java Streams in hot rendering paths
+**Learning:** This codebase's architecture calls these rendering methods frequently per frame. Using Java Streams (like .stream().mapToInt()) causes per-frame object allocation (boxing, closures, stream pipelines) which adds up, generating high garbage collection pressure. Additionally, using .stream().max().orElse() in timeline semaphore calculations can introduce bugs by incorrectly reducing the wait value.
+**Action:** Always replace Java Streams with traditional loops and pre-allocated arrays/collections in methods executed on the rendering fast-path.
