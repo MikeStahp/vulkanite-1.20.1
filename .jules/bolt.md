@@ -1,0 +1,3 @@
+## $(date +%Y-%m-%d) - Replace Streams with Loops for Performance
+**Learning:** In hot rendering paths and tight game loops, using Java Streams (like `.stream().map().toList()` or `.stream().mapToInt().toArray()`) introduces significant CPU overhead and GC pressure due to lambda captures, internal object allocations, and primitive boxing/unboxing.
+**Action:** When working in performance-critical code areas, prefer traditional `for` loops, explicitly sized arrays, and standard collections (like pre-allocated `ArrayList`s). Furthermore, when making performance optimizations as Bolt, **always** include inline comments explaining *why* the optimization was performed.
