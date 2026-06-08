@@ -1,0 +1,3 @@
+## 2024-06-25 - Replace Java Streams and `.forEach` in Performance Paths
+**Learning:** Found several hot rendering paths and descriptor management loops (like `EntityCapture`, `RenderPassExecutor`, `VCmdBuff`, `VDescriptorSet`) using `.forEach(closure)` and `Map.compute` methods, which create closures that capture arguments or require generic type boxing. This causes hidden allocation overhead and increased GC pressure, especially when run per-frame or repeatedly.
+**Action:** When working on hot paths, systematically replace `Collection.forEach`, `Map.forEach`, `Map.compute`, and `.stream()` usage with explicit loops (`for (var x : collection)` or `for (int i = 0; ... )`) to prevent per-frame allocation overhead and maintain O(N) predictable traversal.
