@@ -1,0 +1,3 @@
+## 2024-05-24 - Stream Refactoring in Hot Paths
+**Learning:** Replaced `stream()` operations with traditional loops and pre-allocated arrays/lists in performance-critical paths (`VulkanPipeline.renderPostShadows`, `VCmdBuff.bindDSet`, `CommandManager.Queue.waitForExecutions`, `MixinIrisRenderingPipeline.getCustomTextures`). Streams create Iterator garbage, and functions like `mapToInt` or `mapToLong` can create unnecessary boxing/unboxing overhead.
+**Action:** When working in hot rendering/update paths, use explicit traditional loops (`for (int i = 0; i < size; i++)`) and pre-allocate collections with their exact known size (`new ArrayList<>(size)` or `new int[size]`) to prevent per-frame allocation and eliminate GC pressure. Ensure timeline tracking stays monotonic.
