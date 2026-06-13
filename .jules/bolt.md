@@ -1,0 +1,3 @@
+## 2026-06-13 - [Stream to Loop Refactoring in Hot Paths]
+**Learning:** In the Vulkanite client mod, hot rendering paths (like `VulkanPipeline.renderPostShadows`, `VCmdBuff.bindDSet`, etc.) are heavily negatively impacted by Java Stream APIs (e.g., `.stream().mapToInt()`, `Arrays.stream()`) due to per-frame GC allocations and primitive unboxing/boxing overhead.
+**Action:** When implementing performance improvements or refactoring rendering code, always prefer explicit loops (e.g., `for (int i = 0; i < size; i++)`) and pre-allocated primitive arrays or `ArrayList`s over Streams to minimize garbage generation.
