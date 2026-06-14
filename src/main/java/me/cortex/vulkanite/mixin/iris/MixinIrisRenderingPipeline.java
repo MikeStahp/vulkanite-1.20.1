@@ -56,9 +56,12 @@ public class MixinIrisRenderingPipeline {
 
         entryList.sort(Comparator.comparing(Entry::getKey));
 
-        return entryList.stream()
-                .map(entry -> ((IVGImage) entry.getValue()).getVGImage())
-                .toList();
+        // Use pre-allocated list instead of Streams to avoid per-frame GC allocations
+        var result = new ArrayList<VRef<VGImage>>(entryList.size());
+        for (var entry : entryList) {
+            result.add(((IVGImage) entry.getValue()).getVGImage());
+        }
+        return result;
     }
 
     @Inject(method = "<init>", at = @At("TAIL"))
