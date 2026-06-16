@@ -45,7 +45,7 @@ dependencies {
     modImplementation(fabricApi.module("fabric-resource-loader-v0", project.fabric_version))
     modImplementation(fabricApi.module("fabric-api-base", project.fabric_version))
     modImplementation(fabricApi.module("fabric-block-view-api-v2", project.fabric_version))
-    modImplementation(fabricApi.module("fabric-rendering-fluids-v1", project.fabric_version))
+    modImplementation(fabricApi.module("fabric-lifecycle-events-v1", project.fabric_version))
     modImplementation("net.fabricmc.fabric-api:fabric-rendering-data-attachment-v1:0.3.38+73761d2e9a")
     modImplementation(fabricApi.module("fabric-resource-loader-v0", project.fabric_version))
 
@@ -56,6 +56,7 @@ dependencies {
     modRuntimeOnly 'io.github.douira:glsl-transformer:2.0.0-pre13'
 
     modRuntimeOnly 'net.java.dev.jna:jna:5.9.0'
+    implementation 'net.java.dev.jna:jna:5.9.0'
 }
 
 processResources {
@@ -104,6 +105,48 @@ jar {
     from("LICENSE") {
         rename { "${it}_${project.archivesBaseName}" }
     }
+}
+
+tasks.register("syncVulkaniteShaderpacks") {
+    group = "vulkanite"
+    description = "Copies tracked Vulkanite shaderpacks into the local Iris run directory."
+
+    def packNames = ["VulkaniteRT", "VulkaniteDeferred", "VulkaniteNormal"]
+    def sourceDirectories = packNames.collect {
+        layout.projectDirectory.dir("shaderpacks/${it}")
+    }
+
+    // Shaderpack sources are optional while they still live under the ignored
+    // run directory. Do not declare a missing parent directory as a task input.
+    inputs.files(provider {
+        sourceDirectories.findAll { it.asFile.isDirectory() }.collect { it.asFile }
+    })
+    packNames.each { packName ->
+        outputs.dir(layout.projectDirectory.dir("run/shaderpacks/${packName}"))
+    }
+
+    doLast {
+        packNames.each { packName ->
+            def source = layout.projectDirectory.dir("shaderpacks/${packName}")
+            def target = layout.projectDirectory.dir("run/shaderpacks/${packName}")
+
+            if (!source.asFile.isDirectory()) {
+                logger.info("Skipping ${packName}: tracked source directory does not exist")
+                return
+            }
+
+            delete(target)
+            copy {
+                from(source)
+                into(target)
+                exclude("**/*.spv")
+            }
+        }
+    }
+}
+
+tasks.matching { it.name == "runClient" || it.name == "runServer" }.configureEach {
+    dependsOn(tasks.named("syncVulkaniteShaderpacks"))
 }
 
 // configure the maven publication

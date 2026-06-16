@@ -16,10 +16,23 @@ import java.nio.ByteBuffer;
  *
  * NVIDIA DLSS JITTER HANDLING:
  * - Jitter values are passed to DLSS via InJitterOffsetX/Y parameters
- * - Motion vectors do NOT include jitter - they represent pure geometric motion
- * - DLSS handles jitter compensation internally using the provided jitter offsets
+ * - Motion vectors represent pure geometric motion WITHOUT jitter.
+ * - DLSS handles jitter compensation internally using InJitterOffsetX/Y parameters.
+ * - The prevViewProj matrix passed to shaders is UNJITTERED for correct motion vector calculation.
  * - The ray tracing shader uses unjittered projection for corner vectors
- *   to avoid visible jitter/shaking in the output
+ * to avoid visible jitter/shaking in the output
+ *
+ * CRITICAL: prevViewProj stores the UNJITTERED view-projection matrix.
+ * Motion vectors are calculated as: curUnjitteredPos - prevUnjitteredPos
+ * This ensures motion vectors represent pure geometric motion without jitter effects.
+ * DLSS receives jitter offsets separately and handles sub-pixel sampling internally.
+ *
+ * DLSS QUALITY MODE SCALING:
+ * - When DLSS is enabled with a quality preset, render resolution is scaled
+ *   (e.g., Quality mode = 66.67% of output resolution)
+ * - Jitter calculations use the SCALED render resolution from JitterManager
+ * - Corner vectors are computed for the render resolution, not output resolution
+ * - The ResolutionScaleManager provides consistent scaled dimensions across all components
  */
 public final class UBODataEncoder {
 
@@ -57,8 +70,8 @@ public final class UBODataEncoder {
         boolean hasHistory = TL_HAS_HISTORY.get();
 
         // NOTE: prevViewProj is a ThreadLocal that persists between frames.
-        // It contains the JITTERED matrix from the PREVIOUS frame, which is needed
-        // for correct temporal reprojection. The update to prevViewProj happens at
+        // It contains the UNJITTERED matrix from the PREVIOUS frame, which is needed
+        // for correct motion vector calculation. The update to prevViewProj happens at
         // the END of this method, after we've encoded the current frame's data.
 
         // Get jitter values FIRST - needed for unjittering the projection
@@ -66,23 +79,21 @@ public final class UBODataEncoder {
         float curJitterY = JitterManager.getJitterY();
         int renderWidth = JitterManager.getCurrentRenderWidth();
         int renderHeight = JitterManager.getCurrentRenderHeight();
-
-        // Compute inverse projection (this is the jittered projection for current frame rendering)
-        CapturedRenderingState.INSTANCE.getGbufferProjection().invert(invProjMatrix);
-
-        // CRITICAL FIX: Compute UNJITTERED inverse projection for corner vectors.
-        // The projection matrix from Iris is JITTERED (via MixinGameRenderer.applyJitter).
-        // The ray tracing shader does NOT apply jitter to primary rays (jitteredP = rayP),
-        // so the corner vectors must be UNJITTERED to avoid visible jitter/shaking.
-        // DLSS receives jitter offsets separately and handles sub-pixel sampling internally.
-        invProjUnjittered.set(CapturedRenderingState.INSTANCE.getGbufferProjection());
-        if (renderWidth > 0 && renderHeight > 0 && (curJitterX != 0 || curJitterY != 0)) {
-            float ndcJitterX = (curJitterX * 2.0f) / renderWidth;
-            float ndcJitterY = (curJitterY * 2.0f) / renderHeight;
-            invProjUnjittered.m20(invProjUnjittered.m20() - ndcJitterX);
-            invProjUnjittered.m21(invProjUnjittered.m21() - ndcJitterY);
-        }
-        invProjUnjittered.invert();
+       
+        // RESOLUTION SCALE FIX: Get output dimensions for corner vector scaling.
+        // The projection matrix from Iris is computed for OUTPUT resolution (e.g., 1920x1080),
+        // but ray tracing operates at RENDER resolution (e.g., 1280x720 for Quality mode).
+        // Corner vectors must be scaled to match the render resolution.
+        ResolutionScaleManager scaleManager = ResolutionScaleManager.getInstance();
+        int outputWidth = scaleManager.getOutputWidth();
+        int outputHeight = scaleManager.getOutputHeight();
+       
+        // Compute an unjittered projection for RT ray corners and DLSS guide buffers.
+        // JitterManager owns the sign/resolution math; shaders only consume the
+        // resulting matrices and the explicit pixel-space jitter value.
+        Matrix4f gbufferProjection = CapturedRenderingState.INSTANCE.getGbufferProjection();
+        Matrix4f unjitteredProjection = JitterManager.copyWithoutJitter(gbufferProjection, invProjUnjittered);
+        invProjUnjittered.invert(invProjMatrix);
 
         // Compute view matrix: transforms from ABSOLUTE world space to view space.
         // GbufferModelView transforms from camera-relative world space to view space.
@@ -93,70 +104,73 @@ public final class UBODataEncoder {
         tempView.set(CapturedRenderingState.INSTANCE.getGbufferModelView())
             .translate(camera.getPos().toVector3f().negate());
 
-        // Calculate ViewProj for current frame rendering (JITTERED).
-        // CapturedRenderingState.INSTANCE.getGbufferProjection() contains the jittered projection.
-        curViewProj.set(CapturedRenderingState.INSTANCE.getGbufferProjection())
-        	.mul(tempView);
-       
-        // NVIDIA DLSS REQUIREMENT: Motion vectors must NOT include jitter.
-        // The prevViewProj matrix stored here is used for motion vector calculation.
-        // Since motion vectors represent pure geometric motion (no jitter),
-        // we need to store the UNJITTERED view-projection matrix.
+        // Calculate ViewProj for DLSS motion-vector reprojection.
+        // Motion vectors must stay geometric; NGX receives jitter separately.
+        curViewProj.set(unjitteredProjection)
+                .mul(tempView);
+
+        // Build the current view-projection once from the Java-owned clean matrix.
+        Matrix4f unjitteredCurViewProj = new Matrix4f(curViewProj);
+
+        // CRITICAL FIX: prevViewProj stores the UNJITTERED view-projection matrix.
+        // Motion vectors represent pure geometric motion without jitter effects.
+        // DLSS receives jitter offsets separately and handles sub-pixel sampling internally.
         //
-        // Jitter values are passed separately to DLSS via InJitterOffsetX/Y parameters.
-        // DLSS handles jitter compensation internally - we do NOT subtract jitter from motion vectors.
-        //
-        // Compute unjittered view-projection for motion vector calculation
-        Matrix4f unjitteredProj = new Matrix4f(CapturedRenderingState.INSTANCE.getGbufferProjection());
-        if (renderWidth > 0 && renderHeight > 0 && (curJitterX != 0 || curJitterY != 0)) {
-        	float ndcJitterX = (curJitterX * 2.0f) / renderWidth;
-        	float ndcJitterY = (curJitterY * 2.0f) / renderHeight;
-        	unjitteredProj.m20(unjitteredProj.m20() - ndcJitterX);
-        	unjitteredProj.m21(unjitteredProj.m21() - ndcJitterY);
+        // For the first frame (no history), use the current frame's unjittered matrix as a starting point.
+        if (!hasHistory) {
+        	prevViewProj.set(unjitteredCurViewProj);
+        	TL_HAS_HISTORY.set(true);
         }
-        Matrix4f unjitteredViewProj = new Matrix4f(unjitteredProj).mul(tempView);
-       
- if (!hasHistory) {
- 	prevViewProj.set(unjitteredViewProj);
- 	TL_HAS_HISTORY.set(true);
- }
 
         tempView.invert(invViewMatrix);
 
- // Encode inverse projection corner vectors (offsets 0-48)
- // DIAGNOSTIC: Log both jittered and unjittered corner vectors to verify the issue.
- // When camera is stationary, corner vectors should be STABLE (not change every frame).
- // If they change with jitter, that's the root cause of camera shake.
- Vector3f corner0_jittered = invProjMatrix.transformProject(-1, -1, 0, 1, tmpv3);
- Vector3f corner1_jittered = invProjMatrix.transformProject(+1, -1, 0, 1, tmpv3);
- Vector3f corner2_jittered = invProjMatrix.transformProject(-1, +1, 0, 1, tmpv3);
- Vector3f corner3_jittered = invProjMatrix.transformProject(+1, +1, 0, 1, tmpv3);
+ // NDC COORDINATES FOR CORNER VECTORS
+// Use full NDC range [-1, 1] - no scaling needed.
+//
+// Why this works:
+// 1. The projection matrix from Iris is computed for output resolution with NDC [-1, 1]
+// 2. The inverse projection transforms NDC [-1, 1] to view-space frustum corners
+// 3. The shader interpolates [0, 1] across these corners based on render-resolution pixel coordinates
+// 4. This naturally produces correct rays - each render pixel maps to the appropriate portion of the full frustum
+// 5. The G-buffer is at render resolution, and the ray tracing launch size matches, so UV coordinates align perfectly
+//
+// The previous scaling to [-0.667, 0.667] was INCORRECT and caused projection errors.
+float ndcMinX = -1.0f;
+float ndcMaxX = 1.0f;
+float ndcMinY = -1.0f;
+float ndcMaxY = 1.0f;
 
- // Compute unjittered corners for comparison
- Vector3f corner0_unjittered = invProjUnjittered.transformProject(-1, -1, 0, 1, new Vector3f());
- Vector3f corner1_unjittered = invProjUnjittered.transformProject(+1, -1, 0, 1, new Vector3f());
- Vector3f corner2_unjittered = invProjUnjittered.transformProject(-1, +1, 0, 1, new Vector3f());
- Vector3f corner3_unjittered = invProjUnjittered.transformProject(+1, +1, 0, 1, new Vector3f());
+// Encode inverse projection corner vectors (offsets 0-48)
+// Use UNJITTERED corners with full NDC range [-1, 1].
+// The shader uses these to compute ray directions from pixel positions; jitter
+// should not be projected onto the final screen-space RT image.
+Vector3f corner0 = invProjMatrix.transformProject(ndcMinX, ndcMinY, 0, 1, new Vector3f());
+Vector3f corner1 = invProjMatrix.transformProject(ndcMaxX, ndcMinY, 0, 1, new Vector3f());
+Vector3f corner2 = invProjMatrix.transformProject(ndcMinX, ndcMaxY, 0, 1, new Vector3f());
+Vector3f corner3 = invProjMatrix.transformProject(ndcMaxX, ndcMaxY, 0, 1, new Vector3f());
 
- // Log corner vector differences every 60 frames to verify the issue
- int frameCounterDiag = SystemTimeUniforms.COUNTER.getAsInt();
- if (frameCounterDiag % 60 == 0) {
-     float jitteredLen0 = corner0_jittered.length();
-     float unjitteredLen0 = corner0_unjittered.length();
-     float diff0 = Math.abs(jitteredLen0 - unjitteredLen0);
-     System.out.println("[UBODataEncoder DIAGNOSTIC] Frame " + frameCounterDiag);
-     System.out.println("  Jitter: (" + curJitterX + ", " + curJitterY + ")");
-     System.out.println("  Corner0 JITTERED:   len=" + jitteredLen0 + ", vec=" + corner0_jittered);
-     System.out.println("  Corner0 UNJITTERED: len=" + unjitteredLen0 + ", vec=" + corner0_unjittered);
-     System.out.println("  Difference in length: " + diff0 + " (should be ~0 if jitter is handled correctly)");
-     System.out.println("  If difference > 0.001, corner vectors are changing with jitter = CAUSE OF SHAKE");
- }
+// Log corner vector info every 300 frames
+int frameCounterDiag = SystemTimeUniforms.COUNTER.getAsInt();
+if (frameCounterDiag % 300 == 0) {
+System.out.println("[UBODataEncoder] Frame " + frameCounterDiag
++ ": Using full NDC range [-1, 1]"
++ ", render=" + renderWidth + "x" + renderHeight
++ ", output=" + outputWidth + "x" + outputHeight
++ ", corners: c0=" + corner0 + ", c1=" + corner1);
+System.out.println("[JITTER FRAME DIAG] NDC range: [-1, 1] x [-1, 1] (full range)");
+System.out.println("[JITTER FRAME DIAG] Corner vectors (unjittered, full NDC):");
+System.out.println("[JITTER FRAME DIAG] c0 (minX,minY): (" + corner0.x + ", " + corner0.y + ", " + corner0.z + ")");
+System.out.println("[JITTER FRAME DIAG] c1 (maxX,minY): (" + corner1.x + ", " + corner1.y + ", " + corner1.z + ")");
+System.out.println("[JITTER FRAME DIAG] c2 (minX,maxY): (" + corner2.x + ", " + corner2.y + ", " + corner2.z + ")");
+System.out.println("[JITTER FRAME DIAG] c3 (maxX,maxY): (" + corner3.x + ", " + corner3.y + ", " + corner3.z + ")");
+System.out.println("[JITTER FRAME DIAG] Jitter: cur=(" + curJitterX + ", " + curJitterY + ")");
+}
 
-        // Use UNJITTERED corners - jitter is already in projection matrix, DLSS handles compensation
-        corner0_unjittered.get(bb);
-        corner1_unjittered.get(4 * Float.BYTES, bb);
-        corner2_unjittered.get(8 * Float.BYTES, bb);
-        corner3_unjittered.get(12 * Float.BYTES, bb);
+// Write corner vectors to UBO
+ corner0.get(bb);
+ corner1.get(4 * Float.BYTES, bb);
+ corner2.get(8 * Float.BYTES, bb);
+ corner3.get(12 * Float.BYTES, bb);
 
         // Encode inverse view matrix (offset 64)
         invViewMatrix.get(Float.BYTES * 16, bb);
@@ -188,22 +202,26 @@ public final class UBODataEncoder {
         bb.putFloat(Float.BYTES * 62, prevJitterX);
         bb.putFloat(Float.BYTES * 63, prevJitterY);
 
+        // Encode current unjittered World-to-Clip matrix (offset 256).
+        unjitteredCurViewProj.get(Float.BYTES * 64, bb);
+
         // DIAGNOSTIC: Log jitter values every 300 frames to reduce spam
+        // Note: scaleManager is already declared above for corner vector scaling
         int frameCounterLog = SystemTimeUniforms.COUNTER.getAsInt();
         if (frameCounterLog % 300 == 0) {
-            System.out.println("[UBODataEncoder] Frame " + frameCounterLog +
-                    ": jitter=(" + curJitterX + ", " + curJitterY + ")" +
-                    ", renderRes=" + renderWidth + "x" + renderHeight);
+        	System.out.println("[UBODataEncoder] Frame " + frameCounterLog +
+        	": jitter=(" + curJitterX + ", " + curJitterY + ")" +
+        	", renderRes=" + renderWidth + "x" + renderHeight +
+        	", outputRes=" + outputWidth + "x" + outputHeight +
+        	", scale=" + scaleManager.getScale() + ", dlssEnabled=" + scaleManager.isDLSSEnabled());
         }
 
         bb.rewind();
-       
- // Prepare for next frame: Store the UNJITTERED view-projection matrix.
- // NVIDIA DLSS REQUIREMENT: Motion vectors must NOT include jitter.
- // By storing the unjittered matrix, motion vectors will represent
- // pure geometric motion without jitter effects.
- // Jitter is passed separately to DLSS via InJitterOffsetX/Y parameters.
- prevViewProj.set(unjitteredViewProj);
+
+        // CRITICAL: Store the UNJITTERED current frame's view-projection matrix.
+        // This becomes the "previous frame's matrix" for motion vector calculation.
+        // Motion vectors represent pure geometric motion; DLSS handles jitter compensation internally.
+        prevViewProj.set(unjitteredCurViewProj);
     }
 
     public static void resetTemporalHistory() {

@@ -2,7 +2,6 @@ package me.cortex.vulkanite.client.gui.sodium;
 
 import com.google.common.collect.ImmutableList;
 import me.cortex.vulkanite.client.config.DLSSConfig;
-import me.cortex.vulkanite.client.rendering.DLSSRayReconstruction.DLSSQualityPreset;
 import me.jellysquid.mods.sodium.client.gui.options.OptionGroup;
 import me.jellysquid.mods.sodium.client.gui.options.OptionImpl;
 import me.jellysquid.mods.sodium.client.gui.options.OptionPage;
@@ -14,45 +13,39 @@ import net.minecraft.text.Text;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Sodium GUI page for DLSS/FSR upscaling and denoising configuration.
+ * Provides options for:
+ * - Denoiser type selection (None, DLSS, FSR, DLSS Ray Reconstruction)
+ * - Quality preset for upscaling
+ * - ReSTIR toggle
+ * - Debug mode
+ * - World lighting parameters
+ */
 public class SodiumDLSSPage {
     private static final SodiumDLSSConfig STORAGE = new SodiumDLSSConfig();
 
     public static OptionPage create() {
         List<OptionGroup> groups = new ArrayList<>();
 
-        // Rendering Pipeline
-        groups.add(OptionGroup.createBuilder()
-                .add(OptionImpl.createBuilder(DLSSConfig.RenderingPipeline.class, STORAGE)
-                        .setName(Text.of("Rendering Pipeline"))
-                        .setTooltip(Text.of("Select the rendering pipeline."))
-                        .setControl((opt) -> new CyclingControl<>(opt, DLSSConfig.RenderingPipeline.class, new Text[] {
-                                Text.of("Raster (Default)"),
-                                Text.of("Deferred (Experimental)"),
-                                Text.of("RTX / Path Tracing")
-                        }))
-                        .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setRenderingPipeline(value),
-                                (opts) -> STORAGE.getConfig().getRenderingPipeline())
-                        .build())
-                .build());
-
-        // General Settings
+        // General Settings - Enable/Disable and Denoiser Type
         groups.add(OptionGroup.createBuilder()
                 .add(OptionImpl.createBuilder(boolean.class, STORAGE)
                         .setName(Text.of("Enable DLSS/FSR"))
                         .setTooltip(Text.of("Enable upscaling and denoising via DLSS or FSR."))
                         .setControl(TickBoxControl::new)
                         .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setEnabled(value),
-                                (opts) -> STORAGE.getConfig().isEnabled())
+                                (opts, value) -> STORAGE.getConfig().setDLSSEnabled(value),
+                                (opts) -> STORAGE.getConfig().isDLSSEnabled())
                         .build())
                 .add(OptionImpl.createBuilder(DLSSConfig.DenoiserType.class, STORAGE)
                         .setName(Text.of("Upscaler Type"))
                         .setTooltip(Text.of("Select the upscaling technology to use."))
                         .setControl((opt) -> new CyclingControl<>(opt, DLSSConfig.DenoiserType.class, new Text[] {
+                                Text.of("None"),
                                 Text.of("DLSS (NVIDIA RTX)"),
                                 Text.of("FSR (AMD/Intel/NVIDIA)"),
-                                Text.of("Basic (Fallback)")
+                                Text.of("DLSS RR (Ray Reconstruction)")
                         }))
                         .setBinding(
                                 (opts, value) -> STORAGE.getConfig().setDenoiserType(value),
@@ -60,22 +53,23 @@ public class SodiumDLSSPage {
                         .build())
                 .build());
 
-        // DLSS Settings
-        groups.add(OptionGroup.createBuilder()
-                .add(OptionImpl.createBuilder(DLSSQualityPreset.class, STORAGE)
-                        .setName(Text.of("DLSS Quality"))
-                        .setTooltip(Text.of("Performance/Quality trade-off for DLSS."))
-                        .setControl((opt) -> new CyclingControl<>(opt, DLSSQualityPreset.class, new Text[] {
-                                Text.of("Native (No Upscaling)"),
-                                Text.of("Quality"),
-                                Text.of("Balanced"),
-                                Text.of("Performance"),
-                                Text.of("Ultra Performance")
-                        }))
-                        .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setQualityPreset(value),
-                                (opts) -> STORAGE.getConfig().getQualityPreset())
-                        .build())
+	// DLSS Quality Settings
+	groups.add(OptionGroup.createBuilder()
+		.add(OptionImpl.createBuilder(DLSSConfig.QualityPreset.class, STORAGE)
+			.setName(Text.of("DLSS Quality"))
+			.setTooltip(Text.of("Performance/Quality trade-off for DLSS. Performance: 50%, Balanced: 58%, Quality: 67%, Ultra Quality: 77%, Ultra Performance: 33%, DLAA: 100% (no upscaling)."))
+			.setControl((opt) -> new CyclingControl<>(opt, DLSSConfig.QualityPreset.class, new Text[] {
+				Text.of("Performance"),
+				Text.of("Balanced"),
+				Text.of("Quality"),
+				Text.of("Ultra Performance"),
+				Text.of("Ultra Quality"),
+				Text.of("DLAA")
+			}))
+			.setBinding(
+				(opts, value) -> STORAGE.getConfig().setQualityPreset(value),
+				(opts) -> STORAGE.getConfig().getQualityPreset())
+			.build())
                 .add(OptionImpl.createBuilder(boolean.class, STORAGE)
                         .setName(Text.of("Ray Reconstruction"))
                         .setTooltip(Text.of("Use AI-powered denoising for ray tracing (DLSS 3.5)."))
@@ -83,22 +77,6 @@ public class SodiumDLSSPage {
                         .setBinding(
                                 (opts, value) -> STORAGE.getConfig().setRayReconstructionEnabled(value),
                                 (opts) -> STORAGE.getConfig().isRayReconstructionEnabled())
-                        .build())
-                .add(OptionImpl.createBuilder(boolean.class, STORAGE)
-                        .setName(Text.of("Enable ReSTIR"))
-                        .setTooltip(Text.of("Enable Spatiotemporal Reservoir Resampling for high-quality lighting."))
-                        .setControl(TickBoxControl::new)
-                        .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setReSTIREnabled(value),
-                                (opts) -> STORAGE.getConfig().isReSTIREnabled())
-                        .build())
-                .add(OptionImpl.createBuilder(Integer.class, STORAGE)
-                        .setName(Text.of("Sharpening"))
-                        .setTooltip(Text.of("Apply sharpening to the upscaled image."))
-                        .setControl((opt) -> new SliderControl(opt, 0, 100, 5, (val) -> Text.of(val + "%")))
-                        .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setSharpening(value / 100.0f),
-                                (opts) -> (int) (STORAGE.getConfig().getSharpening() * 100))
                         .build())
                 .build());
 
@@ -114,30 +92,33 @@ public class SodiumDLSSPage {
                                 Text.of("Ultra Performance")
                         }))
                         .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setFsrQualityPreset(value),
-                                (opts) -> STORAGE.getConfig().getFsrQualityPreset())
+                                (opts, value) -> STORAGE.getConfig().setFSRQuality(value.ordinal()),
+                                (opts) -> STORAGE.getConfig().getFSRQualityPreset())
                         .build())
                 .add(OptionImpl.createBuilder(Integer.class, STORAGE)
-                        .setName(Text.of("FSR Sharpening"))
+                        .setName(Text.of("FSR Sharpness"))
                         .setTooltip(Text.of("Apply sharpening to the FSR upscaled image."))
                         .setControl((opt) -> new SliderControl(opt, 0, 100, 5, (val) -> Text.of(val + "%")))
                         .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setFsrSharpeningStrength(value / 100.0f),
-                                (opts) -> (int) (STORAGE.getConfig().getFsrSharpeningStrength() * 100))
+                                (opts, value) -> STORAGE.getConfig().setSharpness(value / 100.0f),
+                                (opts) -> (int) (STORAGE.getConfig().getSharpness() * 100))
+                        .build())
+                .build());
+
+        // ReSTIR Settings
+        groups.add(OptionGroup.createBuilder()
+                .add(OptionImpl.createBuilder(boolean.class, STORAGE)
+                        .setName(Text.of("Enable ReSTIR"))
+                        .setTooltip(Text.of("Enable Spatiotemporal Reservoir Resampling for high-quality lighting."))
+                        .setControl(TickBoxControl::new)
+                        .setBinding(
+                                (opts, value) -> STORAGE.getConfig().setReSTIREnabled(value),
+                                (opts) -> STORAGE.getConfig().isReSTIREnabled())
                         .build())
                 .build());
 
         // RT Quality Tuning
         groups.add(OptionGroup.createBuilder()
-                .add(OptionImpl.createBuilder(Integer.class, STORAGE)
-                        .setName(Text.of("Sun Intensity"))
-                        .setTooltip(Text.of("Multiplier for direct sunlight strength."))
-                        .setControl((opt) -> new SliderControl(opt, 0, 500, 10,
-                                (val) -> Text.of(String.format("%.1fx", val / 100.0f))))
-                        .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setSunIntensity(value / 100.0f),
-                                (opts) -> (int) (STORAGE.getConfig().getSunIntensity() * 100))
-                        .build())
                 .add(OptionImpl.createBuilder(Integer.class, STORAGE)
                         .setName(Text.of("Global Illumination"))
                         .setTooltip(Text.of("Multiplier for indirect bounced lighting."))
@@ -176,56 +157,45 @@ public class SodiumDLSSPage {
                         .build())
                 .build());
 
-        // ReSTIR Advanced Config
-        groups.add(OptionGroup.createBuilder()
-                .add(OptionImpl.createBuilder(Integer.class, STORAGE)
-                        .setName(Text.of("Temporal History"))
-                        .setTooltip(
-                                Text.of("Max frames of temporal accumulation. Higher = less noise but more ghosting."))
-                        .setControl((opt) -> new SliderControl(opt, 1, 20, 1, (val) -> Text.of(val + " frames")))
-                        .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setRestirMaxHistory(value),
-                                (opts) -> STORAGE.getConfig().getRestirMaxHistory())
-                        .build())
-                .add(OptionImpl.createBuilder(Integer.class, STORAGE)
-                        .setName(Text.of("Spatial Radius"))
-                        .setTooltip(Text.of(
-                                "Pixel radius for spatial neighbor reuse. Higher = softer shadows but potential smudging."))
-                        .setControl((opt) -> new SliderControl(opt, 1, 16, 1, (val) -> Text.of(val + " px")))
-                        .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setRestirSpatialRadius((float) value),
-                                (opts) -> (int) STORAGE.getConfig().getRestirSpatialRadius())
-                        .build())
-                .add(OptionImpl.createBuilder(Integer.class, STORAGE)
-                        .setName(Text.of("Spatial Samples"))
-                        .setTooltip(Text.of("Number of spatial neighbors to sample. ReSTIR default is 2."))
-                        .setControl((opt) -> new SliderControl(opt, 0, 8, 1, (val) -> Text.of(val + " taps")))
-                        .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setRestirSpatialSamples(value),
-                                (opts) -> STORAGE.getConfig().getRestirSpatialSamples())
-                        .build())
-                .build());
-
         // Advanced Settings
         groups.add(OptionGroup.createBuilder()
                 .add(OptionImpl.createBuilder(boolean.class, STORAGE)
-                        .setName(Text.of("Debug Mode"))
-                        .setTooltip(Text.of("Enable debug visualization (Quadrants). Disables DLSS/DLSSD processing."))
+                        .setName(Text.of("Motion Vectors"))
+                        .setTooltip(Text.of("Enable motion vector generation for temporal upscaling."))
                         .setControl(TickBoxControl::new)
                         .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setDebugMode(value),
-                                (opts) -> STORAGE.getConfig().isDebugMode())
+                                (opts, value) -> STORAGE.getConfig().setMotionVectorsEnabled(value),
+                                (opts) -> STORAGE.getConfig().isMotionVectorsEnabled())
                         .build())
                 .add(OptionImpl.createBuilder(boolean.class, STORAGE)
-                        .setName(Text.of("Show Performance Metrics"))
-                        .setTooltip(Text.of("Display performance metrics overlay."))
+                        .setName(Text.of("Jitter Enabled"))
+                        .setTooltip(Text.of("Enable camera jitter for temporal upscaling quality."))
                         .setControl(TickBoxControl::new)
                         .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setShowPerformanceMetrics(value),
-                                (opts) -> STORAGE.getConfig().isShowPerformanceMetrics())
+                                (opts, value) -> STORAGE.getConfig().setJitterEnabled(value),
+                                (opts) -> STORAGE.getConfig().isJitterEnabled())
                         .build())
                 .build());
 
-        return new OptionPage(Text.of("Vulkanite Settings"), ImmutableList.copyOf(groups));
+        // Debug Settings
+        groups.add(OptionGroup.createBuilder()
+                .add(OptionImpl.createBuilder(DLSSConfig.DebugType.class, STORAGE)
+                        .setName(Text.of("Debug Visualization"))
+                        .setTooltip(Text.of("Show debug visualization for DLSS/FSR processing."))
+                        .setControl((opt) -> new CyclingControl<>(opt, DLSSConfig.DebugType.class, new Text[] {
+                                Text.of("None"),
+                                Text.of("Input"),
+                                Text.of("Output"),
+                                Text.of("Motion Vectors"),
+                                Text.of("Depth"),
+                                Text.of("Normals")
+                        }))
+                        .setBinding(
+                                (opts, value) -> STORAGE.getConfig().setDebugType(value),
+                                (opts) -> STORAGE.getConfig().getDebugType())
+                        .build())
+                .build());
+
+        return new OptionPage(Text.of("Vulkanite DLSS/FSR"), ImmutableList.copyOf(groups));
     }
 }

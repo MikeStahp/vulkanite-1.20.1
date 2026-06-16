@@ -30,9 +30,9 @@ import static org.lwjgl.vulkan.VK10.*;
 public class BLASBatchProcessor {
     private static final Logger LOGGER = LoggerFactory.getLogger(BLASBatchProcessor.class);
 
-    // Maximum batch size to prevent memory exhaustion
-    // Batches larger than this will be truncated and logged
-    private static final int MAX_BATCH_SIZE = 16;
+    // Maximum batch size to prevent long GPU submissions and query-pool pressure.
+    // Enqueuers should split larger bursts before they reach the processor.
+    public static final int MAX_BATCH_SIZE = 16;
 
     private final VContext context;
     private final int asyncQueue;
@@ -74,11 +74,10 @@ public class BLASBatchProcessor {
 
         var jobs = buildCtx.jobs;
         
-        // Validate and potentially truncate batch size to prevent memory exhaustion
+        // Validate batch size to prevent memory exhaustion.
         if (jobs.size() > MAX_BATCH_SIZE) {
-            LOGGER.warn("[BLAS Batch #{}] Batch size {} exceeds MAX_BATCH_SIZE ({}), truncating to {} jobs. " +
-                    "Consider reducing BLASBuildWorker.collectJobs() limit.",
-                    totalBatchesProcessed + 1, jobs.size(), MAX_BATCH_SIZE, MAX_BATCH_SIZE);
+            throw new IllegalStateException("BLAS batch size " + jobs.size()
+                    + " exceeds MAX_BATCH_SIZE " + MAX_BATCH_SIZE);
         }
         
         totalBatchesProcessed++;

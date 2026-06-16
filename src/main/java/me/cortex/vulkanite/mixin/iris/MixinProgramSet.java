@@ -13,14 +13,28 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-import java.lang.reflect.Field;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Mixin(value = ProgramSet.class, remap = false)
 public abstract class MixinProgramSet implements IGetRaytracingSource {
+    @Unique
+    private static final String VULKANITE_RESTIR_DEFINE = "VULKANITE_RESTIR";
+
+    @Unique
+    private static final String RESTIR_LIBRARY_RESOURCE =
+            "/assets/vulkanite/shaders/raytracing/lib/restir.glsl";
+
+    @Unique
+    private static final String RESTIR_API_VERSION_MARKER =
+            "#define VULKANITE_RESTIR_API_VERSION 2";
+
     @Unique
     private RaytracingShaderSource[] sources;
 
@@ -31,17 +45,154 @@ public abstract class MixinProgramSet implements IGetRaytracingSource {
         if (defines == null || defines.isEmpty())
             return source;
 
+        String updatedSource = source;
+        StringBuilder missingDefines = new StringBuilder();
+        for (String define : defines.split("\\R")) {
+            String trimmed = define.trim();
+            String[] parts = trimmed.split("\\s+", 3);
+            if (parts.length < 3 || !"#define".equals(parts[0])) {
+                continue;
+            }
+
+            Pattern existingDefine = Pattern.compile(
+                    "(?m)^[\\t ]*#define[\\t ]+" + Pattern.quote(parts[1]) + "(?:[\\t ]+.*)?$");
+            Matcher matcher = existingDefine.matcher(updatedSource);
+            if (matcher.find()) {
+                updatedSource = matcher.replaceAll(Matcher.quoteReplacement(trimmed));
+            } else {
+                missingDefines.append(trimmed).append('\n');
+            }
+        }
+
+        if (missingDefines.isEmpty()) {
+            return updatedSource;
+        }
+
         // Find the #version line
-        int versionIndex = source.indexOf("#version");
+        int versionIndex = updatedSource.indexOf("#version");
         if (versionIndex != -1) {
-            int nextLineIndex = source.indexOf('\n', versionIndex);
+            int nextLineIndex = updatedSource.indexOf('\n', versionIndex);
             if (nextLineIndex != -1) {
                 // Insert after #version line
-                return source.substring(0, nextLineIndex + 1) + defines + source.substring(nextLineIndex + 1);
+                return updatedSource.substring(0, nextLineIndex + 1)
+                        + missingDefines
+                        + updatedSource.substring(nextLineIndex + 1);
             }
         }
         // Fallback: prepend if no #version found
-        return defines + source;
+        return missingDefines + updatedSource;
+    }
+
+    @Unique
+    private Boolean getPackRestirSetting(String source) {
+        if (source == null) {
+            return null;
+        }
+
+        for (String line : source.split("\\R")) {
+            String trimmed = line.trim();
+            String[] defineParts = trimmed.split("\\s+", 3);
+            if (defineParts.length < 2
+                    || !"#define".equals(defineParts[0])
+                    || !VULKANITE_RESTIR_DEFINE.equals(defineParts[1])) {
+                continue;
+            }
+
+            String value = defineParts.length == 3 ? defineParts[2].trim() : "";
+            int commentStart = value.indexOf("//");
+            if (commentStart >= 0) {
+                value = value.substring(0, commentStart).trim();
+            }
+
+            if (value.isEmpty()) {
+                return Boolean.TRUE;
+            }
+
+            String token = value.split("\\s+", 2)[0];
+            if ("1".equals(token) || "true".equalsIgnoreCase(token)) {
+                return Boolean.TRUE;
+            }
+            if ("0".equals(token) || "false".equalsIgnoreCase(token)) {
+                return Boolean.FALSE;
+            }
+
+            throw new IllegalArgumentException(
+                    VULKANITE_RESTIR_DEFINE + " must be defined as 0/1 or false/true");
+        }
+
+        return null;
+    }
+
+    @Unique
+    private boolean usesRestirApi(String source) {
+        return source != null
+                && (source.contains("RestirReservoir")
+                        || source.contains("initReservoir(")
+                        || source.contains("updateReservoir(")
+                        || source.contains("combineReservoir(")
+                        || source.contains("finalizeReservoir(")
+                        || source.contains("spatialReuse(")
+                        || source.contains("resolveSunShadowHistory(")
+                        || source.contains("clearSunShadowHistory("));
+    }
+
+    @Unique
+    private boolean hasVulkaniteRestirLibrary(String source) {
+        return source != null && source.contains(RESTIR_API_VERSION_MARKER);
+    }
+
+    @Unique
+    private String injectAfterExtensions(String source, String injectedSource) {
+        int insertAt = -1;
+        int lineStart = 0;
+
+        while (lineStart < source.length()) {
+            int lineEnd = source.indexOf('\n', lineStart);
+            if (lineEnd == -1) {
+                lineEnd = source.length();
+            }
+
+            String line = source.substring(lineStart, lineEnd).trim();
+            if (line.startsWith("#version") || line.startsWith("#extension")) {
+                insertAt = lineEnd < source.length() ? lineEnd + 1 : lineEnd;
+            } else if (!line.isEmpty() && insertAt >= 0) {
+                break;
+            }
+
+            lineStart = lineEnd + 1;
+        }
+
+        if (insertAt < 0) {
+            return injectedSource + "\n" + source;
+        }
+
+        return source.substring(0, insertAt)
+                + "\n// Vulkanite mod-owned ReSTIR implementation\n"
+                + injectedSource
+                + "\n// End Vulkanite ReSTIR implementation\n\n"
+                + source.substring(insertAt);
+    }
+
+    @Unique
+    private String injectRestirLibrary(String source) {
+        if (hasVulkaniteRestirLibrary(source)) {
+            return source;
+        }
+
+        try (InputStream stream = MixinProgramSet.class.getResourceAsStream(RESTIR_LIBRARY_RESOURCE)) {
+            if (stream == null) {
+                throw new IllegalStateException("Missing bundled shader library " + RESTIR_LIBRARY_RESOURCE);
+            }
+
+            String library = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+            String injected = injectAfterExtensions(source, library);
+            if (!hasVulkaniteRestirLibrary(injected)) {
+                throw new IllegalStateException("ReSTIR library injection did not provide the Vulkanite API");
+            }
+            return injected;
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to load bundled ReSTIR shader library", e);
+        }
     }
 
     @Inject(method = "<init>", at = @At("TAIL"))
@@ -49,35 +200,15 @@ public abstract class MixinProgramSet implements IGetRaytracingSource {
             ShaderProperties shaderProperties, ShaderPack pack, CallbackInfo ci) {
         System.out.println("[Vulkanite] Checking for ray tracing shaders...");
 
-        // Load DLSS config
         DLSSConfig dlssConfig = DLSSConfig.load();
         boolean enableDLSSRR = dlssConfig.isRayReconstructionEnabled();
-        boolean enableReSTIR = dlssConfig.isReSTIREnabled();
+        String firstRaygen = sourceProvider.apply(directory.resolve("ray0.rgen"));
+        Boolean packRestirSetting = getPackRestirSetting(firstRaygen);
+        boolean packUsesRestir = usesRestirApi(firstRaygen);
+        boolean enableReSTIR = dlssConfig.isReSTIREnabled()
+                && (Boolean.TRUE.equals(packRestirSetting) || packUsesRestir);
 
-        // Extract shader properties to inject as defines
         StringBuilder definesBuilder = new StringBuilder();
-        try {
-            Field variablesField = ShaderProperties.class.getDeclaredField("variables");
-            variablesField.setAccessible(true);
-            @SuppressWarnings("unchecked")
-            Map<String, String> variables = (Map<String, String>) variablesField.get(shaderProperties);
-            if (variables != null) {
-                for (Map.Entry<String, String> entry : variables.entrySet()) {
-                    // Skip defines that we control via DLSSConfig to avoid redefinition
-                    if (entry.getKey().equals("ENABLE_DLSS_RR") || entry.getKey().equals("ENABLE_RESTIR")) {
-                        continue;
-                    }
-                    definesBuilder.append("#define ").append(entry.getKey()).append(" ").append(entry.getValue())
-                            .append("\n");
-                }
-            }
-
-            System.out.println("[Vulkanite] Injected shader properties: " + definesBuilder.length() + " chars");
-        } catch (Exception e) {
-            System.err.println("[Vulkanite] Failed to extract shader properties: " + e.getMessage());
-        }
-
-        // Inject DLSSConfig settings
         definesBuilder.append("#define ENABLE_DLSS_RR ").append(enableDLSSRR ? 1 : 0).append("\n");
         definesBuilder.append("#define ENABLE_RESTIR ").append(enableReSTIR ? 1 : 0).append("\n");
 
@@ -102,11 +233,16 @@ public abstract class MixinProgramSet implements IGetRaytracingSource {
         int passId = 0;
         while (true) {
             int pass = passId++;
-            var gen = sourceProvider.apply(directory.resolve("ray" + pass + ".rgen"));
+            var gen = pass == 0 ? firstRaygen : sourceProvider.apply(directory.resolve("ray" + pass + ".rgen"));
             System.out.println("[Vulkanite] Looking for ray" + pass + ".rgen, found: " + (gen != null));
             if (gen == null)
                 break;
-            // Inject defines into raygen shader
+
+            Boolean passRestirSetting = getPackRestirSetting(gen);
+            boolean passUsesRestir = usesRestirApi(gen);
+            if (passRestirSetting != null || passUsesRestir) {
+                gen = injectRestirLibrary(gen);
+            }
             gen = injectDefines(gen, defines);
 
             List<String> missSources = new ArrayList<>();

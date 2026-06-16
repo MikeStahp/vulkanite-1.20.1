@@ -1,0 +1,1613 @@
+#version 460 core
+#extension GL_EXT_ray_query : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_nonuniform_qualifier : require
+
+#define IN_VULKANITE 1
+#define VULKANITE_RESTIR 1
+
+#ifndef HYBRID_RENDERING
+#define HYBRID_RENDERING 1
+#endif
+#ifndef ENABLE_DLSS_RR
+#define ENABLE_DLSS_RR 1
+#endif
+#ifndef ENABLE_RESTIR_TEMPORAL_REUSE
+#define ENABLE_RESTIR_TEMPORAL_REUSE 0
+#endif
+#ifndef ENABLE_RESTIR
+#define ENABLE_RESTIR 1
+#endif
+
+// The current reservoir stores only a sun-disk offset and weight; it has no
+// previous-surface history for rejecting disocclusions. Using it for the sun
+// makes the selected visibility sample change between frames. Keep ReSTIR for
+// explicit local emitters and use deterministic disk integration for the sun.
+#ifndef RESTIR_SUN_SHADOWS
+#define RESTIR_SUN_SHADOWS 0
+#endif
+
+#include "/lib/rt/payload.glsl"
+#include "/lib/rt/data.glsl"
+#include "/lib/rt/settings.glsl"
+#include "/lib/rt/pbr.glsl"
+#include "/lib/rt/sky.glsl"
+
+layout(std140, binding = 0) uniform CameraInfo {
+    // Offset 0: Corner vectors (4 * vec3, each padded to 16 bytes in std140 = 64 bytes total)
+    // Java writes: corner0 at offset 0, corner1 at offset 16, corner2 at offset 32, corner3 at offset 48
+    vec3 corners[4];
+    // Offset 64: Inverse view matrix (mat4 = 64 bytes)
+    // CRITICAL: This matrix transforms camera-relative positions to absolute world space.
+    // Used for motion vector calculation to properly handle camera rotation.
+    mat4 viewInverse;
+    // Offset 128: Sun position (vec4 = 16 bytes)
+    vec4 sunPosition;
+    // Offset 144: Moon position (vec4 = 16 bytes)
+    vec4 moonPosition;
+    // Offset 160: Frame counter (uint = 4 bytes)
+    uint frameId;
+    // Offset 164: Flags (uint = 4 bytes)
+    uint flags;
+    // Offset 168: Padding (vec2 = 8 bytes, plus implicit 8 bytes for 16-byte alignment before mat4)
+    vec2 padding1;
+    // Offset 176: Previous frame view-projection matrix (mat4 = 64 bytes)
+    // UNJITTERED: This matrix is used for motion vector calculation and does NOT include jitter.
+    // Motion vectors represent pure geometric motion; DLSS handles jitter compensation internally.
+    mat4 prevViewProj;
+    // Offset 240: Jitter data (vec4 = 16 bytes: curX, curY, prevX, prevY)
+    vec4 jitterData;
+    // Offset 256: Current unjittered view-projection matrix (mat4 = 64 bytes)
+    // Java writes this after jitterData for DLSS motion-vector generation.
+    mat4 curViewProj;
+} cam;
+
+// Push constants are separate from UBOs in Vulkan GLSL
+layout(push_constant) uniform PushConstants {
+	uint frameIndex;
+	uint sampleIndex;
+	float sunDirX;
+	float sunDirY;
+	float sunDirZ;
+	float sunColorR;
+	float sunColorG;
+	float sunColorB;
+	int enableReSTIR;
+	int debugMode;
+	int debugCellIndex; // For DLSS debug mode: which cell to display (0-5), -1 for grid view
+	int separateStableBlocklight;
+} pc;
+
+// Shader options (defaults from shaders.properties)
+// Specular Intensity [0.0 3.0]
+#ifndef SPECULAR_INTENSITY
+#define SPECULAR_INTENSITY 1.0
+#endif
+// Gamma [0.1 3.0]
+#ifndef GAMMA
+#define GAMMA 1.0
+#endif
+// Ambient Factor [0.0 1.0]
+#ifndef AMBIENT_FACTOR
+#define AMBIENT_FACTOR 0.05
+#endif
+// Sun Intensity [0.0 1.8 2.5 3.0 3.4 4.0 5.0 6.0]
+#ifndef SUN_INTENSITY
+#define SUN_INTENSITY 3.4
+#endif
+// Linear HDR exposure before denoise/upscale [0.6 0.75 0.85 0.92 1.0 1.15 1.35]
+#ifndef HDR_EXPOSURE
+#define HDR_EXPOSURE 0.92
+#endif
+// Linear color saturation [0.75 0.9 1.0 1.06 1.15 1.25 1.4]
+#ifndef COLOR_SATURATION
+#define COLOR_SATURATION 1.06
+#endif
+// Linear contrast around middle gray [0.85 0.95 1.0 1.03 1.08 1.15]
+#ifndef COLOR_CONTRAST
+#define COLOR_CONTRAST 1.03
+#endif
+// Indirect Scale [0.0 2.0]
+#ifndef INDIRECT_SCALE
+#define INDIRECT_SCALE 0.6
+#endif
+// Minimum Lighting [0.0 1.0]
+#ifndef MIN_LIGHTING
+#define MIN_LIGHTING 0.05
+#endif
+// Blocklight visual range/intensity. These operate on the Minecraft lightmap
+// signal before DLSS so low local-light levels keep texture detail instead of
+// being reconstructed as muddy, underlit color.
+#ifndef BLOCKLIGHT_VISUAL_RANGE
+#define BLOCKLIGHT_VISUAL_RANGE 1.45
+#endif
+#ifndef BLOCKLIGHT_VISUAL_INTENSITY
+#define BLOCKLIGHT_VISUAL_INTENSITY 8.0
+#endif
+#ifndef BLOCKLIGHT_LOW_FLOOR
+#define BLOCKLIGHT_LOW_FLOOR 0.08
+#endif
+// Soft shadow controls. A larger source radius makes the penumbra visible,
+// while the diffuse blend keeps contact shadows stable.
+#ifndef PENUMBRA_RADIUS
+#define PENUMBRA_RADIUS 0.034
+#endif
+#ifndef PENUMBRA_SAMPLES
+#define PENUMBRA_SAMPLES 8
+#endif
+#ifndef PENUMBRA_DIFFUSE_BLEND
+#define PENUMBRA_DIFFUSE_BLEND 0.75
+#endif
+
+
+layout(binding = 1) uniform accelerationStructureEXT acc;
+
+// Block textures
+layout(binding = 3) uniform sampler2D blockTex;
+layout(binding = 4) uniform sampler2D blockTexNormal;
+layout(binding = 5) uniform sampler2D blockTexSpecular;
+
+layout(set = 1, binding = 0, std430) readonly buffer Quads {
+    Quad quads[];
+} geometryBuffers[];
+
+// ReSTIR reservoir images are declared by Vulkanite's injected library.
+
+// Final output image - RGBA16F for DLSS HDR compatibility
+// DLSS Ray Reconstruction expects floating-point input when IsHDR flag is set
+layout(binding = 12, rgba16f) uniform image2D outputImage;
+layout(binding = 21, rgba16f) uniform image2D blocklightDetailImage;
+
+#if ENABLE_DLSS_RR
+// DLSS Motion Vectors (RG16F) - pixel-space motion for temporal reprojection
+layout(binding = 13, rg16f) uniform image2D motionVectors;
+// Linear depth for DLSS Ray Reconstruction
+layout(binding = 14, r16f) uniform image2D linearDepthImage;
+// Radiance-style DLSS/RR material guide sidecars.
+layout(binding = 16, rgba8) uniform image2D DiffuseAlbedoMetallic;
+layout(binding = 17, rgba8) uniform image2D SpecularAlbedo;
+layout(binding = 18, rgba16f) uniform image2D NormalRoughness;
+layout(binding = 19, r16f) uniform image2D SpecularHitDepth;
+layout(binding = 20, r16f) uniform image2D FirstHitDepth;
+#endif
+
+// prevReservoirImage (binding 15) is declared by Vulkanite's injected library.
+
+// G-Buffer textures for hybrid rendering
+#if HYBRID_RENDERING
+layout(binding = 7) uniform sampler2D gbufferAlbedo;      // colortex1 - Albedo
+layout(binding = 8) uniform sampler2D gbufferMaterial;     // colortex2 - Material (roughness, metallic, specular, emission)
+layout(binding = 9) uniform sampler2D gbufferNormal;       // colortex3 - Normal
+layout(binding = 10) uniform sampler2D gbufferWorldPos;    // colortex4 - World position
+layout(binding = 11) uniform sampler2D gbufferExtra;       // colortex5 - Additional Properties (Specular)
+#endif
+
+// Ray payloads
+layout(location = 1) rayPayloadEXT float shadowPayload;
+layout(location = 0) rayPayloadEXT Payload payload;
+
+bool finiteVec4(vec4 v) {
+    return !any(isnan(v)) && !any(isinf(v));
+}
+
+bool validHybridSample(vec4 gPos, vec4 gNormalRaw, vec4 gAlbedoRaw, vec4 gMaterialRaw, vec4 gExtraRaw) {
+    if (!finiteVec4(gPos) || !finiteVec4(gNormalRaw) || !finiteVec4(gAlbedoRaw) ||
+        !finiteVec4(gMaterialRaw) || !finiteVec4(gExtraRaw)) {
+        return false;
+    }
+
+    float normalLen2 = dot(gNormalRaw.xyz, gNormalRaw.xyz);
+    bool hasPosition = gPos.w > 0.0 || dot(gPos.xyz, gPos.xyz) > 0.000001;
+    bool hasNormal = normalLen2 > 0.25 && normalLen2 < 4.0;
+    bool hasMaterial = gMaterialRaw.a >= 0.0 && gMaterialRaw.a <= 1.5;
+    return hasPosition && hasNormal && hasMaterial;
+}
+
+vec2 queryFragmentUv(Quad quad, uint primitiveIndex, vec2 barycentrics) {
+    bool sideA = (primitiveIndex & 1u) == 0u;
+    vec3 bary = vec3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
+    vec2 uv0 = vec2(quad.vertices[0].block_texture);
+    vec2 uv1 = vec2(sideA ? quad.vertices[1].block_texture : quad.vertices[2].block_texture);
+    vec2 uv2 = vec2(sideA ? quad.vertices[2].block_texture : quad.vertices[3].block_texture);
+    return (uv0 * bary.x + uv1 * bary.y + uv2 * bary.z)
+        * (ATLAS_SCALE / 65536.0);
+}
+
+float alphaAwareVisibility(vec3 rayOrigin, vec3 rayDirection, float rayDistance) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(
+        query,
+        acc,
+        gl_RayFlagsTerminateOnFirstHitEXT,
+        0xFF,
+        rayOrigin,
+        0.001,
+        rayDirection,
+        rayDistance);
+
+    while (rayQueryProceedEXT(query)) {
+        uint sbtOffset = rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(query, false);
+        if (sbtOffset != 0u) {
+            rayQueryConfirmIntersectionEXT(query);
+            continue;
+        }
+
+        uint geometryIndex = nonuniformEXT(
+            rayQueryGetIntersectionInstanceCustomIndexEXT(query, false)
+            + rayQueryGetIntersectionGeometryIndexEXT(query, false));
+        uint primitiveIndex = rayQueryGetIntersectionPrimitiveIndexEXT(query, false);
+        Quad quad = geometryBuffers[geometryIndex].quads[primitiveIndex >> 1u];
+        float blockId = float(quad.vertices[0].block_id.x);
+
+        if (isWaterMaterial(blockId) || isGlassMaterial(blockId) || isIceMaterial(blockId)) {
+            continue;
+        }
+
+        vec2 uv = queryFragmentUv(
+            quad,
+            primitiveIndex,
+            rayQueryGetIntersectionBarycentricsEXT(query, false));
+        float alpha = textureLod(blockTex, uv, 0.0).a;
+        float threshold = isFoliageMaterial(blockId) ? 0.5 : 0.1;
+        if (alpha >= threshold) {
+            rayQueryConfirmIntersectionEXT(query);
+        }
+    }
+
+    return rayQueryGetIntersectionTypeEXT(query, true) == 0 ? 1.0 : 0.0;
+}
+
+vec3 applyLinearColorGrade(vec3 color) {
+    color = max(color, vec3(0.0)) * HDR_EXPOSURE;
+    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    color = mix(vec3(luma), color, COLOR_SATURATION);
+    color = (color - vec3(0.18)) * COLOR_CONTRAST + vec3(0.18);
+    return max(color, vec3(0.0));
+}
+
+float radicalInverse(uint bits) {
+    return float(bitfieldReverse(bits)) * 2.3283064365386963e-10;
+}
+
+vec3 stratifiedCosineHemisphere(vec3 normal, int sampleIndex, uint seed) {
+    float u = (float(sampleIndex) + 0.5) / float(BLOCKLIGHT_SAMPLES);
+    float rotation = float(seed & 0x00ffffffu) * (1.0 / 16777216.0);
+    float v = fract(radicalInverse(uint(sampleIndex)) + rotation);
+    float radius = sqrt(u);
+    float angle = TWO_PI * v;
+
+    vec3 tangent;
+    vec3 bitangent;
+    createOrthonormalBasis(normal, tangent, bitangent);
+    return normalize(
+        tangent * (radius * cos(angle))
+        + bitangent * (radius * sin(angle))
+        + normal * sqrt(max(1.0 - u, 0.0)));
+}
+
+float volumetricPhase(float cosTheta) {
+    float g = clamp(VOLUMETRIC_ANISOTROPY, 0.0, 0.95);
+    float g2 = g * g;
+    float denominator = max(1.0 + g2 - 2.0 * g * cosTheta, 1e-4);
+    return (1.0 - g2) / (4.0 * PI * denominator * sqrt(denominator));
+}
+
+vec4 integrateVolumetrics(
+    vec3 rayOrigin,
+    vec3 rayDirection,
+    float rayDistance,
+    vec3 sunDirection,
+    vec3 sunRadiance,
+    uint seed
+) {
+#if VOLUMETRICS_ENABLED == 0
+    return vec4(0.0, 0.0, 0.0, 1.0);
+#else
+    float marchDistance = min(max(rayDistance, 0.0), VOLUMETRIC_DISTANCE);
+    if (marchDistance <= 0.001 || VOLUMETRIC_DENSITY <= 0.0 || VOLUMETRIC_INTENSITY <= 0.0) {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+
+    float stepLength = marchDistance / float(VOLUMETRIC_SAMPLES);
+    float jitter = float(hashUint(seed, 0x68bc21ebu) & 0x00ffffffu) * (1.0 / 16777216.0);
+    float stepTransmittance = exp(-VOLUMETRIC_DENSITY * stepLength);
+    float transmittance = 1.0;
+    float phase = volumetricPhase(dot(rayDirection, sunDirection));
+    vec3 ambientScatter = mix(vec3(0.025, 0.035, 0.055), sunRadiance * 0.06,
+        smoothstep(-0.1, 0.4, sunDirection.y));
+    vec3 scattering = vec3(0.0);
+
+    for (int i = 0; i < VOLUMETRIC_SAMPLES; i++) {
+        float distanceAlongRay = (float(i) + jitter) * stepLength;
+        vec3 samplePosition = rayOrigin + rayDirection * distanceAlongRay;
+        float sunVisibility = 1.0;
+
+#if VOLUMETRIC_SHADOWS == 1
+        sunVisibility = alphaAwareVisibility(samplePosition, sunDirection, 10000.0);
+#endif
+
+        vec3 incident = ambientScatter + sunRadiance * sunVisibility * phase;
+        scattering += transmittance * (1.0 - stepTransmittance)
+            * incident * VOLUMETRIC_INTENSITY;
+        transmittance *= stepTransmittance;
+    }
+
+    return vec4(max(scattering, vec3(0.0)), clamp(transmittance, 0.0, 1.0));
+#endif
+}
+
+// ============================================================================
+// RT Blocklight Sampling Function
+// Samples nearby emissive blocks (torches, lanterns, lava, etc.) via ray tracing
+// Based on dirtrtold implementation with full PBR BRDF evaluation
+// ============================================================================
+
+vec3 sampleBlockLightRT(vec3 ro, vec3 normal, vec3 albedo, vec3 F0, 
+                        float roughness, float metallic, vec3 viewDir, 
+                        float specularIntensity, inout uint seed) {
+    vec3 rayOrigin = ro + normal * 0.02;
+    vec3 totalContrib = vec3(0.0);
+    
+    float NdotV = max(dot(normal, viewDir), 0.001);
+    
+    for (int i = 0; i < BLOCKLIGHT_SAMPLES; i++) {
+        // Keep local-light samples stable in world space. Frame-varying samples
+        // made stationary emissive lighting crawl and forced RR to blur block edges.
+        vec3 sampleDir = stratifiedCosineHemisphere(normal, i, seed);
+
+        rayQueryEXT query;
+        rayQueryInitializeEXT(
+            query,
+            acc,
+            gl_RayFlagsNoneEXT,
+            0xFF,
+            rayOrigin,
+            0.001,
+            sampleDir,
+            BLOCKLIGHT_MAX_DISTANCE);
+
+        while (rayQueryProceedEXT(query)) {
+            uint sbtOffset = rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(query, false);
+            if (sbtOffset != 0u) {
+                continue;
+            }
+
+            uint geometryIndex = nonuniformEXT(
+                rayQueryGetIntersectionInstanceCustomIndexEXT(query, false)
+                + rayQueryGetIntersectionGeometryIndexEXT(query, false));
+            uint primitiveIndex = rayQueryGetIntersectionPrimitiveIndexEXT(query, false);
+            Quad quad = geometryBuffers[geometryIndex].quads[primitiveIndex >> 1u];
+            float blockId = float(quad.vertices[0].block_id.x);
+
+            if (isWaterMaterial(blockId) || isGlassMaterial(blockId) || isIceMaterial(blockId)) {
+                continue;
+            }
+
+            vec2 uv = queryFragmentUv(
+                quad,
+                primitiveIndex,
+                rayQueryGetIntersectionBarycentricsEXT(query, false));
+            float alpha = textureLod(blockTex, uv, 0.0).a;
+            float threshold = isFoliageMaterial(blockId) ? 0.5 : 0.1;
+            if (alpha >= threshold) {
+                rayQueryConfirmIntersectionEXT(query);
+            }
+        }
+
+        if (rayQueryGetIntersectionTypeEXT(query, true) == 0u) continue;
+
+        uint geometryIndex = nonuniformEXT(
+            rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)
+            + rayQueryGetIntersectionGeometryIndexEXT(query, true));
+        uint primitiveIndex = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+        Quad quad = geometryBuffers[geometryIndex].quads[primitiveIndex >> 1u];
+        float blockId = float(quad.vertices[0].block_id.x);
+        vec2 uv = queryFragmentUv(
+            quad,
+            primitiveIndex,
+            rayQueryGetIntersectionBarycentricsEXT(query, true));
+
+        float hitDistance = rayQueryGetIntersectionTEXT(query, true);
+        if (hitDistance > BLOCKLIGHT_MAX_DISTANCE) continue;
+
+        vec4 shadeColor = quad.vertices[0].color * (1.0 / 255.0);
+        vec4 hitAlbedo = textureLod(blockTex, uv, 0.0);
+        vec4 hitSpecular = sanitizeLabPbrSpecular(samplePbrTexel(blockTexSpecular, uv));
+        hitAlbedo.rgb = pow(hitAlbedo.rgb * shadeColor.rgb, vec3(2.2));
+
+        bool hasHitLabPbrEmission = hasExplicitLabPbrEmission(hitSpecular.a);
+        float labPbrEmission = decodeLabPbrEmission(hitSpecular.a);
+        vec3 hitEmission = hasHitLabPbrEmission
+            ? hitAlbedo.rgb * labPbrEmission * EMISSION_INTENSITY * EMISSIVE_SURFACE_INTENSITY
+            : vec3(0.0);
+        float emissionLuma = dot(hitEmission, vec3(0.299, 0.587, 0.114));
+        if (emissionLuma < 0.001) continue;
+        
+        // Physical attenuation (inverse square law)
+        float dist2 = hitDistance * hitDistance;
+        float attenuation = 1.0 / (1.0 + dist2 * BLOCKLIGHT_FALLOFF);
+        
+        // BRDF evaluation for blocklight contribution
+        vec3 L = sampleDir;
+        vec3 H = normalize(viewDir + L);
+        float NdotL = max(dot(normal, L), 0.0);
+        float NdotH = max(dot(normal, H), 0.0);
+        float HdotV = max(dot(H, viewDir), 0.0);
+        
+        // Diffuse (Lambert) - only for non-metals
+        vec3 diffuse = (1.0 - metallic) * albedo * INV_PI;
+        
+        // Specular (GGX) - for surfaces with specular
+        vec3 specular = vec3(0.0);
+        if (specularIntensity > 0.001 && NdotL > 0.0) {
+            float clampedRoughness = max(roughness, 0.04);
+            float D = distributionGGX(NdotH, clampedRoughness);
+            float G = geometrySmith(NdotV, NdotL, clampedRoughness);
+            vec3 F = fresnelSchlick(HdotV, F0);
+            specular = F * D * G / (4.0 * NdotV * NdotL + 0.001);
+        }
+        
+        vec3 brdf = diffuse + specular * specularIntensity;
+        
+        // Unbiased estimate using cosine-weighted importance sampling
+        // PDF for cosine-weighted hemisphere = NdotL / PI
+        // Contribution = (BRDF * L * NdotL * Atten) / PDF = BRDF * L * PI * Atten
+        vec3 sampleContrib = brdf * hitEmission * PI * attenuation * BLOCKLIGHT_EMISSION_SCALE;
+        
+        totalContrib += sampleContrib;
+    }
+    
+	// Return average contribution from all samples
+	return BLOCKLIGHT_SAMPLES > 0 ? max(vec3(0.0), totalContrib / float(BLOCKLIGHT_SAMPLES)) : vec3(0.0);
+}
+
+vec3 traceSimpleRadiance(
+    vec3 rayOrigin,
+    vec3 rayDirection,
+    vec3 sunDirection,
+    vec3 sunRadiance,
+    float ignoredBlockId,
+    out float hitDistance
+) {
+    payload.hitData = vec4(0.0, 0.0, 0.0, -1.0);
+    payload.material.albedo = vec3(0.0);
+    payload.material.emission = vec3(0.0);
+    payload.material.F0 = vec3(0.04);
+    payload.material.metallic = 0.0;
+    payload.material.roughness = 1.0;
+    payload.material.normal = vec3(0.0, 1.0, 0.0);
+    payload.material.ambientOcclusion = 1.0;
+    payload.material.block_id = i16vec2(0);
+    payload.ignore_block_id = i16vec2(int(ignoredBlockId), 0);
+    payload.inside_block = false;
+    payload.prev_distance = 0.0;
+
+    traceRayEXT(
+        acc,
+        gl_RayFlagsNoneEXT,
+        0xFF,
+        0,
+        0,
+        0,
+        rayOrigin,
+        0.001,
+        rayDirection,
+        REFLECTION_RAY_DISTANCE,
+        0);
+
+    if (payload.hitData.w < 0.0) {
+        hitDistance = 10000.0;
+        return max(payload.hitData.xyz, vec3(0.0));
+    }
+
+    hitDistance = payload.hitData.w;
+    vec3 hitNormal = normalize(payload.material.normal);
+    float nDotL = max(dot(hitNormal, sunDirection), 0.0);
+    float visibility = nDotL > 0.0
+        ? alphaAwareVisibility(payload.hitData.xyz + hitNormal * 0.02, sunDirection, 10000.0)
+        : 0.0;
+    vec3 surfaceColor = mix(
+        payload.material.albedo,
+        payload.material.F0,
+        clamp(payload.material.metallic, 0.0, 1.0));
+    float hitAo = clamp(payload.material.ambientOcclusion, 0.0, 1.0);
+    vec3 ambient = surfaceColor * (0.025 + 0.04 * hitAo);
+    return max(
+        payload.material.emission
+        + surfaceColor * sunRadiance * nDotL * visibility * 0.55
+        + ambient,
+        vec3(0.0));
+}
+
+// ============================================================================
+// DLSS Debug Cell Content Helper
+// ============================================================================
+
+vec3 hsv2rgb(vec3 c) {
+    vec4 K = vec4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    vec3 p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
+}
+
+// Returns the debug visualization for a specific DLSS cell
+// cellIndex: 0=Albedo, 1=Normals, 2=Depth, 3=Motion, 4=Roughness, 5=Specular F0, 6=Jitter Viewer, 7=Final Color, 8=Extras
+vec4 getDLSSDebugCellContent(int cellIndex, bool hit, vec3 albedo, vec3 normal, vec3 worldPos, vec3 origin, float roughness, vec3 F0, bool cameraRelativePos, vec2 cellUV, vec2 motionVec, vec3 finalLighting, vec2 launchSize, vec4 gExtraRaw) {
+	if (cellIndex == 0) {
+		// Cell 0: Albedo (Diffuse Color)
+		if (hit) {
+			return vec4(albedo, 1.0);
+		} else {
+			return vec4(0.0, 1.0, 1.0, 1.0); // Cyan for sky
+		}
+	} else if (cellIndex == 1) {
+		// Cell 1: Normals (World-Space)
+		if (hit) {
+			vec3 normalColor = normal * 0.5 + 0.5;
+			return vec4(normalColor, 1.0);
+		} else {
+			return vec4(1.0, 0.0, 1.0, 1.0); // Magenta for sky
+		}
+	} else if (cellIndex == 2) {
+		// Cell 2: Linear Depth
+		if (hit) {
+			float linearDepth = cameraRelativePos ? length(worldPos) : length(worldPos - origin);
+			float normalizedDepth = clamp(linearDepth / 100.0, 0.0, 1.0);
+			float depthValue = 1.0 - normalizedDepth;
+			return vec4(depthValue * 0.5, depthValue * 0.8, depthValue, 1.0);
+		} else {
+			return vec4(1.0, 0.0, 0.0, 1.0); // Red for sky (far)
+		}
+	} else if (cellIndex == 3) {
+		// Cell 3: Motion Vectors (Optical Flow Visualization)
+		#if ENABLE_DLSS_RR
+		float magnitude = length(motionVec);
+        if (magnitude < 0.001) {
+            return vec4(0.0, 0.0, 0.0, 1.0);
+        }
+        float angle = atan(motionVec.y, motionVec.x);
+        float hue = angle / (2.0 * 3.14159265) + 0.5;
+        float value = clamp(magnitude / 10.0, 0.0, 1.0);
+        value = pow(value, 0.5); 
+		return vec4(hsv2rgb(vec3(hue, 1.0, value)), 1.0);
+		#else
+		return vec4(0.1, 0.1, 0.1, 1.0);
+		#endif
+	} else if (cellIndex == 4) {
+		// Cell 4: Roughness
+		if (hit) {
+			float roughnessVis = (roughness - 0.04) / 0.96;
+			return vec4(vec3(roughnessVis), 1.0);
+		} else {
+			return vec4(0.0, 0.0, 0.0, 1.0); // Black for sky
+		}
+	} else if (cellIndex == 5) {
+		// Cell 5: Specular Albedo (F0)
+		if (hit) {
+			vec3 f0Vis = F0 * 2.0;
+			return vec4(f0Vis, 1.0);
+		} else {
+			return vec4(0.0, 0.0, 0.5, 1.0); // Dark blue for sky
+		}
+	} else if (cellIndex == 6) {
+		// Cell 6: Jitter Viewer
+		vec2 center = vec2(0.5);
+		vec2 jitterOffset = cam.jitterData.xy * 0.8; 
+		vec2 targetPos = center + jitterOffset;
+		float dist = length(cellUV - targetPos);
+		
+        float rx = clamp(cam.jitterData.x + 0.5, 0.0, 1.0);
+        float ry = clamp(cam.jitterData.y + 0.5, 0.0, 1.0);
+		vec4 finalColor = vec4(rx * 0.2, ry * 0.2, 0.1, 1.0);
+		
+		if (fract(cellUV.x * 10.0) < 0.05 || fract(cellUV.y * 10.0) < 0.05) {
+            finalColor = vec4(0.2, 0.2, 0.2, 1.0);
+        }
+		if (abs(cellUV.x - 0.5) < 0.005 || abs(cellUV.y - 0.5) < 0.005) {
+			finalColor = vec4(0.5, 0.5, 0.5, 1.0);
+		}
+		if (dist < 0.03) {
+			finalColor = vec4(1.0, 0.5, 0.0, 1.0);
+		}
+		
+		return finalColor;
+	} else if (cellIndex == 7) {
+        // Cell 7: Final Noisy Lighting
+        return vec4(finalLighting, 1.0);
+    } else {
+        // Cell 8: G-buffer Extras (Blocklight, Skylight, AO)
+        return vec4(clamp(gExtraRaw.rgb, 0.0, 1.0), 1.0);
+	}
+}
+
+#if ENABLE_DLSS_RR
+void writeRadianceDlssSidecars(
+    ivec2 pixel,
+    vec3 diffuseAlbedo,
+    float metallic,
+    vec3 specularAlbedo,
+    vec3 normal,
+    float roughness,
+    float firstHitDepth,
+    float specularHitDepth
+) {
+    imageStore(DiffuseAlbedoMetallic, pixel,
+        vec4(clamp(diffuseAlbedo, vec3(0.0), vec3(1.0)), clamp(metallic, 0.0, 1.0)));
+    imageStore(SpecularAlbedo, pixel,
+        vec4(clamp(specularAlbedo, vec3(0.0), vec3(1.0)), 1.0));
+    imageStore(NormalRoughness, pixel,
+        vec4(normalize(normal) * 0.5 + 0.5, clamp(roughness, 0.04, 1.0)));
+    imageStore(FirstHitDepth, pixel, vec4(max(firstHitDepth, 0.0)));
+    imageStore(SpecularHitDepth, pixel, vec4(max(specularHitDepth, 0.0)));
+}
+
+void writeSkyDlssSidecars(ivec2 pixel) {
+    imageStore(DiffuseAlbedoMetallic, pixel, vec4(0.0));
+    imageStore(SpecularAlbedo, pixel, vec4(0.0));
+    imageStore(NormalRoughness, pixel, vec4(0.5, 1.0, 0.5, 1.0));
+    imageStore(FirstHitDepth, pixel, vec4(10000.0));
+    imageStore(SpecularHitDepth, pixel, vec4(10000.0));
+}
+#endif
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+vec2 launchSize = vec2(gl_LaunchSizeEXT.xy);
+ivec2 screenCoord = ivec2(gl_LaunchIDEXT.xy);
+imageStore(blocklightDetailImage, screenCoord, vec4(0.0));
+#if ENABLE_DLSS_RR
+writeSkyDlssSidecars(screenCoord);
+#endif
+vec2 p = (vec2(screenCoord) + 0.5) / launchSize;
+
+// Store original values before any remapping
+vec2 originalP = p;
+ivec2 originalPixelCoord = screenCoord;
+
+// Determine which quadrant/cell we're in (for debug mode)
+// Debug mode 1 (DLSS): 2x3 grid showing DLSSD inputs
+// Debug mode 2 (BUFFERS): 2x2 quadrant layout
+//
+// DLSS Layout (3x3 grid):
+// +-----------+-----------+-----------+
+// | Cell 0    | Cell 1    | Cell 2    |
+// | Albedo    | Normals   | Depth     |
+// +-----------+-----------+-----------+
+// | Cell 3    | Cell 4    | Cell 5    |
+// | Motion Vec| Roughness | Spec F0   |
+// +-----------+-----------+-----------+
+// | Cell 6    | Blank     | Blank     |
+// | Jitter    |           |           |
+// +-----------+-----------+-----------+
+//
+// BUFFERS Layout (2x2 quadrants):
+// Q2 (normals) | Q3 (final)
+// -----------------|------------------
+// Q0 (depth) | Q1 (motion vec)
+int quadrant = 0;
+int dlssCell = 0;
+if (pc.debugMode == 1) {
+    // DLSS debug mode: 3x3 grid (3 columns, 3 rows)
+    int cellX = int(p.x * 3.0);
+    int cellY = int(p.y * 3.0);
+    cellX = clamp(cellX, 0, 2);
+    cellY = clamp(cellY, 0, 2);
+    dlssCell = cellY * 3 + cellX;
+} else if (pc.debugMode == 2) {
+    // BUFFERS debug mode: 2x2 quadrants
+    // Note: In Vulkan, Y is inverted, but we're working in UV space which is [0,1]
+    if (p.x >= 0.5) quadrant += 1; // Right half
+    if (p.y >= 0.5) quadrant += 2; // Bottom half (in Vulkan Y-down)
+}
+
+  vec3 origin = cam.viewInverse[3].xyz;
+  vec3 corner0 = cam.corners[0];
+  vec3 corner1 = cam.corners[1];
+  vec3 corner2 = cam.corners[2];
+  vec3 corner3 = cam.corners[3];
+  
+  // In debug mode, we need to render the full scene for quadrant 3 (final lighting)
+  // For other quadrants, we still need to trace rays to get valid data
+  // So we always use the original UV for ray tracing
+ vec2 rayP = originalP;
+
+ // Corners from the UBO are unjittered; apply the current subpixel jitter at
+ // ray generation, matching Radiance's pixelCenter += cameraJitter path.
+ // Motion vectors remain unjittered below because NGX receives jitter separately.
+ vec2 rayUv = rayP + (cam.jitterData.xy / launchSize);
+  
+  vec3 target = mix(mix(corner0, corner2, rayUv.y), mix(corner1, corner3, rayUv.y), rayUv.x);
+  vec3 direction = normalize((cam.viewInverse * vec4(target, 0.0)).xyz);
+  
+  ivec2 pixelCoord = ivec2(rayP * launchSize);
+
+  // Initialize payload
+  payload.hitData = vec4(0, 0, 0, -1);
+  payload.geometryNormal = vec3(0);
+  payload.material.albedo = vec3(0);
+  payload.material.emission = vec3(0);
+  payload.material.roughness = 1.0;
+  payload.material.metallic = 0.0;
+  payload.material.F0 = vec3(0.04);
+  payload.material.normal = vec3(0, 1, 0);
+  payload.material.block_id = i16vec2(0);
+  payload.material.ambientOcclusion = 1.0;
+  payload.material.translucent = 1.0;
+  payload.shadowTransmission = vec3(1);
+  payload.ignore_block_id = i16vec2(0);
+  payload.inside_block = false;
+  payload.prev_distance = 0.0;
+  
+  vec3 albedo;
+  vec3 normal;
+  vec3 worldPos;
+  vec3 directEmission = vec3(0.0);
+  float roughness = 1.0;
+  float metallic = 0.0;
+  float ao = 1.0;
+  vec3 F0 = vec3(0.04);
+  float blockId = 0.0;
+  float surfaceAlpha = 1.0;
+  bool hit = false;
+  bool cameraRelativePos = false;
+  
+  // Declare G-buffer variables outside the conditional block so they're accessible throughout the shader
+  // These will be populated by HYBRID_RENDERING or remain as default values
+  vec4 gExtraRaw = vec4(0.0); // Blocklight (R), Skylight (G), AO (B), encoded emission (A)
+  
+  #if HYBRID_RENDERING
+  // Force sampling of all G-buffers to ensure bindings are active
+  // This prevents the compiler from optimizing them out if HYBRID_RENDERING logic is conditional
+  // Use original UV coordinates for G-buffer sampling (not remapped quadrant coordinates)
+  //
+  // G-buffer layout (updated for proper PBR):
+  // colortex1 (gbufferAlbedo): Albedo RGB, Alpha in A
+  // colortex2 (gbufferMaterial): F0 reflectance RGB, roughness in A
+  // colortex3 (gbufferNormal): Signed unit normal RGB, roughness packed in A
+  // colortex4 (gbufferWorldPos): World position RGB, metallic flag in A
+  // colortex5 (gbufferExtra): Blocklight (R), Skylight (G), AO (B), encoded emission (A)
+  // These textures encode one discrete first-hit surface per pixel. Filtering
+  // across silhouettes mixes unrelated normals, materials, and positions.
+  vec4 gPos = texelFetch(gbufferWorldPos, clamp(originalPixelCoord, ivec2(0), textureSize(gbufferWorldPos, 0) - 1), 0);
+  vec4 gNormalRaw = texelFetch(gbufferNormal, clamp(originalPixelCoord, ivec2(0), textureSize(gbufferNormal, 0) - 1), 0);
+  vec4 gAlbedoRaw = texelFetch(gbufferAlbedo, clamp(originalPixelCoord, ivec2(0), textureSize(gbufferAlbedo, 0) - 1), 0);
+  vec4 gMaterialRaw = texelFetch(gbufferMaterial, clamp(originalPixelCoord, ivec2(0), textureSize(gbufferMaterial, 0) - 1), 0);
+  gExtraRaw = texelFetch(gbufferExtra, clamp(originalPixelCoord, ivec2(0), textureSize(gbufferExtra, 0) - 1), 0);
+
+    // Use the sampled values (even if trivially) to ensure they contribute to the output
+    // In a real scenario, these would be used for shading.
+    // Here we use them to populate the payload if a valid hit is found.
+    if (validHybridSample(gPos, gNormalRaw, gAlbedoRaw, gMaterialRaw, gExtraRaw)) {
+        worldPos = gPos.xyz;
+        cameraRelativePos = true;
+        normal = normalize(gNormalRaw.xyz);
+        
+        blockId = decodeGbufferBlockId(gPos.w);
+        metallic = blockId > 0.0 ? 0.0 : clamp(gPos.w, 0.0, 1.0);
+        
+        // Read F0 reflectance
+        F0 = clamp(gMaterialRaw.rgb, vec3(0.0), vec3(1.0));
+        roughness = clamp(gMaterialRaw.a, 0.04, 1.0);
+
+        // For metals: albedo is used as base color, combined with F0 for colored metals
+        // For dielectrics: albedo is the diffuse color
+        // The PBR shader handles this properly via the (1.0 - metallic) term in diffuse
+        albedo = max(gAlbedoRaw.rgb, vec3(0.0));
+        surfaceAlpha = clamp(gAlbedoRaw.a, 0.0, 1.0);
+
+        // AO from colortex5.b
+        ao = clamp(gExtraRaw.b, 0.0, 1.0);
+
+        applyBlockMaterialOverrides(blockId, albedo, F0, metallic, roughness);
+        directEmission = hasEncodedLabPbrEmission(gExtraRaw.a)
+            ? visibleEmissionRadiance(
+                albedo
+                * decodeEncodedLabPbrEmission(gExtraRaw.a)
+                * EMISSION_INTENSITY
+                * EMISSIVE_SURFACE_INTENSITY)
+            : vec3(0.0);
+
+        hit = true;
+    }
+#endif
+
+  if (!hit) {
+    traceRayEXT(acc, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, origin, 0.001, direction, 10000.0, 0);
+    if (payload.hitData.w >= 0.0) {
+      worldPos = payload.hitData.xyz;
+      cameraRelativePos = false;
+      normal = normalize(payload.material.normal);
+      albedo = payload.material.albedo;
+      directEmission = payload.material.emission;
+      roughness = payload.material.roughness;
+      metallic = payload.material.metallic;
+      ao = payload.material.ambientOcclusion;
+      F0 = payload.material.F0;
+      blockId = float(payload.material.block_id.x);
+      surfaceAlpha = clamp(payload.material.translucent, 0.0, 1.0);
+      applyBlockMaterialOverrides(blockId, albedo, F0, metallic, roughness);
+      hit = true;
+    }
+  }
+
+  // Calculate sun direction and color globally for sky and lighting
+  vec3 sunDirView = vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ);
+  if (dot(sunDirView, sunDirView) < 0.000001) sunDirView = vec3(0.5, 1.0, 0.2); // Default
+  vec3 lightDir = normalize(mat3(cam.viewInverse) * normalize(sunDirView));
+  // Apply sun elevation-based color temperature for natural lighting
+  // Low sun = warm orange (sunset/sunrise), high sun = neutral white
+  vec3 baseSunColor = vec3(pc.sunColorR, pc.sunColorG, pc.sunColorB) * SUN_INTENSITY;
+  vec3 sunColor = getSunColorFromElevation(lightDir, baseSunColor);
+
+  vec4 color;
+  vec2 motionVec = vec2(0.0);
+  if (!hit) {
+#if RESTIR_SUN_SHADOWS == 1
+    clearSunShadowHistory(originalPixelCoord);
+#endif
+    // Sky color with procedural gradient and sun glow
+    uint volumeSeed = hashUint(
+        uint(originalPixelCoord.x + originalPixelCoord.y * int(launchSize.x)),
+        0x68bc21ebu);
+    vec4 volume = integrateVolumetrics(
+        origin,
+        direction,
+        VOLUMETRIC_DISTANCE,
+        lightDir,
+        sunColor,
+        volumeSeed);
+    vec3 moonDir = normalize(cam.moonPosition.xyz);
+    color = vec4(getSkyColor(
+        direction,
+        lightDir,
+        moonDir,
+        sunColor,
+        float(cam.frameId) * 0.016) * volume.a + volume.rgb, 1.0);
+    
+#if ENABLE_DLSS_RR
+    // Treat sky as infinitely distant for DLSS/RR guide buffers. Reprojecting a
+    // finite far point injects huge motion into the history, especially at distance.
+    motionVec = vec2(0.0);
+    imageStore(motionVectors, originalPixelCoord, vec4(motionVec, 0.0, 0.0));
+    imageStore(linearDepthImage, originalPixelCoord, vec4(10000.0)); // Sky depth should be far away, not 0.0
+    writeSkyDlssSidecars(originalPixelCoord);
+#endif
+  } else {
+    // Keep all secondary-ray work in absolute world space. The hybrid G-buffer
+    // stores camera-relative positions, while the TLAS and camera origin are absolute.
+    vec3 shadingWorldPos = cameraRelativePos ? (worldPos + origin) : worldPos;
+    bool waterSurface = isWaterMaterial(blockId);
+    bool glassSurface = isGlassMaterial(blockId);
+    bool iceSurface = isIceMaterial(blockId);
+    bool crystalSurface = isCrystalMaterial(blockId);
+    bool thinTransparentSurface = surfaceAlpha < 0.98
+        && !isFoliageMaterial(blockId)
+        && !waterSurface
+        && !glassSurface
+        && !iceSurface;
+    bool refractiveSurface = waterSurface || glassSurface || iceSurface || crystalSurface
+        || thinTransparentSurface;
+    float diffuseOpacity = waterSurface
+        ? 0.08
+        : (glassSurface
+            ? max(1.0 - GLASS_TRANSMISSION, 0.06)
+            : (iceSurface
+                ? max(1.0 - ICE_TRANSMISSION, 0.18)
+                : (crystalSurface
+                    ? max(1.0 - CRYSTAL_TRANSMISSION, 0.25)
+                    : (thinTransparentSurface ? surfaceAlpha : 1.0))));
+    vec3 diffuseAlbedo = albedo * diffuseOpacity;
+
+    // --- Calculate motion vectors FIRST for ReSTIR temporal reuse ---
+    vec2 shadowHistoryPrevPixel = vec2(originalPixelCoord) + vec2(0.5);
+    bool shadowHistoryHasPrev = false;
+
+#if ENABLE_DLSS_RR
+    // Motion vectors are declared non-jittered at NGX feature creation. Keep
+    // them purely geometric because current jitter is passed to NGX separately.
+    // Including it here makes stationary pixels report false motion every frame,
+    // which causes RR to smear bright local-light history into dark surfaces.
+    vec2 currentPixel = vec2(originalPixelCoord) + vec2(0.5);
+    vec2 currentUV = currentPixel / launchSize;
+
+    // 2. Previous frame position via world-space reprojection.
+    // CRITICAL FIX: worldPos from G-buffer is camera-relative (Player Space).
+    // To get the equivalent position in Absolute World Space, we just add the absolute
+    // camera position. Using viewInverse is incorrect here since worldPos is NOT in View Space.
+    vec3 absWorldPos = cameraRelativePos ? (worldPos + origin) : worldPos;
+    vec4 prevClipPos = cam.prevViewProj * vec4(absWorldPos, 1.0);
+    vec2 prevUV = currentUV;
+    bool hasValidPrevProjection = prevClipPos.w > 1e-5
+        && !any(isnan(prevClipPos))
+        && !any(isinf(prevClipPos));
+    if (hasValidPrevProjection) {
+        vec3 prevNDC = prevClipPos.xyz / prevClipPos.w;
+        hasValidPrevProjection = all(lessThanEqual(abs(prevNDC.xy), vec2(1.25)));
+        if (hasValidPrevProjection) {
+            prevUV = prevNDC.xy * 0.5 + 0.5;
+            shadowHistoryPrevPixel = prevUV * launchSize;
+            shadowHistoryHasPrev = true;
+        }
+        // NOTE: No Y-flip here — prevViewProj already produces UVs in the same
+        // coordinate space as currentUV (matching the sky path which also has no Y-flip).
+    }
+
+    // DLSSD Motion Vector Calculation:
+    // - DLSSD expects motion vectors in PIXEL SPACE representing pure GEOMETRIC displacement.
+    // - prevViewProj is UNJITTERED (passed from Java) - pure geometric motion.
+    // - DLSS receives jitter offsets separately and handles jitter compensation internally.
+    motionVec = hasValidPrevProjection
+        ? clamp(prevUV * launchSize - currentPixel, -launchSize, launchSize)
+        : vec2(0.0);
+
+    // Store motion vectors for DLSS (pixel space, RGBA16F)
+    imageStore(motionVectors, originalPixelCoord, vec4(motionVec, 0.0, 0.0));
+
+    // Write linear depth (distance from camera) for DLSS Ray Reconstruction.
+    vec3 cameraForward = -normalize(cam.viewInverse[2].xyz);
+    float linearDepth = cameraRelativePos ? max(dot(worldPos, cameraForward), 0.0) : max(dot(worldPos - origin, cameraForward), 0.0);
+    imageStore(linearDepthImage, originalPixelCoord, vec4(linearDepth));
+    writeRadianceDlssSidecars(
+        originalPixelCoord,
+        albedo,
+        metallic,
+        F0,
+        normal,
+        roughness,
+        linearDepth,
+        linearDepth);
+#endif
+    
+    // --- Direct Lighting ---
+    vec3 viewDir = normalize(origin - shadingWorldPos);
+
+    // Keep the receiver fixed while the camera moves. Bias depends only on
+    // surface/light geometry, not view distance.
+    float viewDist = length(shadingWorldPos - origin);
+    float specularHitDistanceGuide = viewDist;
+    float grazing = 1.0 - max(dot(normal, lightDir), 0.0);
+    float adaptiveBias = mix(0.003, 0.009, grazing);
+    vec3 rayOrigin = shadingWorldPos + normal * adaptiveBias;
+
+    float finalShadow = 0.0;
+    uint seed = hashUint(uint(originalPixelCoord.x + originalPixelCoord.y * int(launchSize.x)), cam.frameId);
+    uint stableSeed = hashUint(uint(originalPixelCoord.x + originalPixelCoord.y * int(launchSize.x)), 0x9e3779b9u);
+    // Never rotate the sun disk by pixel, frame, or surface position. Adjacent
+    // rotations turn camera motion into visible penumbra noise.
+    uvec3 lightingCell = floatBitsToUint(floor(shadingWorldPos));
+    uint worldLightingSeed = hashUint(hashUint(lightingCell.x, lightingCell.y), lightingCell.z);
+    float stableLightRotation = float(cam.frameId & 3u) * 0.25;
+
+    vec3 baseLightDir = lightDir;
+
+    // Build tangent/bitangent for sun disk jittering
+    vec3 tangent, bitangent;
+    createOrthonormalBasis(baseLightDir, tangent, bitangent);
+
+#if RESTIR_SUN_SHADOWS == 1
+    // Check if ReSTIR is enabled via push constant
+    if (pc.enableReSTIR == 1 && ENABLE_RESTIR == 1) {
+        // --- ReSTIR DI ---
+        RestirReservoir r;
+        initReservoir(r);
+    
+        float sunRadius = PENUMBRA_RADIUS;
+        float frameRotation = stableLightRotation;
+    
+        // 1. Initial Sampling (Stochastic Sun — 2 candidates)
+        for (int i = 0; i < 4; i++) {
+            float rSun = sunRadius * sqrt(rand(stableSeed));
+            float thetaSun = TWO_PI * fract(rand(stableSeed) + frameRotation);
+            vec2 sunOffset = vec2(rSun * cos(thetaSun), rSun * sin(thetaSun));
+            vec3 jitteredLightDir = normalize(baseLightDir + (tangent * sunOffset.x + bitangent * sunOffset.y));
+    
+            // ReSTIR optimization: Do not trace visibility rays for initial candidates!
+            // The unshadowed target function is sufficient for importance sampling the sun disk.
+            // A single visibility ray will be traced for the final chosen sample.
+            float pHat = getPHat(worldPos, normal, worldPos + jitteredLightDir * 100.0, sunColor);
+            updateReservoir(r, pHat, sunOffset, rand(seed));
+        }
+    
+        // 2. Temporal Reuse with proper motion vector reprojection
+#if ENABLE_RESTIR_TEMPORAL_REUSE
+    // Use motion vectors to find the previous frame's pixel coordinate
+    ivec2 prevCoord = originalPixelCoord;
+    bool hasTemporalSample = false;
+
+    #if ENABLE_DLSS_RR
+    // ReSTIR reads from the previous frame's reservoir buffer.
+    // prevUV from prevViewProj is UNJITTERED (pure geometric motion),
+    // matching the previous frame's reservoir buffer coordinates.
+    // So we can use prevUV directly without adding jitter again.
+    vec2 exactPrevCoord = prevUV * launchSize;
+    hasTemporalSample = hasValidPrevProjection
+        && all(greaterThanEqual(exactPrevCoord, vec2(0.0)))
+        && all(lessThan(exactPrevCoord, launchSize));
+	if (hasTemporalSample) {
+	prevCoord = clamp(ivec2(exactPrevCoord), ivec2(0), ivec2(launchSize) - ivec2(1));
+	}
+    #endif
+        
+        if (hasTemporalSample) {
+            RestirReservoir prevR = unpackReservoir(imageLoad(prevReservoirImage, prevCoord));
+            clampReservoir(prevR, float(RESTIR_MAX_HISTORY));
+        
+            vec3 prevJitteredDir = normalize(baseLightDir + (tangent * prevR.offset.x + bitangent * prevR.offset.y));
+            float pHatPrev = getPHat(worldPos, normal, worldPos + prevJitteredDir * 100.0, sunColor);
+            
+            if (pHatPrev > 0.0) {
+                combineReservoir(r, prevR, pHatPrev, rand(seed));
+            }
+        }
+#endif
+    
+        // 3. Spatial Reuse using injected settings
+        #if HYBRID_RENDERING
+            spatialReuse(r, gbufferNormal, gbufferWorldPos, originalPixelCoord, worldPos, normal, baseLightDir, sunColor, float(RESTIR_SPATIAL_RADIUS), rand(seed), int(RESTIR_SPATIAL_SAMPLES));
+        #endif
+    
+        // Selected sample direction
+        vec3 finalLightDir = normalize(baseLightDir + (tangent * r.offset.x + bitangent * r.offset.y));
+        float finalPHat = getPHat(worldPos, normal, worldPos + finalLightDir * 100.0, sunColor);
+    
+        finalizeReservoir(r, finalPHat);
+        imageStore(reservoirImage, originalPixelCoord, packReservoir(r));
+    
+        // Final Shadow Ray for the selected sample
+        if (r.W > 0.0) {
+            finalShadow = alphaAwareVisibility(rayOrigin, finalLightDir, 10000.0)
+                * clamp(r.W, 0.0, 2.0);
+        }
+
+        lightDir = finalLightDir;
+    } else
+#endif
+    {
+        // Non-ReSTIR fallback: multi-sample soft shadows with proper penumbra
+        // Use stratified sampling across the sun disk for smooth penumbra
+        float sunRadius = PENUMBRA_RADIUS;
+        const int SHADOW_SAMPLES = PENUMBRA_SAMPLES;
+        const int SHADOW_SAMPLE_PAIRS = (SHADOW_SAMPLES + 1) / 2;
+        
+        float shadowAccum = 0.0;
+        for (int s = 0; s < SHADOW_SAMPLES; s++) {
+            int pairIndex = s / 2;
+            float pairSide = (s & 1) == 0 ? 1.0 : -1.0;
+            float theta = float(pairIndex) * 2.39996323;
+            float r = sunRadius * sqrt((float(pairIndex) + 0.5) / float(SHADOW_SAMPLE_PAIRS));
+            vec2 diskOffset = pairSide * r * vec2(cos(theta), sin(theta));
+            
+            vec3 jitteredLightDir = normalize(baseLightDir + tangent * diskOffset.x + bitangent * diskOffset.y);
+            
+            float NdotL = max(dot(normal, jitteredLightDir), 0.0);
+            if (NdotL > 0.0) {
+                shadowAccum += alphaAwareVisibility(rayOrigin, jitteredLightDir, 10000.0);
+            }
+            
+        }
+        
+        finalShadow = shadowAccum / float(SHADOW_SAMPLES);
+#if RESTIR_SUN_SHADOWS == 1
+        finalShadow = resolveSunShadowHistory(
+            originalPixelCoord,
+            shadowHistoryPrevPixel,
+            shadowHistoryHasPrev,
+            shadingWorldPos,
+            normal,
+            viewDist,
+            finalShadow);
+#endif
+        // The disk samples estimate visibility only. Shading against the final
+        // random sample moves highlights and changes energy between frames.
+        lightDir = baseLightDir;
+    }
+
+    float hardShadow = 0.0;
+    float baseNdotL = max(dot(normal, baseLightDir), 0.0);
+    if (baseNdotL > 0.0) {
+      hardShadow = alphaAwareVisibility(rayOrigin, baseLightDir, 10000.0);
+    }
+
+    float diffuseShadow = mix(hardShadow, finalShadow, PENUMBRA_DIFFUSE_BLEND);
+    float specularShadow = finalShadow;
+
+    vec3 directDiffuse;
+    vec3 directSpecular;
+    evaluatePBRSplit(diffuseAlbedo, normal, viewDir, lightDir, sunColor, F0, roughness, metallic, SPECULAR_INTENSITY, directDiffuse, directSpecular);
+    vec3 directSunLighting = directDiffuse * diffuseShadow + directSpecular * specularShadow;
+
+    // --- Indirect Bounce (cosine-weighted hemisphere for diffuse GI) ---
+    vec3 bounceDir = cosineWeightedHemisphere(normal, seed);
+
+    payload.hitData = vec4(0, 0, 0, -1);
+    payload.material.emission = vec3(0.0);
+    payload.material.albedo = vec3(0.0);
+    traceRayEXT(acc, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, rayOrigin, 0.01, bounceDir, 100.0, 0);
+
+    vec3 indirectContrib = vec3(0.0);
+    if (payload.hitData.w < 0.0) {
+    // Miss — sky radiance contributes to indirect lighting
+    // Use full sky color for natural-looking GI from the sky hemisphere
+    indirectContrib = payload.hitData.xyz * 0.5;
+    } else {
+    // Hit — check if this secondary surface is lit by the sun
+    float secondShadow = 0.0;
+    vec3 secondNormal = normalize(payload.material.normal);
+    float secondNdotL = max(dot(secondNormal, lightDir), 0.0);
+    if (secondNdotL > 0.0) {
+        secondShadow = alphaAwareVisibility(
+            payload.hitData.xyz + secondNormal * 0.05,
+            lightDir,
+            10000.0);
+    }
+    // Secondary surface contribution: diffuse lighting + emission
+    indirectContrib = payload.material.albedo * sunColor * secondNdotL * secondShadow * INDIRECT_SCALE
+    	+ payload.material.emission;
+    }
+
+    // --- Specular Environment Reflections with GGX Importance Sampling ---
+// Both metals and non-metals benefit from environment reflections.
+// Metals: F0 determines reflection color (colored metals like gold, copper)
+// Non-metals: Dim reflections at grazing angles (F0 ~0.04 for dielectrics)
+// 
+// For metals, we use multi-bounce reflections with Russian Roulette termination
+// to properly capture inter-reflections between metal surfaces.
+vec3 specularEnvContrib = vec3(0.0);
+
+// Only trace reflection rays for surfaces with noticeable reflectivity
+// Skip for very rough surfaces (roughness > 0.85) as they scatter too much
+float reflectionRoughnessLimit = mix(REFLECTION_MAX_ROUGHNESS, 0.88, metallic);
+float surfaceFresnelLuma = dot(
+    fresnelSchlick(max(dot(normal, viewDir), 0.0), F0),
+    vec3(0.2126, 0.7152, 0.0722));
+if (!refractiveSurface
+        && roughness < reflectionRoughnessLimit
+        && (metallic > 0.5 || surfaceFresnelLuma > 0.025)) {
+    // Initial path throughput - tracks accumulated reflection color
+    vec3 throughput = vec3(1.0);
+    vec3 reflectionAccum = vec3(0.0);
+    
+    // Current ray state
+    vec3 currentOrigin = rayOrigin;
+    vec3 currentNormal = normal;
+    vec3 currentViewDir = viewDir;
+    vec3 currentF0 = F0;
+    float currentRoughness = roughness;
+    float currentMetallic = metallic;
+    
+    // Multi-bounce reflection loop
+    for (int bounce = 0; bounce < METAL_MAX_BOUNCES; bounce++) {
+        // Skip if throughput is negligible
+        float throughputLuma = dot(throughput, vec3(0.299, 0.587, 0.114));
+        if (throughputLuma < 0.001) break;
+        
+        // Russian Roulette termination after minimum bounces
+        if (bounce >= METAL_RR_MIN_BOUNCE) {
+            float rrProb = russianRouletteProb(throughput);
+            if (rand(seed) > rrProb) break;
+            throughput /= rrProb; // Compensate for terminated paths
+        }
+        
+        // Sample reflection direction using GGX importance sampling
+        vec3 reflectDir;
+        float pdf;
+        
+        #if METAL_GGX_IMPORTANCE
+            // GGX importance sampling - physically correct for metals
+            reflectDir = sampleGGXReflection(currentViewDir, currentNormal, currentRoughness, seed, pdf);
+        #else
+            // Fallback: simple reflection with roughness jittering
+            vec3 perfectReflect = reflect(-currentViewDir, currentNormal);
+            float roughnessJitter = currentRoughness * 0.5;
+            reflectDir = normalize(perfectReflect +
+                (vec3(rand(seed), rand(seed), rand(seed)) * 2.0 - 1.0) * roughnessJitter);
+            pdf = 1.0; // Uniform sampling
+        #endif
+        
+        // Check if reflection direction is valid (above surface)
+        float NdotReflect = dot(currentNormal, reflectDir);
+        if (NdotReflect <= 0.0 || pdf <= 1e-6 ||
+            any(isnan(reflectDir)) || any(isinf(reflectDir))) {
+            // Reflection goes below surface - skip this bounce
+            break;
+        }
+        
+        // Trace reflection ray
+        payload.hitData = vec4(0, 0, 0, -1);
+        payload.material.emission = vec3(0.0);
+        payload.material.albedo = vec3(0.0);
+        traceRayEXT(acc, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0,
+                    currentOrigin + currentNormal * 0.01, 0.001, reflectDir,
+                    REFLECTION_RAY_DISTANCE, 0);
+        if (bounce == 0) {
+            specularHitDistanceGuide = payload.hitData.w < 0.0
+                ? 10000.0
+                : payload.hitData.w;
+        }
+        
+        vec3 envColor;
+        float envBrightness = 0.0;
+        
+        if (payload.hitData.w < 0.0) {
+            // Miss — use sky color from miss shader
+            envColor = payload.hitData.xyz;
+            envBrightness = dot(envColor, vec3(0.299, 0.587, 0.114));
+        } else {
+            // Hit — check if the hit surface is lit by the sun
+            vec3 hitNormal = normalize(payload.material.normal);
+            vec3 hitPos = payload.hitData.xyz;
+            float hitNdotL = max(dot(hitNormal, lightDir), 0.0);
+            float hitShadow = 0.0;
+            
+            if (hitNdotL > 0.0) {
+                hitShadow = alphaAwareVisibility(
+                    hitPos + hitNormal * 0.02,
+                    lightDir,
+                    10000.0);
+            }
+            
+            // Calculate lit color of hit surface
+            vec3 hitLitColor = payload.material.albedo * sunColor * hitNdotL * hitShadow * 0.5
+                + payload.material.emission;
+            
+            // Add ambient contribution
+            float hitAO = clamp(payload.material.ambientOcclusion, 0.0, 1.0);
+            vec3 simpleAmbient = vec3(0.05) * (0.3 + 0.7 * hitAO);
+            hitLitColor += payload.material.albedo * simpleAmbient;
+            
+            envColor = max(hitLitColor, vec3(0.0));
+            envBrightness = dot(envColor, vec3(0.299, 0.587, 0.114));
+        }
+        
+        // Calculate Fresnel for this bounce
+        float NdotV = max(dot(currentNormal, currentViewDir), 0.0);
+        vec3 F = fresnelSchlick(NdotV, currentF0);
+        
+        // Base reflection strength: metals reflect fully, dielectrics get dimmer
+        float baseReflectionStrength = mix(
+            DIELECTRIC_REFLECTION_SCALE,
+            1.0,
+            currentMetallic);
+        
+        // Roughness attenuation (GGX-style)
+        float roughnessAttenuation = (1.0 - currentRoughness * currentRoughness);
+        
+        // Environment brightness scaling
+        float envScale = 0.2 + 0.8 * smoothstep(0.0, 0.3, envBrightness);
+        
+        // Combine factors
+        float reflectionStrength = baseReflectionStrength * roughnessAttenuation * envScale;
+        
+        // GGX BRDF weight for importance sampling
+        #if METAL_GGX_IMPORTANCE
+            // BRDF * cos(theta) / PDF for NDF-sampled GGX. The previous
+            // NdotL/PDF term omitted the GGX distribution/geometry factors and
+            // produced enormous low-PDF fireflies.
+            vec3 H = normalize(currentViewDir + reflectDir);
+            float NdotH = max(dot(currentNormal, H), 1e-4);
+            float HdotV = max(dot(H, currentViewDir), 1e-4);
+            float NdotVSafe = max(dot(currentNormal, currentViewDir), 1e-4);
+            float G = geometrySmith(NdotVSafe, NdotReflect, max(currentRoughness, 0.04));
+            vec3 brdfWeight = F * (G * HdotV / (NdotVSafe * NdotH));
+            brdfWeight = clamp(brdfWeight, vec3(0.0), vec3(4.0));
+        #else
+            vec3 brdfWeight = F;
+        #endif
+        
+        // Accumulate reflection contribution
+        vec3 reflectionSample = throughput * envColor * brdfWeight
+            * reflectionStrength * METAL_REFLECTION_SCALE;
+        if (!any(isnan(reflectionSample)) && !any(isinf(reflectionSample))) {
+            reflectionAccum += min(reflectionSample, vec3(16.0));
+        }
+        
+        // Update throughput for next bounce (only for metals)
+        if (currentMetallic < 0.5) break; // Dielectrics only get one bounce
+        
+        // Update path state for next bounce
+        throughput *= F * reflectionStrength;
+        currentOrigin = payload.hitData.w < 0.0 ? vec3(0.0) : payload.hitData.xyz;
+        currentNormal = payload.hitData.w < 0.0 ? vec3(0.0) : normalize(payload.material.normal);
+        currentViewDir = -reflectDir;
+        currentF0 = payload.hitData.w < 0.0 ? vec3(0.04) : payload.material.F0;
+        currentRoughness = payload.hitData.w < 0.0 ? 0.5 : payload.material.roughness;
+        currentMetallic = payload.hitData.w < 0.0 ? 0.0 : payload.material.metallic;
+        
+        // Stop if we hit sky or invalid surface
+        if (payload.hitData.w < 0.0) break;
+    }
+    
+    specularEnvContrib = reflectionAccum * SPECULAR_INTENSITY;
+}
+
+if (refractiveSurface) {
+    vec3 incident = -viewDir;
+    vec3 reflectionDirection = normalize(reflect(incident, normal));
+    float reflectionDistance;
+    vec3 reflectedRadiance = traceSimpleRadiance(
+        shadingWorldPos + normal * 0.025,
+        reflectionDirection,
+        lightDir,
+        sunColor,
+        blockId,
+        reflectionDistance);
+
+    float ior = waterSurface ? 1.333 : (iceSurface ? 1.31 : (crystalSurface ? 2.20 : 1.50));
+    vec3 refractionDirection = refract(incident, normal, 1.0 / ior);
+    float refractionDistance = 10000.0;
+    vec3 refractedRadiance = reflectedRadiance;
+    if (dot(refractionDirection, refractionDirection) > 1e-6) {
+        refractedRadiance = traceSimpleRadiance(
+            shadingWorldPos - normal * 0.025,
+            normalize(refractionDirection),
+            lightDir,
+            sunColor,
+            blockId,
+            refractionDistance);
+    }
+
+    vec3 fresnel = fresnelSchlick(max(dot(normal, viewDir), 0.0), F0);
+    if (waterSurface) {
+        fresnel = clamp(fresnel * WATER_REFLECTION_STRENGTH, vec3(0.0), vec3(1.0));
+        vec3 waterTint = waterTintColor(albedo);
+        vec3 absorption = waterAbsorption(refractionDistance);
+        refractedRadiance = refractedRadiance * absorption
+            + waterTint * (1.0 - absorption);
+    } else if (glassSurface) {
+        refractedRadiance *= mix(vec3(1.0), max(albedo, vec3(0.2)), 0.28)
+            * GLASS_TRANSMISSION;
+    } else if (iceSurface) {
+        vec3 iceTint = iceTintColor(albedo);
+        vec3 absorption = iceAbsorption(refractionDistance);
+        refractedRadiance = refractedRadiance * absorption * iceTint
+            + iceTint * (1.0 - absorption) * 0.18;
+    } else if (crystalSurface) {
+        refractedRadiance *= mix(vec3(1.0), max(albedo, vec3(0.12)), 0.55)
+            * CRYSTAL_TRANSMISSION;
+    } else {
+        refractedRadiance *= mix(vec3(1.0), max(albedo, vec3(0.1)), 0.35)
+            * surfaceAlpha;
+    }
+
+    specularEnvContrib = mix(refractedRadiance, reflectedRadiance, fresnel)
+        * SPECULAR_INTENSITY;
+    specularHitDistanceGuide = min(reflectionDistance, refractionDistance);
+}
+
+    // --- Ambient (sky-based hemisphere lighting) ---
+    // Natural ambient responds to sun elevation for time-of-day variation
+    float sunElev = lightDir.y;
+    float dayAmount = smoothstep(-0.1, 0.3, sunElev);
+    
+    // Sky hemisphere: upper sky contributes more to upward-facing surfaces
+    float skyVisibility = max(normal.y * 0.5 + 0.5, 0.15);
+    
+    // Ambient color varies with time of day
+    vec3 ambientDay   = mix(vec3(0.35, 0.45, 0.6), vec3(0.5, 0.6, 0.8), skyVisibility);
+    vec3 ambientDusk  = mix(vec3(0.2, 0.12, 0.08), vec3(0.35, 0.2, 0.15), skyVisibility);
+    vec3 ambientNight = mix(vec3(0.01, 0.015, 0.025), vec3(0.02, 0.03, 0.06), skyVisibility);
+    
+    float duskAmount = smoothstep(-0.15, 0.05, sunElev) * (1.0 - smoothstep(0.05, 0.25, sunElev));
+    vec3 ambientColor = mix(ambientNight, ambientDay, dayAmount) + ambientDusk * duskAmount;
+    
+    // Stronger ambient for more natural fill light (shadows shouldn't be pitch black)
+    vec3 ambient = diffuseAlbedo * ambientColor * AMBIENT_FACTOR * (0.3 + 0.7 * ao);
+
+     // --- Blocklight ---
+// gExtraRaw.r = blocklight UV coordinate [0,1] from the Minecraft lightmap
+// Treat it as the authoritative local-light signal. Random hemisphere rays only
+// find an emitter when it happens to be the first surface hit, which made equal
+// light levels alternate between illuminated and dark pixels.
+float blocklightRaw = clamp(gExtraRaw.r, 0.0, 1.0);
+
+// Preserve low Minecraft light levels instead of crushing them below visibility.
+float blocklightExtended = clamp(pow(blocklightRaw, 0.72) * BLOCKLIGHT_VISUAL_RANGE, 0.0, 1.0);
+float blocklightIntensity = blocklightRaw > 0.003
+    ? max(pow(blocklightExtended, 1.05), BLOCKLIGHT_LOW_FLOOR)
+    : 0.0;
+vec3 blocklightColor = vec3(BLOCKLIGHT_COLOR_R, BLOCKLIGHT_COLOR_G, BLOCKLIGHT_COLOR_B)
+    * blocklightIntensity * BLOCKLIGHT_VISUAL_INTENSITY;
+
+vec3 blocklightDiffuse = vec3(0.0);
+vec3 blocklightSpecular = vec3(0.0);
+vec3 blocklightRt = vec3(0.0);
+
+if (blocklightRaw > 0.003) {
+    // Approximate directional blocklight from G-buffer lightmap
+    // We don't know the exact light position, so use a stable normal/up estimate.
+    vec3 blocklightDir = normalize(normal * 0.8 + vec3(0.0, 0.4, 0.0));
+    evaluatePBRSplit(diffuseAlbedo, normal, viewDir, blocklightDir, blocklightColor, F0, roughness, metallic, SPECULAR_INTENSITY, blocklightDiffuse, blocklightSpecular);
+}
+
+#if RT_BLOCKLIGHT_PROBES != 0 && BLOCKLIGHT_SAMPLES > 0
+uint blocklightRtSeed = hashUint(worldLightingSeed, 0x51ed270bu);
+blocklightRt = sampleBlockLightRT(
+    shadingWorldPos,
+    normal,
+    diffuseAlbedo,
+    F0,
+    roughness,
+    metallic,
+    viewDir,
+    SPECULAR_INTENSITY,
+    blocklightRtSeed);
+#endif
+
+imageStore(blocklightDetailImage, screenCoord,
+    vec4(
+        blocklightDiffuse + blocklightSpecular + blocklightRt + directEmission,
+        max(max(blocklightRaw, clamp(length(blocklightRt) / EMISSIVE_SURFACE_INTENSITY, 0.0, 1.0)),
+            clamp(length(directEmission) / EMISSIVE_SURFACE_INTENSITY, 0.0, 1.0))));
+
+    // --- Minimum lighting floor (prevents pitch black shadows) ---
+    vec3 minLight = diffuseAlbedo * MIN_LIGHTING * (0.2 + 0.8 * ao) * 0.08;
+   
+    // --- Final Compositing ---
+    vec3 finalLighting = directEmission
+    	+ directSunLighting
+    	+ indirectContrib * diffuseAlbedo
+    	+ ambient
+    	+ blocklightDiffuse + blocklightSpecular + blocklightRt
+    	+ specularEnvContrib // Environment reflections for metals
+    	+ minLight;
+
+    vec4 volume = integrateVolumetrics(
+        origin,
+        direction,
+        viewDist,
+        lightDir,
+        sunColor,
+        hashUint(worldLightingSeed, 0x68bc21ebu));
+    finalLighting = finalLighting * volume.a + volume.rgb;
+
+    // Firefly clamp — NO tone mapping or gamma here!
+    // DLSS Ray Reconstruction needs linear HDR input.
+    // Tone mapping + gamma are applied AFTER DLSS in the composite/blit pass.
+    finalLighting = clampFirefly(applyLinearColorGrade(finalLighting));
+
+#if ENABLE_DLSS_RR
+    imageStore(SpecularHitDepth, originalPixelCoord, vec4(specularHitDistanceGuide));
+#endif
+
+    color = vec4(finalLighting, 1.0);
+  }
+
+  if (pc.debugMode == 1) {
+	// DLSS Debug Mode: Show DLSSD inputs
+	// debugCellIndex: -1 = grid view (2x3), 0-5 = full-screen single cell
+	// Cell index: 0=Albedo, 1=Normals, 2=Depth, 3=Motion, 4=Roughness, 5=Specular F0, 6=Jitter Viewer
+	
+	// Determine if we're in grid view or full-screen mode
+	bool isGridView = (pc.debugCellIndex < 0);
+	
+	// Cell label colors (unique color for each cell type to identify them)
+	// 0: Albedo - Red, 1: Normals - Green, 2: Depth - Blue
+	// 3: Motion - Yellow, 4: Roughness - Magenta, 5: Specular F0 - Cyan, 6: Jitter - Orange
+	// 7: Final - White, 8: Extras - Gray
+	vec3 labelColors[9];
+	labelColors[0] = vec3(1.0, 0.0, 0.0); // Albedo - Red
+	labelColors[1] = vec3(0.0, 1.0, 0.0); // Normals - Green
+	labelColors[2] = vec3(0.0, 0.0, 1.0); // Depth - Blue
+	labelColors[3] = vec3(1.0, 1.0, 0.0); // Motion - Yellow
+	labelColors[4] = vec3(1.0, 0.0, 1.0); // Roughness - Magenta
+	labelColors[5] = vec3(0.0, 1.0, 1.0); // Specular F0 - Cyan
+	labelColors[6] = vec3(1.0, 0.5, 0.0); // Jitter - Orange
+	labelColors[7] = vec3(1.0, 1.0, 1.0); // Final - White
+	labelColors[8] = vec3(0.5, 0.5, 0.5); // Extras - Gray
+	
+	// Determine which cell to display
+	int activeCell;
+	vec2 cellUV;
+	if (isGridView) {
+		// Grid view: determine cell from screen position (3x3 grid)
+		int cellX = int(p.x * 3.0);
+		int cellY = int(p.y * 3.0);
+		cellX = clamp(cellX, 0, 2);
+		cellY = clamp(cellY, 0, 2);
+		activeCell = cellY * 3 + cellX;
+		// Calculate UV within the cell
+		cellUV = vec2(p.x * 3.0 - float(cellX), p.y * 3.0 - float(cellY));
+	} else {
+		// Full-screen mode: show the selected cell
+		activeCell = clamp(pc.debugCellIndex, 0, 8);
+		cellUV = p;
+	}
+	
+	// Draw label bar at top-left corner of the cell
+	float labelBarHeight = isGridView ? (15.0 / launchSize.y) : (30.0 / launchSize.y);
+	float labelBarWidth = isGridView ? (75.0 / launchSize.x) : (150.0 / launchSize.x);
+	float stripeWidth = isGridView ? (3.0 / launchSize.x) : (5.0 / launchSize.x);
+	
+	// Adjust for grid view
+	if (isGridView) {
+		// Calculate position within the cell
+		vec2 cellPos = vec2(p.x * 3.0, p.y * 3.0);
+		vec2 cellOffset = vec2(float(int(cellPos.x)), float(int(cellPos.y)));
+		vec2 localP = cellPos - cellOffset;
+		
+		bool inStripe = (localP.y < labelBarHeight * 3.0) && (localP.x < stripeWidth * 3.0);
+		bool inLabelBg = (localP.y < labelBarHeight * 3.0) && (localP.x < labelBarWidth * 3.0);
+		
+		if (inStripe) {
+			color = vec4(labelColors[activeCell], 1.0);
+		} else if (inLabelBg) {
+			color = vec4(0.1, 0.1, 0.1, 1.0);
+		} else {
+			// Display the actual cell content
+			color = getDLSSDebugCellContent(activeCell, hit, albedo, normal, worldPos, origin, roughness, F0, cameraRelativePos, cellUV, motionVec, color.rgb, launchSize, gExtraRaw);
+		}
+	} else {
+	// Full-screen mode
+	bool inLabelBg = (p.y < labelBarHeight) && (p.x < labelBarWidth);
+	bool inStripe = (p.y < labelBarHeight) && (p.x < stripeWidth);
+
+	if (inStripe) {
+		color = vec4(labelColors[activeCell], 1.0);
+	} else if (inLabelBg) {
+		color = vec4(0.1, 0.1, 0.1, 1.0);
+	} else {
+	// Display the actual cell content
+	color = getDLSSDebugCellContent(activeCell, hit, albedo, normal, worldPos, origin, roughness, F0, cameraRelativePos, cellUV, motionVec, color.rgb, launchSize, gExtraRaw);
+	}
+	}
+} else if (pc.debugMode == 2) {
+	// BUFFERS Debug Mode: Show 4 quadrants with different debug visualizations
+	// debugCellIndex: -1 = grid view (2x2), 0-3 = full-screen single quadrant
+	// Layout (in UV space, origin at top-left):
+	// Q2 (normals) | Q3 (final lighting)
+	// -----------------|------------------
+	// Q0 (depth) | Q1 (motion vectors)
+	
+	// Determine if we're in grid view or full-screen mode
+	bool isGridView = (pc.debugCellIndex < 0);
+	
+	// Determine which quadrant to display
+	int activeQuadrant;
+	if (isGridView) {
+		// Grid view: use the precomputed quadrant
+		activeQuadrant = quadrant;
+	} else {
+		// Full-screen mode: show the selected quadrant
+		activeQuadrant = clamp(pc.debugCellIndex, 0, 3);
+	}
+	
+	// Display the quadrant content
+	if (activeQuadrant == 0) { // Bottom-Left - Linear Depth
+		if (hit) {
+			float linearDepth = cameraRelativePos ? length(worldPos) : length(worldPos - origin);
+			float normalizedDepth = clamp(linearDepth / 100.0, 0.0, 1.0);
+			float depthValue = 1.0 - normalizedDepth;
+			color = vec4(depthValue * 0.5, depthValue * 0.8, depthValue, 1.0);
+		} else {
+			color = vec4(1.0, 0.0, 0.0, 1.0);
+		}
+	} else if (activeQuadrant == 1) { // Bottom-Right - Motion Vectors
+		#if ENABLE_DLSS_RR
+		vec2 motionVec = imageLoad(motionVectors, originalPixelCoord).rg;
+		float magnitude = length(motionVec);
+		vec2 normalizedMV = motionVec / max(launchSize.x, launchSize.y);
+		color = vec4(normalizedMV * 0.5 + 0.5, magnitude * 0.1, 1.0);
+		#else
+		color = vec4(0.0, 1.0, 0.0, 1.0);
+		#endif
+	} else if (activeQuadrant == 2) { // Top-Left - Blocklight visualization
+		if (hit) {
+			float bl = gExtraRaw.r;
+			color = vec4(bl, bl * 0.5, 1.0 - bl, 1.0);
+		} else {
+			color = vec4(0.0, 1.0, 1.0, 1.0);
+		}
+	} else { // quadrant == 3: Top-Right - Final Lighting (noisy output)
+		// Show the actual noisy output that DLSSD receives
+		// This is what we computed above - just use the color as-is
+	}
+}
+  // When debug mode is off, we just output the computed color
+  
+  imageStore(outputImage, screenCoord, color);
+  }

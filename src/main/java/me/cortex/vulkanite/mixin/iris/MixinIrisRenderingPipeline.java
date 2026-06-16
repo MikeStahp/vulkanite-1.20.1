@@ -2,6 +2,7 @@ package me.cortex.vulkanite.mixin.iris;
 
 import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectMap.Entry;
+import me.cortex.vulkanite.client.ShaderpackSettingsHandler;
 import me.cortex.vulkanite.client.Vulkanite;
 import me.cortex.vulkanite.client.rendering.VulkanPipeline;
 import me.cortex.vulkanite.compat.*;
@@ -14,7 +15,6 @@ import me.cortex.vulkanite.lib.other.DeviceLostException;
 import net.irisshaders.iris.gl.buffer.ShaderStorageBuffer;
 import net.irisshaders.iris.gl.texture.TextureAccess;
 import net.irisshaders.iris.gl.buffer.ShaderStorageBufferHolder;
-import net.irisshaders.iris.mixin.LevelRendererAccessor;
 import net.irisshaders.iris.pipeline.CustomTextureManager;
 import net.irisshaders.iris.pipeline.IrisRenderingPipeline;
 import net.irisshaders.iris.shaderpack.programs.ProgramSet;
@@ -62,7 +62,7 @@ public class MixinIrisRenderingPipeline {
     private VulkanPipeline pipeline;
 
     @Unique
-    private List<VRef<VGImage>> getCustomTextures() {
+    private List<VulkanPipeline.CustomTexture> getCustomTextures() {
         Object2ObjectMap<String, TextureAccess> texturesBinary = customTextureManager.getIrisCustomTextures();
         Object2ObjectMap<String, TextureAccess> texturesPNGs = customTextureManager
                 .getCustomTextureIdMap(TextureStage.GBUFFERS_AND_SHADOW);
@@ -74,7 +74,7 @@ public class MixinIrisRenderingPipeline {
         entryList.sort(Comparator.comparing(Entry::getKey));
 
         return entryList.stream()
-                .map(entry -> ((IVGImage) entry.getValue()).getVGImage())
+                .map(entry -> new VulkanPipeline.CustomTexture(entry.getKey(), ((IVGImage) entry.getValue()).getVGImage()))
                 .toList();
     }
 
@@ -96,6 +96,8 @@ public class MixinIrisRenderingPipeline {
         // or mesh shading, etc.
         pipeline = new VulkanPipeline(ctx, Vulkanite.INSTANCE.getAccelerationManager(), rtShaderPasses,
                 set.getPackDirectives().getBufferObjects().keySet().toArray(new int[0]), getCustomTextures());
+        ShaderpackSettingsHandler.applyShaderpackSettings((IrisRenderingPipeline) (Object) this);
+        ShaderpackSettingsHandler.detectAndApplyShaderpack(pipeline);
     }
 
     // Inject after renderTerrain (when G-Buffer is ready)
@@ -121,11 +123,10 @@ public class MixinIrisRenderingPipeline {
     // renderTranslucents?
     // That would be effectively after opaque terrain.
 
-    @Inject(method = "beginTranslucents", at = @At("HEAD"))
-    private void renderTranslucents(CallbackInfo ci) {
-        // Execute Ray Tracing after opaque terrain (before translucents)
-        // Use the LevelRendererAccessor and Camera passed from the caller instead of creating new ones
-        LevelRendererAccessor lra = (LevelRendererAccessor) MinecraftClient.getInstance().worldRenderer;
+    @Inject(method = "finalizeLevelRendering", at = @At("HEAD"))
+    private void finalizeLevelRendering(CallbackInfo ci) {
+        // Keep OpenGL responsible for the complete compatibility frame, including
+        // entities, fluids, particles, and modded translucent render layers.
         Camera camera = MinecraftClient.getInstance().gameRenderer.getCamera();
         runRayTracing(camera);
     }
@@ -133,12 +134,18 @@ public class MixinIrisRenderingPipeline {
     @Inject(method = "renderShadows", at = @At("TAIL"))
     private void renderShadows(CallbackInfo ci) {
         // Remove RT from here, it's too early for Hybrid Rendering!
-    }
+        }
+
+        // NOTE: ResolutionScaleManager.update() is called from:
+        // 1. DeferredGBufferManager.initialize() - when creating G-buffers
+        // 2. VulkanPipeline.render() - during main render loop
+        // This ensures correct resolution is used for DLSS low-res output.
 
     @Unique
     private void runRayTracing(Camera camera) {
         if (pipeline == null)
             return;
+        ShaderpackSettingsHandler.detectAndApplyShaderpack(pipeline);
 
         var prof = MinecraftClient.getInstance().getProfiler();
         prof.push("vulkanite_render_rt");
@@ -166,6 +173,22 @@ public class MixinIrisRenderingPipeline {
         try {
         var ctx = Vulkanite.INSTANCE.getCtx();
         var requirements = pipeline.getPipelineRequirements();
+        boolean deferredMode = pipeline.isDeferredModeActive();
+
+        if (deferredMode) {
+            LOGGER.debug("Deferred mode active: binding colortex0-4 as deferred G-buffer inputs");
+            for (int i = 0; i < gbufferViews.length; i++) {
+                var target = renderTargets.getOrCreate(i);
+                var image = ((IRenderTargetVkGetter) target).getMain();
+                if (image != null && image.get() != null) {
+                    gbufferViews[i] = VImageView.create(ctx, new VRef<>(image.get()));
+                    LOGGER.debug("Deferred G-buffer colortex{} bound: {}x{}",
+                            i, image.get().width, image.get().height);
+                } else {
+                    LOGGER.warn("Deferred G-buffer colortex{} is null or invalid", i);
+                }
+            }
+        } else {
         
         LOGGER.info("G-buffer requirements: albedo={}, material={}, normal={}, worldPos={}, extra={}", 
             requirements.needsAlbedo(), requirements.needsMaterial(), requirements.needsNormal(), 
@@ -182,6 +205,13 @@ public class MixinIrisRenderingPipeline {
         			albedoImg.get().width, albedoImg.get().height,
         			MinecraftClient.getInstance().getWindow().getFramebufferWidth(),
         			MinecraftClient.getInstance().getWindow().getFramebufferHeight());
+        		// TRANSPARENCY DIAG: Log resolution mismatch for transparent ghosting investigation
+        		var scaleManager = me.cortex.vulkanite.client.rendering.ResolutionScaleManager.getInstance();
+        		LOGGER.info("[TRANSPARENCY DIAG] G-buffer resolution: {}x{}, Render resolution: {}x{}, Output resolution: {}x{}, DLSS scaling: {}, Scale factor: {}",
+        			albedoImg.get().width, albedoImg.get().height,
+        			scaleManager.getRenderWidth(), scaleManager.getRenderHeight(),
+        			scaleManager.getOutputWidth(), scaleManager.getOutputHeight(),
+        			scaleManager.isScalingActive(), scaleManager.getScale());
         	} else {
         		LOGGER.warn("G-buffer albedo (colortex1) is null or invalid!");
         	}
@@ -234,6 +264,7 @@ public class MixinIrisRenderingPipeline {
         LOGGER.warn("G-buffer extra (colortex5) is null or invalid!");
         }
         // Note: Do NOT close additionalImg here - the view holds a reference to it
+        }
         }
         } catch (Exception e) {
         LOGGER.warn("Could not create G-buffer views: {}", e.getMessage());

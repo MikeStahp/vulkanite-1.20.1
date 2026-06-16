@@ -321,6 +321,45 @@ public class DescriptorUpdateBuilder {
         return this;
     }
 
+    public DescriptorUpdateBuilder imageSampler(
+            int binding,
+            int dstArrayElement,
+            int layout,
+            final List<VRef<VImageView>> views,
+            VRef<VSampler> sampler) {
+        validateNotApplied();
+        validateState();
+        if (views == null || views.isEmpty()) {
+            return this;
+        }
+        if (sampler == null) {
+            throw new IllegalArgumentException("Sampler cannot be null");
+        }
+        if (refSet != null && refSet.getBindingAt(binding) == null) {
+            return this;
+        }
+
+        VkDescriptorImageInfo.Buffer imageInfos = VkDescriptorImageInfo.calloc(views.size());
+        for (int i = 0; i < views.size(); i++) {
+            VRef<VImageView> view = views.get(i);
+            setRef.get().addRef(dstArrayElement + i, view != null ? view.addRefGeneric() : null);
+            imageInfos.get(i)
+                    .imageLayout(layout)
+                    .imageView(viewOrPlaceholder(view))
+                    .sampler(sampler.get().sampler);
+        }
+        updates.get()
+                .sType$Default()
+                .dstBinding(binding)
+                .dstSet(set)
+                .dstArrayElement(dstArrayElement)
+                .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                .descriptorCount(views.size())
+                .pImageInfo(imageInfos);
+        bulkImageInfos.add(imageInfos);
+        return this;
+    }
+
     public void apply() {
         if (applied) {
             throw new IllegalStateException("apply() has already been called");

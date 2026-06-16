@@ -2,245 +2,508 @@ package me.cortex.vulkanite.client.rendering;
 
 import com.sun.jna.Library;
 import com.sun.jna.Native;
+import com.sun.jna.Pointer;
+import com.sun.jna.ptr.IntByReference;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import me.cortex.vulkanite.client.rendering.util.NativeLibraryLoader;
+import java.util.List;
 
 /**
- * JNA Bridge to the native DLSS/DLSSD library.
- * 
- * This interface provides Java bindings to the native C++ DLSS bridge library,
- * supporting both standard DLSS upscaling and DLSSD Ray Reconstruction.
+ * Native bridge for DLSS/DLSSD functionality.
+ *
+ * <p>This class provides JNA bindings to the native DLSS bridge library
+ * (dlss_bridge/vulkanite_dlss_bridge.dll) which wraps the NVIDIA NGX SDK.</p>
+ *
+ * <h2>Native Bridge Location</h2>
+ * <ul>
+ * <li>C++ Implementation: dlss_bridge/dlss_wrapper.cpp</li>
+ * <li>Headers: dlss_bridge/Include/nvsdk_ngx_helpers_dlssd_vk.h</li>
+ * </ul>
+ *
+ * <h2>Key NGX Functions Used</h2>
+ * <ul>
+ * <li>NGX_VULKAN_CREATE_DLSSD_EXT1 - Create DLSSD feature</li>
+ * <li>NGX_VULKAN_EVALUATE_DLSSD_EXT - Evaluate DLSSD frame</li>
+ * <li>NVSDK_NGX_VULKAN_ReleaseFeature - Release feature</li>
+ * </ul>
+ *
+ * <h2>DLSSD Evaluation Parameters (NVSDK_NGX_VK_DLSSD_Eval_Params)</h2>
+ * <ul>
+ * <li>pInColor - Noisy ray-traced color input</li>
+ * <li>pInDepth - Linear depth buffer</li>
+ * <li>pInMotionVectors - Screen-space motion vectors</li>
+ * <li>pInDiffuseAlbedo - Diffuse albedo (G-buffer)</li>
+ * <li>pInSpecularAlbedo - Specular albedo/F0 (G-buffer)</li>
+ * <li>pInNormals - World-space normals with roughness in .w (if packed)</li>
+ * <li>pInRoughness - Separate roughness buffer (if unpacked)</li>
+ * <li>InJitterOffsetX/Y - Subpixel jitter in pixel space [-0.5, 0.5]</li>
+ * <li>InReset - Set to 1 on scene changes to reset temporal history</li>
+ * <li>InFrameTimeDeltaInMsec - Frame time for temporal stability</li>
+ * </ul>
+ *
+ * @see DLSSDProcessor
+ * @see DLSSConfig
  */
-public interface DLSSBridge extends Library {
+public class DLSSBridge {
+    private static final Logger LOGGER = LoggerFactory.getLogger(DLSSBridge.class);
 
-    // ========================================================================
-    // NGX Result Codes
-    // ========================================================================
-    
-    /** Success */
-    int NGX_RESULT_SUCCESS = 1;
+    // DLSS depth type constants (from nvsdk_ngx_defs_dlssd.h)
+    public static final int DEPTH_TYPE_LINEAR = 0;
+    public static final int DEPTH_TYPE_HW = 1;
 
-    // ========================================================================
-    // NGX Extension Query Functions
-    // ========================================================================
+    // DLSS roughness mode constants
+    public static final int ROUGHNESS_MODE_UNPACKED = 0;
+    public static final int ROUGHNESS_MODE_PACKED = 1;
 
-    int getNGXInstanceExtensionCount();
+    // NGX quality/performance values - matches NVSDK_NGX_PerfQuality_Value enum from nvsdk_ngx_defs.h
+    // These values are passed directly to the NGX SDK without remapping.
+    // See plans/DLSSD_PARAMETERS_REFERENCE.md for documentation.
+    public static final int NGX_PERF_QUALITY_MAX_PERF = 0;        // "Performance" - 0.5 (50%) scale
+    public static final int NGX_PERF_QUALITY_BALANCED = 1;        // "Balanced" - 0.583 (58.3%) scale
+    public static final int NGX_PERF_QUALITY_MAX_QUALITY = 2;     // "Quality" - 0.667 (66.67%) scale
+    public static final int NGX_PERF_QUALITY_ULTRA_PERFORMANCE = 3; // "Ultra Performance" - 0.333 (33.3%) scale
+    public static final int NGX_PERF_QUALITY_ULTRA_QUALITY = 4;   // "Ultra Quality" - ~0.77 (77%) scale
+    public static final int NGX_PERF_QUALITY_DLAA = 5;            // "DLAA" - 1.0 (no upscaling, AA only)
 
-    String getNGXInstanceExtension(int index);
+    // Legacy aliases for backward compatibility
+    /** @deprecated Use {@link #NGX_PERF_QUALITY_MAX_PERF} instead */
+    public static final int NGX_PERF_QUALITY_PERFORMANCE = NGX_PERF_QUALITY_MAX_PERF;
+    /** @deprecated Use {@link #NGX_PERF_QUALITY_MAX_QUALITY} instead */
+    public static final int NGX_PERF_QUALITY_QUALITY = NGX_PERF_QUALITY_MAX_QUALITY;
 
-    int getNGXDeviceExtensionCount(long instance, long physicalDevice);
+    // Native library loaded flag
+    private static boolean nativeLibraryLoaded = false;
+    private static boolean nativeLibraryLoadAttempted = false;
 
-    String getNGXDeviceExtension(long instance, long physicalDevice, int index);
-
-    /**
-     * Initializes the NGX SDK (Internal function, usually called by initDLSS/initDLSSD).
-     * 
-     * @param vkInstance       Vulkan instance pointer
-     * @param vkPhysicalDevice Vulkan physical device pointer
-     * @param vkDevice         Vulkan logical device pointer
-     * @param dlssPath         Path to the folder containing DLSS binaries (optional)
-     * @return 1 on success, 0 on failure
-     */
-    int initializeNGX(long vkInstance, long vkPhysicalDevice, long vkDevice, String dlssPath);
-
-    // ========================================================================
-    // Standard DLSS Functions (Upscaling + Anti-Aliasing)
-    // ========================================================================
-
-        /**
-         * Initializes the DLSS feature for a specific resolution.
-         * 
-         * @param vkInstance       Vulkan instance pointer
-         * @param vkPhysicalDevice Vulkan physical device pointer
-         * @param vkDevice         Vulkan logical device pointer
-         * @param width            Render width
-         * @param height           Render height
-         * @param outWidth         Output width
-         * @param outHeight        Output height
-         * @return 1 on success, 0 on failure
-         */
-        int initDLSS(long vkInstance, long vkPhysicalDevice, long vkDevice, int width, int height, int outWidth,
-                        int outHeight);
-
-        /**
-         * Cleans up the DLSS feature and releases resources.
-         * 
-         * @param vkDevice Vulkan logical device pointer
-         */
-        void destroyDLSS(long vkDevice);
-
-        /**
-         * Evaluates the DLSS feature for a single frame.
-         * 
-         * @param vkCommandBuffer        Vulkan command buffer pointer where the DLSS
-         *                               commands will be recorded
-         * @param colorImageView         Vulkan image view pointer for the
-         *                               noisy/jittered color input
-         * @param colorImage             Vulkan image pointer
-         * @param depthImageView         Vulkan image view pointer for the depth buffer
-         * @param depthImage             Vulkan image pointer
-         * @param motionVectorsImageView Vulkan image view pointer for the motion
-         *                               vectors
-         * @param motionVectorsImage     Vulkan image pointer
-         * @param outputImageView        Vulkan image view pointer for the
-         *                               anti-aliased/upscaled output
-         * @param outputImage            Vulkan image pointer
-         * @param jitterX                Jitter offset X in sub-pixel space (-0.5 to
-         *                               0.5)
-         * @param jitterY                Jitter offset Y in sub-pixel space (-0.5 to
-         *                               0.5)
-         * @return 1 on success, 0 on failure
-         */
-        int evaluateDLSS(long vkCommandBuffer,
-                        long colorImageView, long colorImage, int colorFormat,
-                        long depthImageView, long depthImage, int depthFormat,
-                        long motionVectorsImageView, long motionVectorsImage, int motionVectorsFormat,
-                        long outputImageView, long outputImage, int outputFormat,
-                        float jitterX, float jitterY);
-
-        // ========================================================================
-        // DLSSD (Ray Reconstruction) Functions
-        // ========================================================================
-
-        /**
-         * Initializes the DLSSD (Ray Reconstruction) feature.
-         * 
-         * DLSSD uses AI to denoise ray-traced images, replacing traditional denoisers
-         * with a neural network trained on ray-tracing noise patterns.
-         * 
-         * @param vkInstance       Vulkan instance pointer
-         * @param vkPhysicalDevice Vulkan physical device pointer
-         * @param vkDevice         Vulkan logical device pointer
-         * @param width            Render width (internal resolution)
-         * @param height           Render height (internal resolution)
-         * @param outWidth         Output width (target resolution)
-         * @param outHeight        Output height (target resolution)
-         * @param denoiseMode      Denoise mode: 0=Off, 1=DLUnified (Ray Reconstruction)
-         * @param roughnessMode    Roughness mode: 0=Unpacked (separate texture),
-         *                         1=Packed (in normals.w)
-         * @param depthType        Depth type: 0=Linear, 1=HW Depth
-         * @return 1 on success, 0 on failure
-         */
-        int initDLSSD(
-                        long vkInstance,
-                        long vkPhysicalDevice,
-                        long vkDevice,
-                        int width, int height,
-                        int outWidth, int outHeight,
-                        int denoiseMode,
-                        int roughnessMode,
-                        int depthType,
-                        int perfQualityValue);
-
-        /**
-         * Cleans up the DLSSD feature and releases resources.
-         * 
-         * @param vkDevice Vulkan logical device pointer
-         */
-        void destroyDLSSD(long vkDevice);
-
-    /**
-     * Evaluates DLSSD (Ray Reconstruction) for a single frame.
-     *
-     * This function takes the noisy ray-traced output along with G-buffer data
-     * and produces a denoised, high-quality image using AI.
-     *
-     * @param vkCommandBuffer Vulkan command buffer pointer
-     * @param colorImageView Noisy ray-traced color input image view
-     * @param colorImage Noisy ray-traced color input image
-     * @param depthImageView Depth buffer image view
-     * @param depthImage Depth buffer image
-     * @param mvImageView Motion vectors image view
-     * @param mvImage Motion vectors image
-     * @param diffuseAlbedoImageView Diffuse albedo (RGB surface color) image view
-     * @param diffuseAlbedoImage Diffuse albedo image
-     * @param specularAlbedoImageView Specular albedo (F0 reflectance) image view
-     * @param specularAlbedoImage Specular albedo image
-     * @param normalsImageView World-space normals image view (roughness in
-     * .w if packed)
-     * @param normalsImage Normals image
-     * @param roughnessImageView Roughness image view (only if unpacked mode)
-     * @param roughnessImage Roughness image
-     * @param outputImageView Denoised output image view
-     * @param outputImage Denoised output image
-     * @param jitterX Jitter offset X in sub-pixel space (-0.5 to
-     * 0.5)
-     * @param jitterY Jitter offset Y in sub-pixel space (-0.5 to
-     * 0.5)
-     * @param reset Set to 1 when scene changes completely (new
-     * level, teleport, etc.)
-     * @param frameTimeDeltaMs Frame time in milliseconds for temporal
-     * stability
-     * @return 1 on success, 0 on failure
-     */
-    int evaluateDLSSD(
-        long vkCommandBuffer,
-        // Standard inputs
-        long colorImageView, long colorImage, int colorFormat,
-        long depthImageView, long depthImage, int depthFormat,
-        long mvImageView, long mvImage, int mvFormat,
-        // G-buffer inputs for Ray Reconstruction
-        long diffuseAlbedoImageView, long diffuseAlbedoImage, int diffuseAlbedoFormat,
-        long specularAlbedoImageView, long specularAlbedoImage, int specularAlbedoFormat,
-        long normalsImageView, long normalsImage, int normalsFormat,
-        long roughnessImageView, long roughnessImage, int roughnessFormat,
-        // Output
-        long outputImageView, long outputImage, int outputFormat,
-        // Parameters
-        float jitterX, float jitterY,
-        int reset,
-        float frameTimeDeltaMs);
-
-        /**
-         * Check if DLSSD (Ray Reconstruction) is available on this system.
-         * 
-         * @return 1 if available, 0 if not
-         */
+    // JNA interface to native library
+    private interface NativeDLSS extends Library {
+        // DLSSD availability check - maps to isDLSSDAvailable()
         int isDLSSDAvailable();
 
-        /**
-         * Get the required render resolution for a given output resolution and quality
-         * preset.
-         * 
-         * @param outWidth        Output/target width
-         * @param outHeight       Output/target height
-         * @param qualityPreset   Quality preset: 0=Native, 1=Quality, 2=Balanced,
-         *                        3=Performance, 4=UltraPerformance
-         * @param outRenderWidth  Array to receive calculated render width
-         * @param outRenderHeight Array to receive calculated render height
-         */
-        void getDLSSDRenderResolution(
-                        int outWidth, int outHeight,
-                        int qualityPreset,
-                        int[] outRenderWidth, int[] outRenderHeight);
+        // DLSSD initialization - maps to initDLSSD()
+        int initDLSSD(
+            long instance,
+            long physicalDevice,
+            long device,
+            int width, int height,
+            int outWidth, int outHeight,
+            int denoiseMode,
+            int roughnessMode,
+            int depthType,
+            int perfQualityValue);
 
-        // ========================================================================
-        // Constants for DLSSD parameters
-        // ========================================================================
+        // DLSSD evaluation - maps to evaluateDLSSD()
+        int evaluateDLSSD(
+            long cmdBuffer,
+            long colorImageView, long colorImage, int colorFormat,
+            long depthImageView, long depthImage, int depthFormat,
+            long mvImageView, long mvImage, int mvFormat,
+            long diffuseAlbedoImageView, long diffuseAlbedoImage, int diffuseAlbedoFormat,
+            long specularAlbedoImageView, long specularAlbedoImage, int specularAlbedoFormat,
+            long normalsImageView, long normalsImage, int normalsFormat,
+            long roughnessImageView, long roughnessImage, int roughnessFormat,
+            long specularHitDepthImageView, long specularHitDepthImage, int specularHitDepthFormat,
+            long outputImageView, long outputImage, int outputFormat,
+            float jitterX, float jitterY,
+            int reset, float frameTimeDeltaMs,
+            float[] worldToViewMatrix, float[] viewToClipMatrix);
 
-        /** Denoise mode: Ray Reconstruction disabled */
-        int DENOISE_MODE_OFF = 0;
-        /** Denoise mode: DL Unified (Ray Reconstruction enabled) */
-        int DENOISE_MODE_DLUNIFIED = 1;
+        // DLSSD destruction - maps to destroyDLSSD()
+        void destroyDLSSD(long device);
 
-        /** Roughness mode: Separate roughness texture */
-        int ROUGHNESS_MODE_UNPACKED = 0;
-        /** Roughness mode: Roughness packed in normals.w */
-        int ROUGHNESS_MODE_PACKED = 1;
+        // NGX initialization - maps to initializeNGX()
+        int initializeNGX(long instance, long physicalDevice, long device, String dlssPath);
 
-        /** Depth type: Linear depth (distance from camera) */
-        int DEPTH_TYPE_LINEAR = 0;
-        /** Depth type: Hardware depth (standard OpenGL non-linear: 0.0=near, 1.0=far) */
-        int DEPTH_TYPE_HW = 1;
+        // Standard DLSS initialization - maps to initDLSS()
+        int initDLSS(long instance, long physicalDevice, long device, int width, int height, int outWidth, int outHeight);
 
-        /** Quality preset: Native resolution (no upscaling) */
-        int QUALITY_NATIVE = 0;
-        /** Quality preset: Quality (66.7% resolution) */
-        int QUALITY_QUALITY = 1;
-        /** Quality preset: Balanced (58.3% resolution) */
-        int QUALITY_BALANCED = 2;
-        /** Quality preset: Performance (50% resolution) */
-        int QUALITY_PERFORMANCE = 3;
-        /** Quality preset: Ultra Performance (33.3% resolution) */
-        int QUALITY_ULTRA_PERFORMANCE = 4;
+        // Standard DLSS evaluation - maps to evaluateDLSS()
+        int evaluateDLSS(
+            long cmdBuffer,
+            long colorImageView, long colorImage, int colorFormat,
+            long depthImageView, long depthImage, int depthFormat,
+            long mvImageView, long mvImage, int mvFormat,
+            long outputImageView, long outputImage, int outputFormat,
+            float jitterX, float jitterY);
+
+        // Standard DLSS destruction - maps to destroyDLSS()
+        void destroyDLSS(long device);
+
+        // Get render resolution - maps to getDLSSDRenderResolution()
+        void getDLSSDRenderResolution(int outWidth, int outHeight, int qualityPreset, int[] outRenderWidth, int[] outRenderHeight);
+
+        // NGX Extension Discovery (must be called BEFORE Vulkan instance/device creation)
+        int getNGXInstanceExtensionCount();
+        String getNGXInstanceExtension(int index);
+        int getNGXDeviceExtensionCount(long instance, long physicalDevice);
+        String getNGXDeviceExtension(long instance, long physicalDevice, int index);
+    }
+
+    private static NativeDLSS nativeLib = null;
+
+    static {
+        loadNativeLibrary();
+    }
+
+    /**
+     * Load the native DLSS bridge library.
+     */
+    private static void loadNativeLibrary() {
+        if (nativeLibraryLoadAttempted) {
+            return;
+        }
+        nativeLibraryLoadAttempted = true;
+
+        try {
+            // Try to load the native library using JNA
+            nativeLib = Native.load("vulkanite_dlss_bridge", NativeDLSS.class);
+            nativeLibraryLoaded = true;
+            LOGGER.info("DLSS bridge native library loaded successfully via JNA");
+        } catch (UnsatisfiedLinkError e) {
+            LOGGER.warn("Failed to load DLSS bridge native library: {}", e.getMessage());
+            LOGGER.info("DLSS functionality will be disabled");
+            nativeLibraryLoaded = false;
+        }
+    }
+
+    /**
+     * Check if the native library is loaded.
+     *
+     * @return true if the native library was loaded successfully
+     */
+    public static boolean isNativeLibraryLoaded() {
+        return nativeLibraryLoaded;
+    }
+
+    /**
+     * Check if DLSSD (Ray Reconstruction) is supported.
+     *
+     * @return true if DLSSD is available
+     */
+    public static boolean isDLSSDSupported() {
+        if (!nativeLibraryLoaded || nativeLib == null) {
+            return false;
+        }
+        try {
+            return nativeLib.isDLSSDAvailable() != 0;
+        } catch (UnsatisfiedLinkError e) {
+            LOGGER.warn("Native method not available: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Query NGX-required Vulkan instance extensions.
+     * MUST be called BEFORE VkInstance creation so these extensions can be enabled.
+     *
+     * @return list of required extension names, empty if native lib unavailable
+     */
+    public static List<String> getRequiredInstanceExtensions() {
+        List<String> extensions = new java.util.ArrayList<>();
+        if (!nativeLibraryLoaded || nativeLib == null) {
+            return extensions;
+        }
+        try {
+            int count = nativeLib.getNGXInstanceExtensionCount();
+            for (int i = 0; i < count; i++) {
+                String ext = nativeLib.getNGXInstanceExtension(i);
+                if (ext != null && !ext.isEmpty()) {
+                    extensions.add(ext);
+                    LOGGER.info("NGX requires instance extension: {}", ext);
+                }
+            }
+        } catch (UnsatisfiedLinkError e) {
+            LOGGER.warn("getNGXInstanceExtension not available: {}", e.getMessage());
+        }
+        return extensions;
+    }
+
+    /**
+     * Query NGX-required Vulkan device extensions.
+     * MUST be called AFTER physical device selection but BEFORE VkDevice creation.
+     *
+     * @param instance VkInstance handle
+     * @param physicalDevice VkPhysicalDevice handle
+     * @return list of required extension names, empty if native lib unavailable
+     */
+    public static List<String> getRequiredDeviceExtensions(long instance, long physicalDevice) {
+        List<String> extensions = new java.util.ArrayList<>();
+        if (!nativeLibraryLoaded || nativeLib == null) {
+            return extensions;
+        }
+        try {
+            int count = nativeLib.getNGXDeviceExtensionCount(instance, physicalDevice);
+            for (int i = 0; i < count; i++) {
+                String ext = nativeLib.getNGXDeviceExtension(instance, physicalDevice, i);
+                if (ext != null && !ext.isEmpty()) {
+                    extensions.add(ext);
+                    LOGGER.info("NGX requires device extension: {}", ext);
+                }
+            }
+        } catch (UnsatisfiedLinkError e) {
+            LOGGER.warn("getNGXDeviceExtension not available: {}", e.getMessage());
+        }
+        return extensions;
+    }
+
+    /**
+     * Create a DLSSD feature.
+     *
+     * @param instance The Vulkan instance handle
+     * @param physicalDevice The Vulkan physical device handle
+     * @param device The Vulkan device handle
+     * @param renderWidth The render width
+     * @param renderHeight The render height
+     * @param outputWidth The output width
+     * @param outputHeight The output height
+     * @param qualityMode The quality mode (NGX_PERF_QUALITY_* value)
+     * @param roughnessMode The roughness mode (ROUGHNESS_MODE_PACKED or UNPACKED)
+     * @param depthType The depth type (DEPTH_TYPE_LINEAR or HW)
+     * @return The feature handle, or 0 on failure
+     */
+    public static long createDLSSDFeature(
+        long instance, long physicalDevice, long device,
+        int renderWidth, int renderHeight,
+        int outputWidth, int outputHeight,
+        int qualityMode,
+        int roughnessMode,
+        int depthType) {
+
+        if (!nativeLibraryLoaded || nativeLib == null) {
+            LOGGER.warn("Cannot create DLSSD feature - native library not loaded");
+            return 0;
+        }
+
+        try {
+            // Note: The native initDLSSD returns an NGX result code, not a handle.
+            // We use a non-zero value to indicate success since the native code
+            // manages the feature internally as a singleton.
+            int result = nativeLib.initDLSSD(
+                instance, physicalDevice,
+                device,
+                renderWidth, renderHeight,
+                outputWidth, outputHeight,
+                1, // denoiseMode - Ray Reconstruction
+                roughnessMode,
+                depthType,
+                qualityMode);
+
+            if (result != 1) { // NVSDK_NGX_Result_Success = 1
+                LOGGER.error("Native initDLSSD failed with error code: {}", result);
+                return 0;
+            }
+
+            // Return a non-zero handle to indicate success
+            // The actual feature is managed internally by the native bridge
+            long handle = 1; // Use 1 as success indicator
+            LOGGER.info("DLSSD feature created: handle={}, render={}x{}, output={}x{}",
+                handle, renderWidth, renderHeight, outputWidth, outputHeight);
+            return handle;
+
+        } catch (UnsatisfiedLinkError e) {
+            LOGGER.error("Native method not available: {}", e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * Evaluate DLSSD for a frame.
+     *
+     * @param commandBuffer The Vulkan command buffer
+     * @param featureHandle The feature handle from createDLSSDFeature
+     * @param colorImage The noisy color input image
+     * @param colorFormat The color image format
+     * @param depthView The depth image view (or 0 to use image directly)
+     * @param depthImage The depth VkImage handle
+     * @param depthFormat The depth image format
+     * @param motionVectorsImage The motion vectors image
+     * @param motionVectorsFormat The motion vectors format
+     * @param outputView The output image view (or 0 to use image directly)
+     * @param outputImage The output VkImage handle
+     * @param outputFormat The output format
+     * @param diffuseAlbedoView The diffuse albedo image view (or 0)
+     * @param diffuseAlbedoImage The diffuse albedo image (required if view is 0)
+     * @param diffuseAlbedoFormat The diffuse albedo format
+     * @param specularAlbedoView The specular albedo image view (or 0)
+     * @param specularAlbedoImage The specular albedo image (required if view is 0)
+     * @param specularAlbedoFormat The specular albedo format
+     * @param normalsView The normals image view (or 0)
+     * @param normalsImage The normals image (required if view is 0)
+     * @param normalsFormat The normals format
+     * @param roughnessView The roughness image view (or 0, if packed in normals)
+     * @param roughnessImage The roughness image (or 0 if packed in normals)
+     * @param roughnessFormat The roughness format
+     * @param jitterX The jitter X offset in pixel space
+     * @param jitterY The jitter Y offset in pixel space
+     * @param reset 1 to reset temporal history, 0 otherwise
+     * @param deltaTimeMs The frame delta time in milliseconds
+     * @param renderWidth The render width
+     * @param renderHeight The render height
+     * @return true if evaluation succeeded
+     */
+    public static boolean evaluateDLSSD(
+        long commandBuffer,
+        long featureHandle,
+        long colorView, long colorImage, int colorFormat,
+        long depthView, long depthImage, int depthFormat,
+        long motionVectorsView, long motionVectorsImage, int motionVectorsFormat,
+        long outputView, long outputImage, int outputFormat,
+        long diffuseAlbedoView, long diffuseAlbedoImage, int diffuseAlbedoFormat,
+        long specularAlbedoView, long specularAlbedoImage, int specularAlbedoFormat,
+        long normalsView, long normalsImage, int normalsFormat,
+        long roughnessView, long roughnessImage, int roughnessFormat,
+        long specularHitDepthView, long specularHitDepthImage, int specularHitDepthFormat,
+        float jitterX, float jitterY,
+        int reset,
+        float deltaTimeMs,
+        float[] worldToViewMatrix,
+        float[] viewToClipMatrix,
+        int renderWidth, int renderHeight) {
+
+        if (!nativeLibraryLoaded || nativeLib == null) {
+            LOGGER.warn("Cannot evaluate DLSSD - native library not loaded");
+            return false;
+        }
+
+        try {
+            // Pass views and images to native code
+            // Native expects (view, image, format) triplets for each resource
+            int result = nativeLib.evaluateDLSSD(
+                commandBuffer,
+                colorView, colorImage, colorFormat,             // colorView, colorImage, colorFormat
+                depthView, depthImage, depthFormat,      // depthView, depthImage, depthFormat
+                motionVectorsView, motionVectorsImage, motionVectorsFormat, // mvView, mvImage, mvFormat
+                diffuseAlbedoView, diffuseAlbedoImage, diffuseAlbedoFormat,
+                specularAlbedoView, specularAlbedoImage, specularAlbedoFormat,
+                normalsView, normalsImage, normalsFormat,
+                roughnessView, roughnessImage, roughnessFormat,
+                specularHitDepthView, specularHitDepthImage, specularHitDepthFormat,
+                outputView, outputImage, outputFormat,   // outputView, outputImage, outputFormat
+                jitterX, jitterY,
+                reset, deltaTimeMs,
+                worldToViewMatrix, viewToClipMatrix);
+
+            return result == 1; // NVSDK_NGX_Result_Success = 1
+
+        } catch (UnsatisfiedLinkError e) {
+            LOGGER.error("Native method not available: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Release a DLSSD feature.
+     *
+     * @param featureHandle The feature handle to release
+     */
+    public static void releaseDLSSDFeature(long featureHandle) {
+        if (!nativeLibraryLoaded || nativeLib == null) {
+            return;
+        }
+        try {
+            nativeLib.destroyDLSSD(0); // device not used in current implementation
+            LOGGER.info("DLSSD feature released: handle={}", featureHandle);
+        } catch (UnsatisfiedLinkError e) {
+            LOGGER.warn("Native method not available: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Initialize standard DLSS Super Resolution feature.
+     * This is the fallback when DLSSD (Ray Reconstruction) is not available.
+     *
+     * @param instance VkInstance handle
+     * @param physicalDevice VkPhysicalDevice handle
+     * @param device VkDevice handle
+     * @param renderWidth Render (input) width
+     * @param renderHeight Render (input) height
+     * @param outputWidth Output (display) width
+     * @param outputHeight Output (display) height
+     * @return true if initialization succeeded
+     */
+    public static boolean initStandardDLSS(
+            long instance, long physicalDevice, long device,
+            int renderWidth, int renderHeight,
+            int outputWidth, int outputHeight) {
+        if (!nativeLibraryLoaded || nativeLib == null) {
+            LOGGER.warn("Cannot init standard DLSS - native library not loaded");
+            return false;
+        }
+        try {
+            int result = nativeLib.initDLSS(instance, physicalDevice, device,
+                    renderWidth, renderHeight, outputWidth, outputHeight);
+            if (result == 1) { // NVSDK_NGX_Result_Success = 1
+                LOGGER.info("Standard DLSS initialized: render={}x{}, output={}x{}",
+                        renderWidth, renderHeight, outputWidth, outputHeight);
+                return true;
+            } else {
+                LOGGER.error("Standard DLSS init failed with code: {}", result);
+                return false;
+            }
+        } catch (UnsatisfiedLinkError e) {
+            LOGGER.error("Standard DLSS native method not available: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Evaluate standard DLSS Super Resolution for a frame.
+     * Standard DLSS performs temporal upscaling without ray reconstruction denoising.
+     *
+     * @param commandBuffer VkCommandBuffer handle
+     * @param colorImage Noisy color input VkImage
+     * @param colorFormat Color image Vulkan format
+     * @param depthView Depth VkImageView (or 0)
+     * @param depthImage Depth VkImage handle
+     * @param depthFormat Depth Vulkan format
+     * @param motionVectorsImage Motion vectors VkImage
+     * @param motionVectorsFormat Motion vectors Vulkan format
+     * @param outputView Output VkImageView (or 0)
+     * @param outputImage Output VkImage handle
+     * @param outputFormat Output Vulkan format
+     * @param jitterX Jitter X offset in pixel space
+     * @param jitterY Jitter Y offset in pixel space
+     * @return true if evaluation succeeded
+     */
+    public static boolean evaluateStandardDLSS(
+            long commandBuffer,
+            long colorView, long colorImage, int colorFormat,
+            long depthView, long depthImage, int depthFormat,
+            long motionVectorsView, long motionVectorsImage, int motionVectorsFormat,
+            long outputView, long outputImage, int outputFormat,
+            float jitterX, float jitterY) {
+        if (!nativeLibraryLoaded || nativeLib == null) {
+            LOGGER.warn("Cannot evaluate standard DLSS - native library not loaded");
+            return false;
+        }
+        try {
+            int result = nativeLib.evaluateDLSS(
+                commandBuffer,
+                colorView, colorImage, colorFormat,           // colorView, colorImage, format
+                depthView, depthImage, depthFormat,    // depthView, depthImage, format
+                motionVectorsView, motionVectorsImage, motionVectorsFormat, // mvView, mvImage, format
+                outputView, outputImage, outputFormat, // outputView, outputImage, format
+                jitterX, jitterY);
+            return result == 1; // NVSDK_NGX_Result_Success = 1
+        } catch (UnsatisfiedLinkError e) {
+            LOGGER.error("Standard DLSS evaluate native method not available: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Destroy standard DLSS feature.
+     *
+     * @param device VkDevice handle
+     */
+    public static void destroyStandardDLSS(long device) {
+        if (!nativeLibraryLoaded || nativeLib == null) return;
+        try {
+            nativeLib.destroyDLSS(device);
+            LOGGER.info("Standard DLSS destroyed");
+        } catch (UnsatisfiedLinkError e) {
+            LOGGER.warn("Standard DLSS destroy native method not available: {}", e.getMessage());
+        }
+    }
 }

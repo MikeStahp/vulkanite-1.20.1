@@ -30,8 +30,10 @@ public abstract class MixinResourceTexture extends AbstractTexture implements IV
     private void redirect(int id, int maxLevel, int width, int height) {
         GlStateManager._bindTexture(0);
         RenderSystem.assertOnRenderThreadOrInit();
-        if (getVGImage() != null) {
+        var existingImage = getVGImage();
+        if (existingImage != null) {
             System.err.println("Vulkan image already allocated, releasing");
+            existingImage.close();
             setVGImage(null);
         }
 

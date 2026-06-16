@@ -34,11 +34,15 @@ import static org.lwjgl.vulkan.VK12.vkWaitSemaphores;
 //Manages multiple command queues and fence synchronizations
 public class CommandManager {
     private static final Logger LOGGER = LoggerFactory.getLogger(CommandManager.class);
+    private static final long HOST_WAIT_SLICE_NS = 500_000_000L;
+    private static final long HOST_WAIT_LOG_INTERVAL_NS = 2_000_000_000L;
+    private static final long HOST_WAIT_TIMEOUT_NS = 10_000_000_000L;
     /**
      * Thread-safe queue for pending submissions from non-render threads.
      * All submissions are processed on the render thread to ensure thread safety.
      */
     private final ConcurrentLinkedQueue<CommandSubmissionRequest> pendingSubmissions = new ConcurrentLinkedQueue<>();
+    private final List<InFlightSubmission> inFlightSubmissions = new ArrayList<>();
     // Frame pacing control
     private long lastFrameTime = System.nanoTime();
     private long targetFrameTimeNs = 16666667; // 60 FPS target
@@ -139,9 +143,33 @@ public class CommandManager {
                     .semaphoreCount(1)
                     .pValues(stack.longs(execution));
 
-            LOGGER.debug("About to call vkWaitSemaphores with timeout=-1 (infinite)");
             long waitStart = System.nanoTime();
-            _CHECK_(vkWaitSemaphores(device, waitInfo, -1));
+            long lastWaitLog = waitStart;
+            while (true) {
+                int result = vkWaitSemaphores(device, waitInfo, HOST_WAIT_SLICE_NS);
+                if (result == VK_SUCCESS) {
+                    break;
+                }
+
+                long elapsedNs = System.nanoTime() - waitStart;
+                if (result == VK_TIMEOUT) {
+                    if (elapsedNs >= HOST_WAIT_TIMEOUT_NS) {
+                        Vulkanite.IS_ENABLED = false;
+                        throw new DeviceLostException("Timed out waiting for queue " + waitQueueId
+                                + " execution " + execution + " after " + (elapsedNs / 1_000_000) + "ms");
+                    }
+                    long now = System.nanoTime();
+                    if (now - lastWaitLog >= HOST_WAIT_LOG_INTERVAL_NS) {
+                        LOGGER.warn("Waiting for queue {} execution {} for {}ms",
+                                waitQueueId, execution, elapsedNs / 1_000_000);
+                        lastWaitLog = now;
+                    }
+                    continue;
+                }
+
+                Vulkanite.IS_ENABLED = false;
+                _CHECK_(result);
+            }
             long waitDuration = (System.nanoTime() - waitStart) / 1_000_000;
             LOGGER.debug("vkWaitSemaphores completed after {}ms", waitDuration);
         }
@@ -206,87 +234,60 @@ public class CommandManager {
     /**
      * Processes all pending submission requests on the render thread.
      * This method must be called from the render thread only.
-     * It drains the pending submissions queue and submits each request.
+     * It drains the pending submissions queue and polls earlier submissions for GPU
+     * completion without blocking the render thread.
      */
     public void processPendingSubmissions() {
         RenderSystem.assertOnRenderThread();
 
+        completeFinishedSubmissions();
+
         CommandSubmissionRequest request;
         while ((request = pendingSubmissions.poll()) != null) {
             try {
-                // Submit on the render thread
                 long timelineValue = submit(
                         request.getQueueIndex(),
                         request.getCommandBuffer(),
                         request.getWaitSemaphores(),
                         request.getSignalSemaphores(),
                         request.getFence());
-
-                // FIX: Wait for GPU to complete before completing the future.
-                // This ensures that any query pool results or other GPU-written data
-                // are ready before the waiting thread (e.g., BLASBuildWorker) proceeds.
-                // Without this wait, VK_ERROR_DEVICE_LOST can occur when the GPU is
-                // still processing heavy workloads (e.g., ray tracing) while the CPU
-                // tries to read query results.
-                // Use timeout instead of infinite wait to avoid blocking render thread
-                // indefinitely
-                long timeoutNs = 500_000_000L; // 500ms timeout
-                int maxAttempts = 2;
-                int attempt = 0;
-                int waitResult = VK_SUCCESS;
-
-                try (var stack = stackPush()) {
-                    var queue = queues[request.getQueueIndex()];
-                    VkSemaphoreWaitInfo waitInfo = VkSemaphoreWaitInfo.calloc(stack)
-                            .sType$Default()
-                            .pSemaphores(stack.longs(queue.timelineSema.get().address()))
-                            .semaphoreCount(1)
-                            .pValues(stack.longs(timelineValue));
-
-                    while (attempt < maxAttempts) {
-                        waitResult = vkWaitSemaphores(device, waitInfo, timeoutNs);
-                        if (waitResult == VK_SUCCESS) {
-                            break;
-                        } else if (waitResult == VK_TIMEOUT) {
-                            attempt++;
-                            LOGGER.warn("[CommandManager] GPU wait timeout (attempt {}/{}), timeline value: {}",
-                                    attempt, maxAttempts, timelineValue);
-                            if (attempt >= maxAttempts) {
-                                LOGGER.error("[CommandManager] GPU wait failed after {} attempts, possible device hang",
-                                        maxAttempts);
-                                // CRITICAL FIX: Disable Vulkanite and throw DeviceLostException
-                                // to prevent cascade of failures from subsequent submissions
-                                Vulkanite.IS_ENABLED = false;
-                                var deviceLostException = new DeviceLostException(
-                                        "GPU hang detected after " + maxAttempts + " timeout attempts");
-                                request.completeExceptionally(deviceLostException);
-                                throw deviceLostException;
-                            }
-                        } else {
-                            // Actual error - likely device lost
-                            LOGGER.error("[CommandManager] vkWaitSemaphores failed with error: {}", waitResult);
-                            Vulkanite.IS_ENABLED = false;
-                            var deviceLostException = new DeviceLostException(
-                                    "vkWaitSemaphores failed with error: " + waitResult);
-                            request.completeExceptionally(deviceLostException);
-                            throw deviceLostException;
-                        }
-                    }
-
-                    if (waitResult != VK_SUCCESS) {
-                        continue; // Move to next request
-                    }
-                    queue.updateCompletedTimestamp(timelineValue);
-                    queue.collect();
-                }
-
-                // Complete the future to notify the waiting thread (GPU work is now done)
-                request.complete(timelineValue);
+                inFlightSubmissions.add(new InFlightSubmission(request, timelineValue));
             } catch (Exception e) {
-                // Complete exceptionally on error
                 request.completeExceptionally(e);
             }
         }
+
+        completeFinishedSubmissions();
+    }
+
+    private void completeFinishedSubmissions() {
+        if (inFlightSubmissions.isEmpty()) {
+            return;
+        }
+
+        long[] observedExecutions = new long[queues.length];
+        Arrays.fill(observedExecutions, Long.MIN_VALUE);
+
+        inFlightSubmissions.removeIf(submission -> {
+            int queueIndex = submission.request().getQueueIndex();
+            var queue = queues[queueIndex];
+            long completed = queue.completedTimestamp.get();
+
+            if (completed < submission.timelineValue()) {
+                if (observedExecutions[queueIndex] == Long.MIN_VALUE) {
+                    observedExecutions[queueIndex] = queue.getCurrentExecution();
+                    queue.updateCompletedTimestamp(observedExecutions[queueIndex]);
+                    queue.collect();
+                }
+                completed = queue.completedTimestamp.get();
+            }
+
+            if (completed >= submission.timelineValue()) {
+                submission.request().complete(submission.timelineValue());
+                return true;
+            }
+            return false;
+        });
     }
 
     public void waitQueueIdle(int queue) {
@@ -322,6 +323,11 @@ public class CommandManager {
         for (var queue : queues) {
             queue.newFrame();
         }
+
+        completeFinishedSubmissions();
+    }
+
+    private record InFlightSubmission(CommandSubmissionRequest request, long timelineValue) {
     }
 
     /**

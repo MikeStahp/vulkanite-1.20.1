@@ -1,575 +1,608 @@
 package me.cortex.vulkanite.client.config;
 
-import com.google.gson.*;
-import me.cortex.vulkanite.client.rendering.DLSSRayReconstruction.DLSSQualityPreset;
+import me.cortex.vulkanite.client.ShaderpackSettingsHandler;
+import net.fabricmc.loader.api.FabricLoader;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.*;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.util.Properties;
 
 /**
- * DLSS Configuration System
- *
- * This class manages upscaling/denoising settings including:
- * - Denoiser selection (DLSS, FSR, Basic)
- * - DLSS settings (quality preset, ray reconstruction, sharpening)
- * - FSR settings (quality preset, sharpening)
- *
- * Configuration is stored in a JSON file that can be edited by users.
- * Default location: .minecraft/vulkanite/dlss_config.json
- *
- * Example configuration:
- * {
- * "denoiser": "DLSS",
- * "enabled": true,
- * "qualityPreset": "QUALITY",
- * "rayReconstructionEnabled": true,
- * "sharpening": 0.5,
- * "fsrQualityPreset": "QUALITY",
- * "fsrSharpeningStrength": 0.5
- * }
+ * Configuration class for DLSS/FSR upscaling and denoising settings.
+ * Uses singleton pattern with file persistence.
+ * 
+ * Settings include:
+ * - Render style (auto-detected: Deferred, RTX, Vanilla)
+ * - Denoiser type (DLSS, FSR, DLSS_RR)
+ * - Quality presets
+ * - ReSTIR toggle
+ * - Debug mode
+ * - World lighting parameters
  */
 public class DLSSConfig {
-
-    // Singleton instance - ensures all code uses the same configuration
-    private static DLSSConfig INSTANCE = null;
+    private static final Logger LOGGER = LoggerFactory.getLogger(DLSSConfig.class);
+    private static final String CONFIG_FILE_NAME = "vulkanite-dlss.properties";
     
-    // Configuration file path
-    private static final Path CONFIG_PATH = Paths.get("vulkanite", "dlss_config.json");
+    private static volatile DLSSConfig INSTANCE;
+    private volatile boolean dirty = false;
 
-    // Denoiser selection
-    private String denoiser; // DLSS, FSR, BASIC
+    // =====================================================================
+    // NESTED ENUMS
+    // =====================================================================
 
-    // Rendering Pipeline
-    private String pipeline; // RASTER, DEFERRED, RTX
+    /**
+     * Type of denoiser/upscaler to use
+     */
+    public enum DenoiserType {
+        NONE("None", "No upscaling/denoising"),
+        DLSS("DLSS", "NVIDIA DLSS upscaling"),
+        FSR("FSR", "AMD FSR upscaling"),
+        DLSS_RR("DLSS_RR", "NVIDIA DLSS Ray Reconstruction");
 
-    // Master enable/disable
-    private boolean enabled;
+        private final String displayName;
+        private final String description;
 
-    // DLSS settings
-    private String qualityPreset;
-    private boolean rayReconstructionEnabled;
-    private float sharpening;
-    private boolean roughnessPacked;
+        DenoiserType(String displayName, String description) {
+            this.displayName = displayName;
+            this.description = description;
+        }
 
-    // FSR settings
-    private String fsrQualityPreset;
-    private float fsrSharpeningStrength;
-
-    // Advanced settings
-    private boolean debugMode;
-    private boolean showPerformanceMetrics;
-
-    // RT Quality Settings
-    private float sunIntensity;
-    private float indirectScale;
-    private float ambientFactor;
-    private float minLighting;
-    private float specularIntensity;
-    private float gamma;
-
-    // ReSTIR Settings
-    private boolean enableReSTIR;
-    private int restirMaxHistory;
-    private float restirSpatialRadius;
-    private int restirSpatialSamples;
-
-    public DLSSConfig() {
-        // Default values
-        this.denoiser = "DLSS";
-        this.pipeline = "RASTER";
-        this.enabled = false; // Disabled by default until SDK is implemented
-        this.qualityPreset = "QUALITY";
-        this.rayReconstructionEnabled = true;
-        this.sharpening = 0.5f;
-        this.roughnessPacked = true;
-
-        // FSR defaults
-        this.fsrQualityPreset = "QUALITY";
-        this.fsrSharpeningStrength = 0.5f;
-
-        // Advanced defaults
-        this.debugMode = false;
-        this.showPerformanceMetrics = false;
-
-        // RT Quality defaults
-        this.sunIntensity = 1.8f;
-        this.indirectScale = 0.6f;
-        this.ambientFactor = 0.05f;
-        this.minLighting = 0.05f;
-        this.specularIntensity = 1.0f;
-        this.gamma = 1.0f;
-
-        // ReSTIR defaults
-        this.enableReSTIR = true;
-        this.restirMaxHistory = 3;
-        this.restirSpatialRadius = 4.0f;
-        this.restirSpatialSamples = 2;
+        public String getDisplayName() { return displayName; }
+        public String getDescription() { return description; }
     }
 
     /**
-     * Get the singleton instance of the configuration.
-     * This ensures all code uses the same configuration object.
+     * Quality preset for upscaling - controls render resolution ratio
+     * Values match NVSDK_NGX_PerfQuality_Value enum from nvsdk_ngx_defs.h:
+     * 0 = MaxPerf (Performance), 1 = Balanced, 2 = MaxQuality (Quality),
+     * 3 = UltraPerformance, 4 = UltraQuality, 5 = DLAA
+     */
+    public enum QualityPreset {
+    	PERFORMANCE(0, 0.5f, "Performance", "Higher performance, reduced quality"),
+    	BALANCED(1, 0.583f, "Balanced", "Good balance of quality and performance"),
+    	QUALITY(2, 0.667f, "Quality", "Best image quality, lower performance"),
+    	ULTRA_PERFORMANCE(3, 0.333f, "Ultra Performance", "Maximum performance, lowest quality"),
+    	ULTRA_QUALITY(4, 0.77f, "Ultra Quality", "Near-native quality with some upscaling"),
+    	DLAA(5, 1.0f, "DLAA", "No upscaling, anti-aliasing only");
+   
+    	private final int ngxValue;
+    	private final float resolutionRatio;
+    	private final String displayName;
+    	private final String description;
+   
+    	QualityPreset(int ngxValue, float resolutionRatio, String displayName, String description) {
+    		this.ngxValue = ngxValue;
+    		this.resolutionRatio = resolutionRatio;
+    		this.displayName = displayName;
+    		this.description = description;
+    	}
+   
+    	public int getNgxValue() { return ngxValue; }
+    	public float getResolutionRatio() { return resolutionRatio; }
+    	public float getScale() { return resolutionRatio; }
+    	public String getDisplayName() { return displayName; }
+    	public String getDescription() { return description; }
+    }
+
+    /**
+     * FSR Quality preset - separate enum for FSR-specific scaling
+     */
+    public enum FSRQualityPreset {
+        QUALITY(0.667f, "Quality"),
+        BALANCED(0.583f, "Balanced"),
+        PERFORMANCE(0.5f, "Performance"),
+        ULTRA_PERFORMANCE(0.333f, "Ultra Performance");
+
+        private final float scale;
+        private final String displayName;
+
+        FSRQualityPreset(float scale, String displayName) {
+            this.scale = scale;
+            this.displayName = displayName;
+        }
+
+        public float getScale() { return scale; }
+        public String getDisplayName() { return displayName; }
+    }
+
+    /**
+     * Debug visualization type
+     */
+    public enum DebugType {
+        NONE("None", "No debug visualization"),
+        INPUT("Input", "Show DLSS input texture"),
+        OUTPUT("Output", "Show DLSS output texture"),
+        MOTION_VECTORS("Motion Vectors", "Show motion vectors"),
+        DEPTH("Depth", "Show depth buffer"),
+        NORMALS("Normals", "Show normal buffer");
+
+        private final String displayName;
+        private final String description;
+
+        DebugType(String displayName, String description) {
+            this.displayName = displayName;
+            this.description = description;
+        }
+
+        public String getDisplayName() { return displayName; }
+        public String getDescription() { return description; }
+    }
+
+    /**
+     * Render style - auto-detected based on shaderpack
+     */
+    public enum RenderStyle {
+        VANILLA("Vanilla", "Standard Minecraft rendering"),
+        DEFERRED("Deferred", "Compute-based deferred lighting"),
+        RTX("RTX", "Ray tracing enabled");
+
+        private final String displayName;
+        private final String description;
+
+        RenderStyle(String displayName, String description) {
+            this.displayName = displayName;
+            this.description = description;
+        }
+
+        public String getDisplayName() { return displayName; }
+        public String getDescription() { return description; }
+    }
+
+    // =====================================================================
+    // CONFIGURATION FIELDS
+    // =====================================================================
+
+    // Core DLSS Settings
+    private boolean dlssEnabled = true;
+    private boolean rayReconstructionEnabled = true;
+    private DenoiserType denoiserType = DenoiserType.DLSS_RR;
+    private QualityPreset qualityPreset = QualityPreset.QUALITY;
+    private DebugType debugType = DebugType.NONE;
+    private float sharpness = 0.5f;
+    private boolean motionVectorsEnabled = true;
+    private boolean jitterEnabled = true;
+
+    // FSR Settings
+    private boolean fsrEnabled = false;
+    private int fsrQuality = 1; // 0=Quality, 1=Balanced, 2=Performance, 3=Ultra Performance
+
+    // ReSTIR Settings
+    private boolean restirEnabled = false;
+
+    // World/Lighting Parameters
+    private float indirectScale = 1.0f;
+    private float ambientFactor = 0.1f;
+    private float minLighting = 0.01f;
+    private float specularIntensity = 1.0f;
+    private float gamma = 2.2f;
+
+    // Debug Settings
+    private int debugCellIndex = -1;
+
+    // =====================================================================
+    // SINGLETON ACCESS
+    // =====================================================================
+
+    /**
+     * Get the singleton instance with double-checked locking for thread safety.
      */
     public static DLSSConfig getInstance() {
         if (INSTANCE == null) {
-            INSTANCE = loadFromFile();
+            synchronized (DLSSConfig.class) {
+                if (INSTANCE == null) {
+                    INSTANCE = new DLSSConfig();
+                    INSTANCE.loadConfig();
+                }
+            }
         }
         return INSTANCE;
     }
-    
+
     /**
-     * Reload configuration from file (useful for GUI changes)
-     */
-    public static void reload() {
-        INSTANCE = loadFromFile();
-    }
-    
-    /**
-     * Load configuration - returns the singleton instance.
-     * This method exists for backward compatibility.
+     * Static load method for convenience - returns singleton instance.
+     * Used by: ResolutionScaleManager, VulkanPipeline, MixinProgramSet
      */
     public static DLSSConfig load() {
         return getInstance();
     }
 
-    /**
-     * Load configuration from file (internal method)
-     */
-    private static DLSSConfig loadFromFile() {
-        DLSSConfig config = new DLSSConfig();
+    // =====================================================================
+    // PERSISTENCE
+    // =====================================================================
 
-        try {
-            File configFile = CONFIG_PATH.toFile();
-            if (configFile.exists()) {
-                String json = Files.readString(CONFIG_PATH);
-                if (json == null || json.trim().isEmpty()) {
-                    System.err.println("[Vulkanite] DLSS configuration file is empty, using defaults");
-                    config.save(); // Overwrite with defaults
-                    return config;
-                }
+    private void loadConfig() {
+        File configFile = new File(FabricLoader.getInstance().getConfigDir().toFile(), CONFIG_FILE_NAME);
 
-                JsonElement element = JsonParser.parseString(json);
-                if (element == null || !element.isJsonObject()) {
-                    System.err.println("[Vulkanite] DLSS configuration file contains invalid JSON, using defaults");
-                    config.save(); // Overwrite with defaults
-                    return config;
-                }
-
-                JsonObject jsonObject = element.getAsJsonObject();
-
-                // Parse denoiser selection
-                if (jsonObject.has("denoiser")) {
-                    config.denoiser = jsonObject.get("denoiser").getAsString();
-                }
-
-                // Parse pipeline selection
-                if (jsonObject.has("pipeline")) {
-                    config.pipeline = jsonObject.get("pipeline").getAsString();
-                }
-
-                // Parse master enable
-                if (jsonObject.has("enabled")) {
-                    config.enabled = jsonObject.get("enabled").getAsBoolean();
-                }
-
-                // Parse DLSS settings
-                if (jsonObject.has("qualityPreset")) {
-                    config.qualityPreset = jsonObject.get("qualityPreset").getAsString();
-                }
-                if (jsonObject.has("rayReconstructionEnabled")) {
-                    config.rayReconstructionEnabled = jsonObject.get("rayReconstructionEnabled").getAsBoolean();
-                }
-                if (jsonObject.has("sharpening")) {
-                    config.sharpening = jsonObject.get("sharpening").getAsFloat();
-                }
-                if (jsonObject.has("roughnessPacked")) {
-                    config.roughnessPacked = jsonObject.get("roughnessPacked").getAsBoolean();
-                }
-
-                // Parse FSR settings
-                if (jsonObject.has("fsrQualityPreset")) {
-                    config.fsrQualityPreset = jsonObject.get("fsrQualityPreset").getAsString();
-                }
-                if (jsonObject.has("fsrSharpeningStrength")) {
-                    config.fsrSharpeningStrength = jsonObject.get("fsrSharpeningStrength").getAsFloat();
-                }
-
-                // Parse advanced settings
-                if (jsonObject.has("debugMode")) {
-                    config.debugMode = jsonObject.get("debugMode").getAsBoolean();
-                }
-                if (jsonObject.has("showPerformanceMetrics")) {
-                    config.showPerformanceMetrics = jsonObject.get("showPerformanceMetrics").getAsBoolean();
-                }
-
-                // Parse RT Quality Settings
-                if (jsonObject.has("sunIntensity")) {
-                    config.sunIntensity = jsonObject.get("sunIntensity").getAsFloat();
-                }
-                if (jsonObject.has("indirectScale")) {
-                    config.indirectScale = jsonObject.get("indirectScale").getAsFloat();
-                }
-                if (jsonObject.has("ambientFactor")) {
-                    config.ambientFactor = jsonObject.get("ambientFactor").getAsFloat();
-                }
-                if (jsonObject.has("minLighting")) {
-                    config.minLighting = jsonObject.get("minLighting").getAsFloat();
-                }
-                if (jsonObject.has("specularIntensity")) {
-                    config.specularIntensity = jsonObject.get("specularIntensity").getAsFloat();
-                }
-                if (jsonObject.has("gamma")) {
-                    config.gamma = jsonObject.get("gamma").getAsFloat();
-                }
-
-                // Parse ReSTIR Settings
-                if (jsonObject.has("enableReSTIR")) {
-                    config.enableReSTIR = jsonObject.get("enableReSTIR").getAsBoolean();
-                }
-                if (jsonObject.has("restirMaxHistory")) {
-                    config.restirMaxHistory = jsonObject.get("restirMaxHistory").getAsInt();
-                }
-                if (jsonObject.has("restirSpatialRadius")) {
-                    config.restirSpatialRadius = jsonObject.get("restirSpatialRadius").getAsFloat();
-                }
-                if (jsonObject.has("restirSpatialSamples")) {
-                    config.restirSpatialSamples = jsonObject.get("restirSpatialSamples").getAsInt();
-                }
-    
-                System.out.println("[Vulkanite] Loaded DLSS configuration from " + CONFIG_PATH + " [debugMode=" + config.debugMode + "]");
-            } else {
-                // Create default config file
-                config.save();
-                System.out.println("[Vulkanite] Created default DLSS configuration file");
-            }
-        } catch (IOException e) {
-            System.err.println("[Vulkanite] Failed to load DLSS configuration: " + e.getMessage());
-            System.err.println("[Vulkanite] Using default configuration");
+        if (!configFile.exists()) {
+            LOGGER.info("[Vulkanite] DLSS config file not found, creating with defaults");
+            saveConfig();
+            return;
         }
 
-        return config;
-    }
+        Properties props = new Properties();
+        try (FileReader reader = new FileReader(configFile)) {
+            props.load(reader);
 
-    /**
-     * Save configuration to file
-     */
-    public void save() {
-        try {
-            // Create parent directories if they don't exist
-            Files.createDirectories(CONFIG_PATH.getParent());
+            // Core DLSS Settings
+            dlssEnabled = Boolean.parseBoolean(props.getProperty("dlssEnabled", "true"));
+            rayReconstructionEnabled = Boolean.parseBoolean(props.getProperty("rayReconstructionEnabled", "true"));
+            denoiserType = parseDenoiserType(props.getProperty("denoiserType", "DLSS_RR"));
+            qualityPreset = parseQualityPreset(props.getProperty("qualityPreset", "QUALITY"));
+            debugType = parseDebugType(props.getProperty("debugType", "NONE"));
+            sharpness = Float.parseFloat(props.getProperty("sharpness", "0.5"));
+            motionVectorsEnabled = Boolean.parseBoolean(props.getProperty("motionVectorsEnabled", "true"));
+            jitterEnabled = Boolean.parseBoolean(props.getProperty("jitterEnabled", "true"));
 
-            JsonObject jsonObject = new JsonObject();
-
-            // Denoiser selection
-            jsonObject.addProperty("denoiser", denoiser);
-
-            // Pipeline selection
-            jsonObject.addProperty("pipeline", pipeline);
-
-            // Master enable
-            jsonObject.addProperty("enabled", enabled);
-
-            // DLSS settings
-            jsonObject.addProperty("qualityPreset", qualityPreset);
-            jsonObject.addProperty("rayReconstructionEnabled", rayReconstructionEnabled);
-            jsonObject.addProperty("sharpening", sharpening);
-            jsonObject.addProperty("roughnessPacked", roughnessPacked);
-
-            // FSR settings
-            jsonObject.addProperty("fsrQualityPreset", fsrQualityPreset);
-            jsonObject.addProperty("fsrSharpeningStrength", fsrSharpeningStrength);
-
-            // Advanced settings
-            jsonObject.addProperty("debugMode", debugMode);
-            jsonObject.addProperty("showPerformanceMetrics", showPerformanceMetrics);
-
-            // RT Quality Settings
-            jsonObject.addProperty("sunIntensity", sunIntensity);
-            jsonObject.addProperty("indirectScale", indirectScale);
-            jsonObject.addProperty("ambientFactor", ambientFactor);
-            jsonObject.addProperty("minLighting", minLighting);
-            jsonObject.addProperty("specularIntensity", specularIntensity);
-            jsonObject.addProperty("gamma", gamma);
+            // FSR Settings
+            fsrEnabled = Boolean.parseBoolean(props.getProperty("fsrEnabled", "false"));
+            fsrQuality = Integer.parseInt(props.getProperty("fsrQuality", "1"));
 
             // ReSTIR Settings
-            jsonObject.addProperty("enableReSTIR", enableReSTIR);
-            jsonObject.addProperty("restirMaxHistory", restirMaxHistory);
-            jsonObject.addProperty("restirSpatialRadius", restirSpatialRadius);
-            jsonObject.addProperty("restirSpatialSamples", restirSpatialSamples);
+            restirEnabled = Boolean.parseBoolean(props.getProperty("restirEnabled", "false"));
 
-            // Write to file
-            Gson gson = new GsonBuilder().setPrettyPrinting().create();
-            Files.writeString(CONFIG_PATH, gson.toJson(jsonObject));
+            // World/Lighting Parameters
+            indirectScale = Float.parseFloat(props.getProperty("indirectScale", "1.0"));
+            ambientFactor = Float.parseFloat(props.getProperty("ambientFactor", "0.1"));
+            minLighting = Float.parseFloat(props.getProperty("minLighting", "0.01"));
+            specularIntensity = Float.parseFloat(props.getProperty("specularIntensity", "1.0"));
+            gamma = Float.parseFloat(props.getProperty("gamma", "2.2"));
 
-            System.out.println("[Vulkanite] Saved DLSS configuration to " + CONFIG_PATH + " [debugMode=" + debugMode + "]");
+            // Debug Settings
+            debugCellIndex = Integer.parseInt(props.getProperty("debugCellIndex", "-1"));
+
+            LOGGER.info("[Vulkanite] DLSS config loaded: denoiser={}, quality={}, restir={}", 
+                denoiserType, qualityPreset, restirEnabled);
+
         } catch (IOException e) {
-            System.err.println("[Vulkanite] Failed to save DLSS configuration: " + e.getMessage());
-        }
-    }
-
-    // Getters and Setters
-
-    public String getDenoiser() {
-        return denoiser;
-    }
-
-    public void setDenoiser(String denoiser) {
-        this.denoiser = denoiser;
-    }
-
-    public DenoiserType getDenoiserType() {
-        try {
-            return DenoiserType.valueOf(denoiser.toUpperCase());
-        } catch (IllegalArgumentException e) {
-            return DenoiserType.DLSS;
-        }
-    }
-
-    public void setDenoiserType(DenoiserType type) {
-        this.denoiser = type.name();
-    }
-
-    public String getPipeline() {
-        return pipeline;
-    }
-
-    public void setPipeline(String pipeline) {
-        this.pipeline = pipeline;
-    }
-
-    public RenderingPipeline getRenderingPipeline() {
-        try {
-            return RenderingPipeline.valueOf(pipeline.toUpperCase());
-        } catch (IllegalArgumentException e) {
-            return RenderingPipeline.RASTER;
-        }
-    }
-
-    public void setRenderingPipeline(RenderingPipeline pipeline) {
-        this.pipeline = pipeline.name();
-    }
-
-    public boolean isEnabled() {
-        return enabled;
-    }
-
-    public void setEnabled(boolean enabled) {
-        this.enabled = enabled;
-        me.cortex.vulkanite.client.rendering.JitterManager.setEnabled(enabled);
-    }
-
-    public DLSSQualityPreset getQualityPreset() {
-        try {
-            return DLSSQualityPreset.valueOf(qualityPreset.toUpperCase());
-        } catch (IllegalArgumentException e) {
-            return DLSSQualityPreset.QUALITY;
-        }
-    }
-
-    public void setQualityPreset(DLSSQualityPreset preset) {
-        this.qualityPreset = preset.name();
-    }
-
-    public boolean isRayReconstructionEnabled() {
-        return rayReconstructionEnabled;
-    }
-
-    public void setRayReconstructionEnabled(boolean enabled) {
-        this.rayReconstructionEnabled = enabled;
-    }
-
-    public float getSharpening() {
-        return sharpening;
-    }
-
-    public void setSharpening(float sharpening) {
-        this.sharpening = Math.max(0.0f, Math.min(1.0f, sharpening));
-    }
-
-    public boolean isRoughnessPacked() {
-        return roughnessPacked;
-    }
-
-    public void setRoughnessPacked(boolean roughnessPacked) {
-        this.roughnessPacked = roughnessPacked;
-    }
-
-    public FSRQualityPreset getFsrQualityPreset() {
-        try {
-            return FSRQualityPreset.valueOf(fsrQualityPreset.toUpperCase());
-        } catch (IllegalArgumentException e) {
-            return FSRQualityPreset.QUALITY;
-        }
-    }
-
-    public void setFsrQualityPreset(FSRQualityPreset preset) {
-        this.fsrQualityPreset = preset.name();
-    }
-
-    public float getFsrSharpeningStrength() {
-        return fsrSharpeningStrength;
-    }
-
-    public void setFsrSharpeningStrength(float strength) {
-        this.fsrSharpeningStrength = Math.max(0.0f, Math.min(1.0f, strength));
-    }
-
-    public boolean isDebugMode() {
-        // DEBUG LOG: Track when debugMode is read
-        return debugMode;
-    }
-
-    public void setDebugMode(boolean debugMode) {
-        // DEBUG LOG: Track when debugMode is changed
-        System.out.println("[Vulkanite DLSSConfig] setDebugMode called: " + this.debugMode + " -> " + debugMode);
-        this.debugMode = debugMode;
-    }
-
-    public boolean isShowPerformanceMetrics() {
-        return showPerformanceMetrics;
-    }
-
-    public void setShowPerformanceMetrics(boolean showPerformanceMetrics) {
-        this.showPerformanceMetrics = showPerformanceMetrics;
-    }
-
-    public boolean isReSTIREnabled() {
-        return enableReSTIR;
-    }
-
-    public void setReSTIREnabled(boolean enableReSTIR) {
-        this.enableReSTIR = enableReSTIR;
-    }
-
-    // RT Quality Getters and Setters
-    public float getSunIntensity() {
-        return sunIntensity;
-    }
-
-    public void setSunIntensity(float v) {
-        this.sunIntensity = Math.max(0.0f, Math.min(5.0f, v));
-    }
-
-    public float getIndirectScale() {
-        return indirectScale;
-    }
-
-    public void setIndirectScale(float v) {
-        this.indirectScale = Math.max(0.0f, Math.min(2.0f, v));
-    }
-
-    public float getAmbientFactor() {
-        return ambientFactor;
-    }
-
-    public void setAmbientFactor(float v) {
-        this.ambientFactor = Math.max(0.0f, Math.min(1.0f, v));
-    }
-
-    public float getMinLighting() {
-        return minLighting;
-    }
-
-    public void setMinLighting(float v) {
-        this.minLighting = Math.max(0.0f, Math.min(1.0f, v));
-    }
-
-    public float getSpecularIntensity() {
-        return specularIntensity;
-    }
-
-    public void setSpecularIntensity(float v) {
-        this.specularIntensity = Math.max(0.0f, Math.min(3.0f, v));
-    }
-
-    public float getGamma() {
-        return gamma;
-    }
-
-    public void setGamma(float v) {
-        this.gamma = Math.max(0.1f, Math.min(3.0f, v));
-    }
-
-    // ReSTIR Advanced Getters and Setters
-    public int getRestirMaxHistory() {
-        return restirMaxHistory;
-    }
-
-    public void setRestirMaxHistory(int v) {
-        this.restirMaxHistory = Math.max(1, Math.min(20, v));
-    }
-
-    public float getRestirSpatialRadius() {
-        return restirSpatialRadius;
-    }
-
-    public void setRestirSpatialRadius(float v) {
-        this.restirSpatialRadius = Math.max(1.0f, Math.min(16.0f, v));
-    }
-
-    public int getRestirSpatialSamples() {
-        return restirSpatialSamples;
-    }
-
-    public void setRestirSpatialSamples(int v) {
-        this.restirSpatialSamples = Math.max(0, Math.min(8, v));
-    }
-
-    /**
-     * FSR Quality Presets
-     */
-    public enum FSRQualityPreset {
-        QUALITY(0.667f),
-        BALANCED(0.59f),
-        PERFORMANCE(0.5f),
-        ULTRA_PERFORMANCE(0.36f);
-
-        private final float scale;
-
-        FSRQualityPreset(float scale) {
-            this.scale = scale;
-        }
-
-        public float getScale() {
-            return scale;
+            LOGGER.error("[Vulkanite] Failed to load DLSS config: {}", e.getMessage());
+            saveConfig(); // Save defaults
+        } catch (NumberFormatException e) {
+            LOGGER.error("[Vulkanite] Invalid config value: {}", e.getMessage());
+            saveConfig(); // Save defaults
         }
     }
 
     /**
-     * Rendering Pipeline
+     * Save configuration to file.
      */
-    public enum RenderingPipeline {
-        RASTER,
-        DEFERRED,
-        RTX
+    public void save() {
+        saveConfig();
+    }
+
+    private void saveConfig() {
+        File configFile = new File(FabricLoader.getInstance().getConfigDir().toFile(), CONFIG_FILE_NAME);
+
+        Properties props = new Properties();
+
+        // Core DLSS Settings
+        props.setProperty("dlssEnabled", String.valueOf(dlssEnabled));
+        props.setProperty("rayReconstructionEnabled", String.valueOf(rayReconstructionEnabled));
+        props.setProperty("denoiserType", denoiserType.name());
+        props.setProperty("qualityPreset", qualityPreset.name());
+        props.setProperty("debugType", debugType.name());
+        props.setProperty("sharpness", String.valueOf(sharpness));
+        props.setProperty("motionVectorsEnabled", String.valueOf(motionVectorsEnabled));
+        props.setProperty("jitterEnabled", String.valueOf(jitterEnabled));
+
+        // FSR Settings
+        props.setProperty("fsrEnabled", String.valueOf(fsrEnabled));
+        props.setProperty("fsrQuality", String.valueOf(fsrQuality));
+
+        // ReSTIR Settings
+        props.setProperty("restirEnabled", String.valueOf(restirEnabled));
+
+        // World/Lighting Parameters
+        props.setProperty("indirectScale", String.valueOf(indirectScale));
+        props.setProperty("ambientFactor", String.valueOf(ambientFactor));
+        props.setProperty("minLighting", String.valueOf(minLighting));
+        props.setProperty("specularIntensity", String.valueOf(specularIntensity));
+        props.setProperty("gamma", String.valueOf(gamma));
+
+        // Debug Settings
+        props.setProperty("debugCellIndex", String.valueOf(debugCellIndex));
+
+        try (FileWriter writer = new FileWriter(configFile)) {
+            props.store(writer, "Vulkanite DLSS/FSR Configuration");
+            dirty = false;
+            LOGGER.debug("[Vulkanite] DLSS config saved");
+        } catch (IOException e) {
+            LOGGER.error("[Vulkanite] Failed to save DLSS config: {}", e.getMessage());
+        }
+    }
+
+    // =====================================================================
+    // PARSING HELPERS
+    // =====================================================================
+
+    private DenoiserType parseDenoiserType(String value) {
+        try {
+            return DenoiserType.valueOf(value.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            return DenoiserType.DLSS_RR;
+        }
+    }
+
+    private QualityPreset parseQualityPreset(String value) {
+        try {
+            return QualityPreset.valueOf(value.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            return QualityPreset.QUALITY;
+        }
+    }
+
+    private DebugType parseDebugType(String value) {
+        try {
+            return DebugType.valueOf(value.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            return DebugType.NONE;
+        }
+    }
+
+    // =====================================================================
+    // GETTERS - Core DLSS Settings
+    // =====================================================================
+
+    public boolean isDLSSEnabled() { return dlssEnabled; }
+    
+    public boolean isEnabled() { 
+        return dlssEnabled && denoiserType != DenoiserType.NONE; 
+    }
+
+    public boolean isRayReconstructionEnabled() { 
+        return rayReconstructionEnabled && (denoiserType == DenoiserType.DLSS_RR || denoiserType == DenoiserType.DLSS); 
+    }
+
+    public DenoiserType getDenoiserType() { return denoiserType; }
+    
+    /**
+     * Get denoiser type as string for compatibility with existing code.
+     */
+    public String getDenoiser() { 
+        if (rayReconstructionEnabled && denoiserType == DenoiserType.DLSS) {
+            return DenoiserType.DLSS_RR.name();
+        }
+        return denoiserType.name(); 
+    }
+
+    public QualityPreset getQualityPreset() { return qualityPreset; }
+
+    public DebugType getDebugType() { return debugType; }
+
+    public boolean isDebugEnabled() { 
+        return debugType != DebugType.NONE; 
+    }
+
+    public float getSharpness() { return sharpness; }
+
+    public boolean isMotionVectorsEnabled() { return motionVectorsEnabled; }
+
+    public boolean isJitterEnabled() { return jitterEnabled; }
+
+    // =====================================================================
+    // GETTERS - FSR Settings
+    // =====================================================================
+
+    public boolean isFSREnabled() { return fsrEnabled; }
+
+    public int getFSRQuality() { return fsrQuality; }
+
+    public FSRQualityPreset getFSRQualityPreset() {
+        switch (fsrQuality) {
+            case 0: return FSRQualityPreset.QUALITY;
+            case 1: return FSRQualityPreset.BALANCED;
+            case 2: return FSRQualityPreset.PERFORMANCE;
+            case 3: return FSRQualityPreset.ULTRA_PERFORMANCE;
+            default: return FSRQualityPreset.BALANCED;
+        }
+    }
+
+    // =====================================================================
+    // GETTERS - ReSTIR Settings
+    // =====================================================================
+
+    public boolean isReSTIREnabled() { return restirEnabled; }
+
+    // =====================================================================
+    // GETTERS - World/Lighting Parameters
+    // =====================================================================
+
+    public float getIndirectScale() { return indirectScale; }
+    public float getAmbientFactor() { return ambientFactor; }
+    public float getMinLighting() { return minLighting; }
+    public float getSpecularIntensity() { return specularIntensity; }
+    public float getGamma() { return gamma; }
+
+    // =====================================================================
+    // GETTERS - Debug Settings
+    // =====================================================================
+
+    public int getDebugCellIndex() { return debugCellIndex; }
+
+    // =====================================================================
+    // SETTERS - Core DLSS Settings
+    // =====================================================================
+
+    public void setDLSSEnabled(boolean enabled) { 
+        this.dlssEnabled = enabled; 
+        this.dirty = true;
+    }
+
+    public void setRayReconstructionEnabled(boolean enabled) { 
+        this.rayReconstructionEnabled = enabled; 
+        this.dirty = true;
+    }
+
+    public void setDenoiserType(DenoiserType type) { 
+        this.denoiserType = type; 
+        this.dirty = true;
+    }
+
+    public void setQualityPreset(QualityPreset preset) { 
+        this.qualityPreset = preset; 
+        this.dirty = true;
+    }
+
+    public void setDebugType(DebugType type) { 
+        this.debugType = type; 
+        this.dirty = true;
+    }
+
+    public void setSharpness(float sharpness) { 
+        this.sharpness = Math.max(0.0f, Math.min(1.0f, sharpness)); 
+        this.dirty = true;
+    }
+
+    public void setMotionVectorsEnabled(boolean enabled) { 
+        this.motionVectorsEnabled = enabled; 
+        this.dirty = true;
+    }
+
+    public void setJitterEnabled(boolean enabled) { 
+        this.jitterEnabled = enabled; 
+        this.dirty = true;
+    }
+
+    // =====================================================================
+    // SETTERS - FSR Settings
+    // =====================================================================
+
+    public void setFSREnabled(boolean enabled) { 
+        this.fsrEnabled = enabled; 
+        this.dirty = true;
+    }
+
+    public void setFSRQuality(int quality) { 
+        this.fsrQuality = Math.max(0, Math.min(3, quality)); 
+        this.dirty = true;
+    }
+
+    // =====================================================================
+    // SETTERS - ReSTIR Settings
+    // =====================================================================
+
+    public void setReSTIREnabled(boolean enabled) { 
+        this.restirEnabled = enabled; 
+        this.dirty = true;
+    }
+
+    // =====================================================================
+    // SETTERS - World/Lighting Parameters
+    // =====================================================================
+
+    public void setIndirectScale(float scale) { 
+        this.indirectScale = Math.max(0.0f, scale); 
+        this.dirty = true;
+    }
+
+    public void setAmbientFactor(float factor) { 
+        this.ambientFactor = Math.max(0.0f, Math.min(1.0f, factor)); 
+        this.dirty = true;
+    }
+
+    public void setMinLighting(float min) { 
+        this.minLighting = Math.max(0.0f, Math.min(1.0f, min)); 
+        this.dirty = true;
+    }
+
+    public void setSpecularIntensity(float intensity) { 
+        this.specularIntensity = Math.max(0.0f, intensity); 
+        this.dirty = true;
+    }
+
+    public void setGamma(float gamma) { 
+        this.gamma = Math.max(1.0f, Math.min(3.0f, gamma)); 
+        this.dirty = true;
+    }
+
+    // =====================================================================
+    // SETTERS - Debug Settings
+    // =====================================================================
+
+    public void setDebugCellIndex(int index) {
+        this.debugCellIndex = index;
+        this.dirty = true;
+    }
+
+    // =====================================================================
+    // ADDITIONAL GETTERS - Used by MixinProgramSet
+    // =====================================================================
+
+    public float getSunIntensity() { return 1.0f; }
+    public int getRestirMaxHistory() { return 8; }
+    public int getRestirSpatialRadius() { return 15; }
+    public int getRestirSpatialSamples() { return 4; }
+
+    // =====================================================================
+    // UTILITY METHODS
+    // =====================================================================
+
+    /**
+     * Check if configuration has unsaved changes.
+     */
+    public boolean isDirty() { 
+        return dirty; 
     }
 
     /**
-     * Denoiser Type enumeration
+     * Get the current render style based on configuration and shaderpack.
+     * This is auto-detected based on the current rendering mode.
      */
-    public enum DenoiserType {
-        DLSS, // NVIDIA DLSS Ray Reconstruction (RTX only)
-        FSR, // AMD FidelityFX Super Resolution (all GPUs)
-        BASIC // Basic temporal accumulation (fallback)
+    public RenderStyle getRenderStyle() {
+        // Check the active shaderpack/override for the deferred baseline.
+        VulkaniteConfig config = VulkaniteConfig.getInstance();
+        if (config.shouldUseDeferredRendering(ShaderpackSettingsHandler.getCurrentShaderpackName())) {
+            return RenderStyle.DEFERRED;
+        }
+        // If DLSS/DLSS_RR is enabled, we're in RTX mode
+        if (dlssEnabled && denoiserType != DenoiserType.NONE) {
+            return RenderStyle.RTX;
+        }
+        return RenderStyle.VANILLA;
     }
 
     /**
-     * Get a human-readable description of the current configuration
+     * Get the effective resolution scale based on current settings.
      */
-    public String getDescription() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("Vulkanite Upscaler/Denoiser Configuration:\n");
-        sb.append(" Denoiser: ").append(denoiser).append("\n");
-        sb.append(" Enabled: ").append(enabled).append("\n");
-        sb.append("\nDLSS Settings:\n");
-        sb.append(" Quality Preset: ").append(qualityPreset).append("\n");
-        sb.append(" Ray Reconstruction: ").append(rayReconstructionEnabled).append("\n");
-        sb.append(" Sharpening: ").append(sharpening).append("\n");
-        sb.append("\nFSR Settings:\n");
-        sb.append(" Quality Preset: ").append(fsrQualityPreset).append("\n");
-        sb.append(" Sharpening: ").append(fsrSharpeningStrength).append("\n");
-        return sb.toString();
+    public float getEffectiveScale() {
+        if (!dlssEnabled) {
+            return 1.0f;
+        }
+        
+        switch (denoiserType) {
+            case DLSS:
+            case DLSS_RR:
+                return qualityPreset.getScale();
+            case FSR:
+                return getFSRQualityPreset().getScale();
+            default:
+                return 1.0f;
+        }
+    }
+
+    /**
+     * Reset all settings to defaults.
+     */
+    public void resetToDefaults() {
+        dlssEnabled = true;
+        rayReconstructionEnabled = true;
+        denoiserType = DenoiserType.DLSS_RR;
+        qualityPreset = QualityPreset.QUALITY;
+        debugType = DebugType.NONE;
+        sharpness = 0.5f;
+        motionVectorsEnabled = true;
+        jitterEnabled = true;
+        fsrEnabled = false;
+        fsrQuality = 1;
+        restirEnabled = false;
+        indirectScale = 1.0f;
+        ambientFactor = 0.1f;
+        minLighting = 0.01f;
+        specularIntensity = 1.0f;
+        gamma = 2.2f;
+        debugCellIndex = -1;
+        dirty = true;
+        
+        LOGGER.info("[Vulkanite] DLSS config reset to defaults");
     }
 }

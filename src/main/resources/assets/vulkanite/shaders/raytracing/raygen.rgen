@@ -1,6 +1,7 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_nonuniform_qualifier : require
+#extension GL_GOOGLE_include_directive : require
 
 // ============================================================================
 // Vulkanite RT - Ray Generation Shader with G-buffer Integration
@@ -57,7 +58,7 @@ layout(binding = 6, set = 0, rgba16f) uniform image2D RayTraceIntermediate[];
 // Binding 7: G-Buffer colortex1 (Albedo)
 layout(binding = 7, set = 0) uniform sampler2D colortex1;
 
-// Binding 8: G-Buffer colortex2 (Material - Roughness, Metallic, Specular, Emission)
+// Binding 8: G-Buffer colortex2 (F0 RGB, roughness A)
 layout(binding = 8, set = 0) uniform sampler2D colortex2;
 
 // Binding 9: G-Buffer colortex3 (Normal)
@@ -72,11 +73,17 @@ layout(binding = 11, set = 0) uniform sampler2D colortex5;
 // Binding 12: Final Output Target (storage image array)
 layout(binding = 12, set = 0, rgba16f) uniform image2D RayTraceData[];
 
-// Binding 13: Motion Vectors for DLSS (RG32F)
-layout(binding = 13, set = 0, rg32f) uniform image2D MotionVectors;
+// Binding 13: Motion Vectors for DLSS (Radiance: R16G16_SFLOAT)
+layout(binding = 13, set = 0, rg16f) uniform image2D MotionVectors;
 
-// Binding 14: Linear Depth for DLSS (R32F)
-layout(binding = 14, set = 0, r32f) uniform image2D LinearDepth;
+// Binding 14: Linear Depth for DLSS (Radiance: R16_SFLOAT)
+layout(binding = 14, set = 0, r16f) uniform image2D LinearDepth;
+
+layout(binding = 16, set = 0, rgba8) uniform image2D DiffuseAlbedoMetallic;
+layout(binding = 17, set = 0, rgba8) uniform image2D SpecularAlbedo;
+layout(binding = 18, set = 0, rgba16f) uniform image2D NormalRoughness;
+layout(binding = 19, set = 0, r16f) uniform image2D SpecularHitDepth;
+layout(binding = 20, set = 0, r16f) uniform image2D FirstHitDepth;
 
 // ============================================================================
 // Constants
@@ -98,12 +105,26 @@ vec2 calculateUV(vec2 launchID, vec2 launchSize) {
     return (launchID + 0.5) / launchSize;
 }
 
+ivec2 sourceTexel(sampler2D textureRef, vec2 uv) {
+    ivec2 size = textureSize(textureRef, 0);
+    return clamp(ivec2(uv * vec2(size)), ivec2(0), size - 1);
+}
+
 vec2 getJitterDelta() {
     return cam.jitter.xy - cam.jitter.zw;
 }
 
-vec2 computeMotionVector(vec2 currentUV, vec2 previousUV, vec2 launchSize) {
-    return (previousUV - currentUV) * launchSize;
+vec2 computeMotionVector(vec2 currentPixel, vec2 previousPixel, vec2 launchSize) {
+    return clamp(previousPixel - currentPixel, -launchSize, launchSize);
+}
+
+vec2 projectToPixel(mat4 viewProj, vec3 absWorldPos, vec2 launchSize, vec2 fallbackPixel) {
+    vec4 clip = viewProj * vec4(absWorldPos, 1.0);
+    if (abs(clip.w) < 0.00001) {
+        return fallbackPixel;
+    }
+    vec3 ndc = clip.xyz / clip.w;
+    return (ndc.xy * 0.5 + 0.5) * launchSize;
 }
 
 /// Calculates the primary ray direction from camera corners
@@ -112,27 +133,47 @@ vec2 computeMotionVector(vec2 currentUV, vec2 previousUV, vec2 launchSize) {
 /// @return Ray direction in world space
 vec3 calculateRayDirection(vec2 uv) {
     // Bilinear interpolation of the 4 corner vectors
-    // corners[0] = top-left, corners[1] = top-right
-    // corners[2] = bottom-left, corners[3] = bottom-right
-    vec3 cornerTL = cam.corners[0];
-    vec3 cornerTR = cam.corners[1];
-    vec3 cornerBL = cam.corners[2];
-    vec3 cornerBR = cam.corners[3];
-    
+    // corners[0] = bottom-left, corners[1] = bottom-right
+    // corners[2] = top-left, corners[3] = top-right
+    vec3 cornerBL = cam.corners[0];
+    vec3 cornerBR = cam.corners[1];
+    vec3 cornerTL = cam.corners[2];
+    vec3 cornerTR = cam.corners[3];
+
     // Interpolate along top and bottom edges
-    vec3 top = mix(cornerTL, cornerTR, uv.x);
     vec3 bottom = mix(cornerBL, cornerBR, uv.x);
-    
+    vec3 top = mix(cornerTL, cornerTR, uv.x);
+
     // Interpolate between top and bottom
     vec3 rayDir = mix(bottom, top, uv.y);
-    
-    return normalize(rayDir);
+
+    return normalize((cam.viewInverse * vec4(rayDir, 0.0)).xyz);
 }
 
 /// Extracts camera position from the viewInverse matrix
 /// @return Camera position in world space
 vec3 getCameraPosition() {
     return cam.viewInverse[3].xyz;
+}
+
+void writeRadianceDlssSidecars(
+    ivec2 pixel,
+    vec3 diffuseAlbedo,
+    float metallic,
+    vec3 specularAlbedo,
+    vec3 normal,
+    float roughness,
+    vec2 motion,
+    float firstDepth,
+    float specularDepth
+) {
+    imageStore(DiffuseAlbedoMetallic, pixel, vec4(clamp(diffuseAlbedo, 0.0, 1.0), clamp(metallic, 0.0, 1.0)));
+    imageStore(SpecularAlbedo, pixel, vec4(clamp(specularAlbedo, 0.0, 1.0), 1.0));
+    imageStore(NormalRoughness, pixel, vec4(normalize(normal) * 0.5 + 0.5, clamp(roughness, 0.04, 1.0)));
+    imageStore(MotionVectors, pixel, vec4(motion, 0.0, 0.0));
+    imageStore(LinearDepth, pixel, vec4(firstDepth, 0.0, 0.0, 0.0));
+    imageStore(SpecularHitDepth, pixel, vec4(specularDepth, 0.0, 0.0, 0.0));
+    imageStore(FirstHitDepth, pixel, vec4(firstDepth, 0.0, 0.0, 0.0));
 }
 
 /// Checks if a pixel is sky/invalid based on G-buffer data
@@ -142,13 +183,13 @@ vec3 getCameraPosition() {
 bool isSkyPixel(vec3 normal, vec3 worldPos) {
     // Sky pixels typically have zero or near-zero normal
     if (length(normal) < 0.1) return true;
-    
+
     // Sky pixels may have extreme Y values or zero position
     if (length(worldPos) < EPSILON) return true;
-    
+
     // Check for very far distances (sky box)
     if (length(worldPos) > 10000.0) return true;
-    
+
     return false;
 }
 
@@ -160,31 +201,31 @@ bool isSkyPixel(vec3 normal, vec3 worldPos) {
 vec3 calculateSkyColor(vec3 rayDir) {
     // Simple sky gradient based on ray direction Y component
     float t = max(0.0, rayDir.y);
-    
+
     // Horizon color (darker) to zenith color (lighter)
     vec3 horizonColor = vec3(0.2, 0.3, 0.5);
     vec3 zenithColor = vec3(0.4, 0.6, 1.0);
-    
+
     vec3 skyColor = mix(horizonColor, zenithColor, t);
-    
+
     // Check for sun disk
     vec3 sunDir = normalize(cam.sunPosition.xyz);
     float sunDot = max(dot(rayDir, sunDir), 0.0);
-    
+
     if (sunDot > cos(SUN_ANGULAR_RADIUS)) {
         // Sun disk - bright yellowish-white
         return vec3(1.0, 0.95, 0.8) * 10.0;
     }
-    
+
     // Check for moon disk
     vec3 moonDir = normalize(cam.moonPosition.xyz);
     float moonDot = max(dot(rayDir, moonDir), 0.0);
-    
+
     if (moonDot > cos(SUN_ANGULAR_RADIUS)) {
         // Moon disk - dim bluish-white
         return vec3(0.9, 0.9, 1.0) * 0.5;
     }
-    
+
     return skyColor;
 }
 
@@ -196,61 +237,66 @@ void main() {
     // =========================================================================
     // Step 1: Calculate pixel coordinates and UV
     // =========================================================================
-    
+
     vec2 launchID = vec2(gl_LaunchIDEXT.xy);
     vec2 launchSize = vec2(gl_LaunchSizeEXT.xy);
-    
+
     // Bounds check
     if (launchID.x >= launchSize.x || launchID.y >= launchSize.y) {
         return;
     }
-    
+
     // Calculate normalized UV coordinates
-    vec2 uv = calculateUV(launchID, launchSize);
-    
+    vec2 pixelCenter = launchID + vec2(0.5);
+    vec2 uv = pixelCenter / launchSize;
+
     // =========================================================================
     // Step 2: Read G-buffer data for hybrid rendering
     // =========================================================================
-    
-    // Read G-buffer textures
-    vec4 albedoSample = texture(colortex1, uv);
-    vec4 materialSample = texture(colortex2, uv);
-    vec4 normalSample = texture(colortex3, uv);
-    vec4 worldPosSample = texture(colortex4, uv);
-    vec4 extraSample = texture(colortex5, uv);
-    
+
+    // Read full-resolution G-buffer texels through normalized UV so DLSS can
+    // render internally at Radiance's lower module resolution.
+    vec4 albedoSample = texelFetch(colortex1, sourceTexel(colortex1, uv), 0);
+    vec4 materialSample = texelFetch(colortex2, sourceTexel(colortex2, uv), 0);
+    vec4 normalSample = texelFetch(colortex3, sourceTexel(colortex3, uv), 0);
+    vec4 worldPosSample = texelFetch(colortex4, sourceTexel(colortex4, uv), 0);
+    vec4 extraSample = texelFetch(colortex5, sourceTexel(colortex5, uv), 0);
+
     vec3 albedo = albedoSample.rgb;
     vec3 normal = normalSample.rgb;
     vec3 worldPos = worldPosSample.rgb;
     vec2 lightmap = extraSample.rg;
-    
+
     // Material properties from G-buffer
-    // R = roughness, G = metallic, B = specular, A = emission
-    float roughness = materialSample.r;
-    float metallic = materialSample.g;
-    float specular = materialSample.b;
-    float emission = materialSample.a;
-    
+    float roughness = materialSample.a;
+    float metallic = clamp(worldPosSample.a, 0.0, 1.0);
+    float specular = max(max(materialSample.r, materialSample.g), materialSample.b);
+    float emission = extraSample.a < -0.5
+        ? clamp(-extraSample.a - 1.0, 0.0, 1.0)
+        : 0.0;
+
     // =========================================================================
     // Step 3: Check for sky/invalid pixels
     // =========================================================================
-    
+
     bool isSky = isSkyPixel(normal, worldPos);
-    
+
     if (isSky) {
         // =====================================================================
         // Sky Pixel: Trace primary ray for environment/sky color
         // =====================================================================
-        
+
         // Get camera position and calculate ray direction
         vec3 cameraPos = getCameraPosition();
-        vec3 rayDirection = calculateRayDirection(uv);
-        
+        // Radiance/MCVR jitters the ray sample position, not the motion-vector
+        // matrices: pixelCenter += cameraJitter before inverse projection.
+        vec3 rayDirection = calculateRayDirection(uv + cam.jitter.xy / launchSize);
+
         // Trace primary ray (will hit miss shader for sky)
         payload.color = vec3(0.0);
         payload.hitDistance = RAY_MISS_INDICATOR;
         payload.hitType = 0;
-        
+
         traceRayEXT(
             tlas,
             gl_RayFlagsNoneEXT,
@@ -264,88 +310,80 @@ void main() {
             10000.0,
             6
         );
-        
+
         // Use miss shader result or fallback sky color
         vec3 skyColor = (payload.hitType == 0) ? payload.color : calculateSkyColor(rayDirection);
-        
+
         // Apply tone mapping and gamma correction
         // vec3 finalColor = toneMapACES(skyColor); // DISABLE: Tone mapping is done after DLSS
         // finalColor = toGammaSpace(finalColor); // DISABLE: Gamma correction is done after DLSS
         vec3 finalColor = skyColor; // Pass linear color to DLSS
-        
+
         // Write final color to output image
         // NOTE: Output to DLSS must be LINEAR space, not Gamma space!
         imageStore(RayTraceData[0], ivec2(launchID), vec4(finalColor, 1.0));
-        
-        // Calculate and write Motion Vectors for Sky
-        // Use a far point in ray direction to simulate sky motion (rotation only)
-        vec3 farPos = getCameraPosition() + rayDirection * 1000.0;
-        vec4 prevClipSky = cam.prevViewProj * vec4(farPos, 1.0);
-        vec3 prevNDCSky = prevClipSky.xyz / prevClipSky.w;
-        vec2 prevUVSky = prevNDCSky.xy * 0.5 + 0.5;
-        
-        // Convert to Pixel Space displacement (DLSS expects native pixel scale)
-        // DLSS expects: MV = Previous - Current (pure geometric motion only)
-        vec2 skyMotion = computeMotionVector(uv, prevUVSky, launchSize);
-        
-        // Store Pixel space difference
-        imageStore(MotionVectors, ivec2(launchID), vec4(skyMotion, 0.0, 0.0));
-        
-        // Write Linear Depth for Sky (Far Plane)
-        imageStore(LinearDepth, ivec2(launchID), vec4(10000.0, 0.0, 0.0, 0.0));
-        
+
+        // Sky has no stable surface for reprojection. Feeding projected far-point
+        // motion into DLSS/RR lets sky history bleed into silhouettes, especially
+        // around leaves and horizon edges, so keep far pixels history-neutral.
+        writeRadianceDlssSidecars(ivec2(launchID), vec3(0.0), 0.0, vec3(0.0),
+            vec3(0.0, 1.0, 0.0), 1.0, vec2(0.0), 10000.0, 10000.0);
+
         return;
     }
-    
+
     // =========================================================================
     // Step 4: Geometry Pixel - Hybrid Rendering with G-buffer
     // =========================================================================
-    
+
     // For geometry pixels, we use G-buffer data directly and trace secondary rays
     // This is the hybrid rendering approach - skip primary ray trace
-    
-    // Ensure normal faces the camera
+
+    // Ensure normal faces the camera. G-buffer worldPos is camera-relative.
     vec3 cameraPos = getCameraPosition();
-    vec3 viewDir = normalize(cameraPos - worldPos);
-    
+    vec3 viewDir = normalize(-worldPos);
+
     if (dot(normal, viewDir) < 0.0) {
         normal = -normal;
     }
-    
+
     // Clamp material properties
     roughness = clamp(roughness, 0.04, 1.0);
     metallic = clamp(metallic, 0.0, 1.0);
-    
+
     // =========================================================================
     // Step 5: Calculate lighting layers
     // =========================================================================
-    
-    // Initialize random seed for this pixel (temporal variation)
-    uint seed = hashUint(uint(launchID.x + launchID.y * launchSize.x), cam.frameId);
-    
+
+    // Keep one-bounce GI stable while the camera is still. Frame-varying GI
+    // makes illuminated blocks breathe and encourages RR/DLSS to blur edges.
+    vec3 stableWorldPos = worldPos + cameraPos;
+    uvec3 lightingCell = floatBitsToUint(floor(stableWorldPos * 16.0) * (1.0 / 16.0));
+    uint seed = hashUint(hashUint(lightingCell.x, lightingCell.y), lightingCell.z);
+
     // --- Layer 0: Unlit Base ---
     vec3 unlitBase = albedo;
-    
+
     // --- Layer 1: Blocklight ---
     // Use lightmap UV from G-buffer extra channel
     vec3 blocklight = calculateBlocklight(lightmap);
-    
+
     // --- Layer 2: Sunlight with Ray-Traced Shadows ---
     // Trace shadow ray toward sun
     vec3 sunDir = normalize(cam.sunPosition.xyz);
-    
+
     // Improved ray origin calculation to avoid self-intersection artifacts on distant geometry
     // Use a view-dependent bias that scales with distance
-    float viewDist = length(worldPos - cameraPos);
+    float viewDist = length(worldPos);
     float adaptiveBias = max(BIAS, viewDist * 0.0001); // Scale bias slightly with distance
-    
+
     vec3 rayOrigin = worldPos + normal * adaptiveBias;
-    
+
     // Use global payload for shadow ray
     payload.color = vec3(1.0);
     payload.hitDistance = 1000.0;
     payload.hitType = 1; // Assume hit (shadowed) initially
-    
+
     traceRayEXT(
         tlas,
         gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsTerminateOnFirstHitEXT,
@@ -359,26 +397,26 @@ void main() {
         10000.0,
         6
     );
-    
+
     float sunVisibility = (payload.hitType == 0) ? 1.0 : 0.0;
     vec3 sunlight = calculateSunlight(worldPos, normal, sunVisibility);
-    
+
     // --- Layer 3: Specular (Cook-Torrance BRDF) ---
     vec3 specularContrib = calculateSpecular(albedo, roughness, normal, viewDir, sunDir);
     specularContrib *= sunVisibility;
-    
+
     // --- Optional: GI Ray (cosine-weighted hemisphere sampling) ---
     // Trace one bounce GI ray for indirect diffuse
     vec3 giDir = cosineWeightedHemisphere(normal, seed);
-    
+
     // Use the same adaptive bias for GI ray origin
     vec3 giOrigin = worldPos + normal * adaptiveBias;
-    
+
     // Use global payload for GI ray
     payload.color = vec3(0.0);
     payload.hitDistance = RAY_MISS_INDICATOR;
     payload.hitType = 0;
-    
+
     traceRayEXT(
         tlas,
         gl_RayFlagsNoneEXT,
@@ -392,61 +430,62 @@ void main() {
         10000.0,
         6
     );
-    
+
     // GI contribution (scaled down for energy conservation)
     vec3 gi = payload.color * albedo * 0.5;
-    
+
     // =========================================================================
     // Step 6: Combine all lighting layers
     // =========================================================================
-    
+
     vec3 finalColor = combineLightingLayers(unlitBase, blocklight, sunlight, gi, specularContrib);
-    
+
     // Add emission
     if (emission > 0.0) {
         finalColor += albedo * emission * 25.0; // Emission scale
     }
-    
+
     // =========================================================================
     // Step 7: Apply post-processing and write output
     // =========================================================================
-    
+
     // Apply firefly clamping
     finalColor = clampFirefly(finalColor);
-    
+
     // Apply ACES tone mapping
     // finalColor = toneMapACES(finalColor); // DISABLE: Tone mapping is done after DLSS
-    
+
     // Apply gamma correction (convert to sRGB)
     // finalColor = toGammaSpace(finalColor); // DISABLE: Gamma correction is done after DLSS
-    
+
     // Write final color to output image
     // NOTE: Output to DLSS must be LINEAR space, not Gamma space!
     imageStore(RayTraceData[0], ivec2(launchID), vec4(finalColor, 1.0));
-    
+
     // Calculate and write Motion Vectors for Geometry
     // CRITICAL: worldPos from G-buffer is CAMERA-RELATIVE (Minecraft renders centered on camera).
     // prevViewProj transforms from ABSOLUTE world space to clip space.
     // We must convert to absolute world space before reprojecting.
-    vec3 absWorldPos = worldPos + getCameraPosition();
-    vec4 prevClip = cam.prevViewProj * vec4(absWorldPos, 1.0);
-    vec3 prevNDC = prevClip.xyz / prevClip.w;
-    vec2 prevUV = prevNDC.xy * 0.5 + 0.5;
-    
+    vec3 absWorldPos = worldPos + cameraPos;
+    vec2 jitteredPixelCenter = pixelCenter + cam.jitter.xy;
+    vec2 prevPixel = projectToPixel(cam.prevViewProj, absWorldPos, launchSize, jitteredPixelCenter);
+
     // Scale to Pixel Space as required by DLSS
     // DLSS expects MV = Previous - Current (pure geometric motion only)
-    vec2 motion = computeMotionVector(uv, prevUV, launchSize);
-    
-    imageStore(MotionVectors, ivec2(launchID), vec4(motion, 0.0, 0.0));
-    
-    // Write Linear Depth for Geometry (Euclidean distance from camera)
-    float dist = distance(worldPos, cameraPos);
-    imageStore(LinearDepth, ivec2(launchID), vec4(dist, 0.0, 0.0, 0.0));
-    
+    vec2 motion = computeMotionVector(jitteredPixelCenter, prevPixel, launchSize);
+
+    // Write Linear Depth for Geometry. DLSS/RR expects camera/view depth, and
+    // worldPos from the G-buffer is camera-relative in world axes.
+    vec3 cameraForward = -normalize(cam.viewInverse[2].xyz);
+    float linearDepth = max(dot(worldPos, cameraForward), 0.0);
+    vec3 f0 = mix(vec3(0.04), clamp(albedo, 0.0, 1.0), metallic);
+    writeRadianceDlssSidecars(ivec2(launchID), albedo, metallic, f0, normal, roughness,
+        motion, linearDepth, linearDepth);
+
     // =========================================================================
     // Optional: Debug output to intermediate buffer
     // =========================================================================
-    
+
     #ifdef DEBUG_OUTPUT
     if (RayTraceIntermediate.length() > 0) {
         imageStore(RayTraceIntermediate[0], ivec2(launchID), vec4(finalColor, 1.0));

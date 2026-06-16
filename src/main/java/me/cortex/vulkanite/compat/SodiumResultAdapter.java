@@ -7,7 +7,7 @@ import org.lwjgl.system.MemoryUtil;
 
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -17,7 +17,7 @@ import java.util.Map;
 public class SodiumResultAdapter {
     public static void compute(ChunkBuildOutput buildResult) {
         var ebr = (IAccelerationBuildResult) buildResult;
-        Map<TerrainRenderPass, GeometryData> map = new HashMap<>();
+        Map<TerrainRenderPass, GeometryData> map = new LinkedHashMap<>();
         List<NativeBuffer> nativeBuffers = new ArrayList<>();
         
         for (var pass : buildResult.meshes.entrySet()) {

@@ -10,9 +10,11 @@ import java.util.BitSet;
 public final class TlasPointerArena {
     private final BitSet vacant;
     public int maxIndex = 0;
+    private int capacity;
 
     public TlasPointerArena(int size) {
         size *= 3;
+        capacity = size;
         vacant = new BitSet(size);
         vacant.set(0, size);
     }
@@ -43,7 +45,13 @@ public final class TlasPointerArena {
         }
 
         if (pos == -1) {
-            throw new IllegalStateException("No contiguous range available for allocation of size " + count);
+            pos = capacity;
+            int newCapacity = capacity;
+            while (newCapacity - pos < count) {
+                newCapacity *= 2;
+            }
+            vacant.set(capacity, newCapacity);
+            capacity = newCapacity;
         }
 
         vacant.clear(pos, pos + count);

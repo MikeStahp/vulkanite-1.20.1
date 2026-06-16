@@ -96,12 +96,31 @@ public abstract class MixinGlTexture extends MixinGlResource implements IVGImage
      */
     @Overwrite
     protected void destroyInternal() {
-        if (sharedImage != null)
-            sharedImage.close();
+        safeClose(sharedImage);
         sharedImage = null;
     }
 
     public VRef<VGImage> getVGImage() {
-        return sharedImage == null ? null : sharedImage.addRef();
+        if (sharedImage == null) {
+            return null;
+        }
+        try {
+            return sharedImage.addRef();
+        } catch (NullPointerException e) {
+            sharedImage = null;
+            return null;
+        }
+    }
+
+    @Unique
+    private static void safeClose(VRef<?> ref) {
+        if (ref == null) {
+            return;
+        }
+        try {
+            ref.close();
+        } catch (NullPointerException ignored) {
+            // The referenced image may already have been collected during reload.
+        }
     }
 }

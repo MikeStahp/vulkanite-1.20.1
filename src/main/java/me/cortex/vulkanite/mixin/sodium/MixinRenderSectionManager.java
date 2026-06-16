@@ -44,8 +44,6 @@ public abstract class MixinRenderSectionManager {
     private void processResults(ArrayList<ChunkBuildOutput> results, CallbackInfo ci) {
         Reference2ReferenceLinkedOpenHashMap<RenderSection, ChunkBuildOutput> map = new Reference2ReferenceLinkedOpenHashMap<>();
         for(ChunkBuildOutput output : results) {
-            if (((IAccelerationBuildResult)output).getAccelerationGeometryData() == null)
-                continue;
             if (!output.render.isDisposed() && output.render.getLastBuiltFrame() <= output.buildTime) {
                 RenderSection render = output.render;
                 ChunkBuildOutput previous = map.get(render);
@@ -54,8 +52,18 @@ public abstract class MixinRenderSectionManager {
                 }
             }
         }
-        if (!map.values().isEmpty()) {
-            Vulkanite.INSTANCE.upload(new ArrayList<>(map.values()));
+
+        ArrayList<ChunkBuildOutput> accelerationUploads = new ArrayList<>();
+        for (ChunkBuildOutput output : map.values()) {
+            if (((IAccelerationBuildResult) output).getAccelerationGeometryData() == null) {
+                Vulkanite.INSTANCE.sectionRemove(output.render);
+            } else {
+                accelerationUploads.add(output);
+            }
+        }
+
+        if (!accelerationUploads.isEmpty()) {
+            Vulkanite.INSTANCE.upload(accelerationUploads);
         }
     }
 }

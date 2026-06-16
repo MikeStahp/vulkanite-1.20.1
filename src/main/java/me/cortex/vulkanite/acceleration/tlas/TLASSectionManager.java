@@ -14,7 +14,6 @@ import org.joml.Matrix4x3f;
 import org.lwjgl.vulkan.VkAccelerationStructureInstanceKHR;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 
 import static org.lwjgl.system.MemoryStack.stackPush;
@@ -28,24 +27,6 @@ import static org.lwjgl.vulkan.VK12.*;
  * geometry buffers, and tracking active sections for TLAS building.
  */
 public class TLASSectionManager extends TLASInstanceBuffer {
-    /**
-     * Cached descriptor set entry for frequently used resource combinations.
-     */
-    private static class CachedDescriptorSet {
-        final VRef<VDescriptorSet> descriptorSet;
-        final long lastUsed;
-        final int usageCount;
-        
-        CachedDescriptorSet(VRef<VDescriptorSet> descriptorSet, long lastUsed, int usageCount) {
-            this.descriptorSet = descriptorSet;
-            this.lastUsed = lastUsed;
-            this.usageCount = usageCount;
-        }
-    }
-    // Descriptor set cache for frequently used resource combinations
-    private static final Map<Integer, CachedDescriptorSet> descriptorSetCache = new ConcurrentHashMap<>();
-    private static final int MAX_CACHE_SIZE = 1000;
-    
     private final TlasPointerArena arena = new TlasPointerArena(30000);
     private final ConcurrentLinkedDeque<BLASBuildResult> sectionUpdates = new ConcurrentLinkedDeque<>();
     private final ConcurrentLinkedDeque<RenderSection> sectionRemovals = new ConcurrentLinkedDeque<>();
@@ -203,24 +184,12 @@ public class TLASSectionManager extends TLASInstanceBuffer {
             }
 
             for (var job : descriptorUpdateJobs) {
-                // Try to use cached descriptor set first
-                VRef<VDescriptorSet> cachedSet = getCachedDescriptorSet(job.geometryBuffer(), job.bufferOffsets());
-                if (cachedSet != null) {
-                    // Use cached descriptor set
-                    // In a real implementation, we would use the cached set here
-                    // For now, we'll proceed with the normal update
-                    cachedSet.close();
-                }
-                
                 dub.buffer(0, job.element(), job.geometryBuffer(), job.bufferOffsets());
                 job.geometryBuffer().close();
             }
             descriptorUpdateJobs.clear();
 
             dub.apply();
-            
-            // Prune cache if needed
-            pruneDescriptorSetCache();
         }
 
         return super.getInstanceBuffer();
@@ -235,73 +204,6 @@ public class TLASSectionManager extends TLASInstanceBuffer {
             geometryBufferDescSet.get().removeRef(index + i);
         }
     }
-    
-    /**
-     * Gets or creates a cached descriptor set for the given buffer and offsets.
-     * 
-     * @param buffer The geometry buffer
-     * @param offsets The buffer offsets
-     * @return A cached or newly created descriptor set
-     */
-    private VRef<VDescriptorSet> getCachedDescriptorSet(VRef<VBuffer> buffer, List<Long> offsets) {
-        // Generate cache key based on buffer and offsets
-        int cacheKey = generateDescriptorCacheKey(buffer, offsets);
-        
-        // Check if we have a cached descriptor set
-        CachedDescriptorSet cached = descriptorSetCache.get(cacheKey);
-        if (cached != null) {
-            // Update usage count and last used time
-            CachedDescriptorSet updated = new CachedDescriptorSet(
-                cached.descriptorSet.addRef(), 
-                System.nanoTime(), 
-                cached.usageCount + 1
-            );
-            descriptorSetCache.put(cacheKey, updated);
-            return cached.descriptorSet.addRef();
-        }
-        
-        // Create new descriptor set (this would be implemented based on specific needs)
-        // For now, we'll return null to indicate no caching for this case
-        return null;
-    }
-    
-    /**
-     * Generates a cache key for descriptor sets based on buffer and offsets.
-     * 
-     * @param buffer The geometry buffer
-     * @param offsets The buffer offsets
-     * @return Hash code representing the descriptor set configuration
-     */
-    private int generateDescriptorCacheKey(VRef<VBuffer> buffer, List<Long> offsets) {
-        int result = 1;
-        result = 31 * result + (buffer != null ? buffer.hashCode() : 0);
-        result = 31 * result + offsets.hashCode();
-        return result;
-    }
-    
-    /**
-     * Clears the descriptor set cache.
-     */
-    public static void clearDescriptorSetCache() {
-        descriptorSetCache.clear();
-    }
-    
-    /**
-     * Prunes the descriptor set cache to maintain size limits.
-     */
-    private void pruneDescriptorSetCache() {
-        if (descriptorSetCache.size() > MAX_CACHE_SIZE) {
-            // Remove least recently used entries
-            descriptorSetCache.entrySet().stream()
-                .sorted(Map.Entry.comparingByValue((a, b) -> Long.compare(a.lastUsed, b.lastUsed)))
-                .limit(descriptorSetCache.size() - MAX_CACHE_SIZE / 2)
-                .forEach(entry -> {
-                    entry.getValue().descriptorSet.close();
-                    descriptorSetCache.remove(entry.getKey());
-                });
-        }
-    }
-
     /**
      * Queues a BLAS build result for processing.
      */
@@ -319,11 +221,11 @@ public class TLASSectionManager extends TLASInstanceBuffer {
     /**
      * Adds an ephemeral instance for entities or other transient geometry.
      */
-    public void addEphemeralInstance(VCmdBuff cmd, VkAccelerationStructureInstanceKHR asi,
+    public VRef<TLASSectionHolder> addEphemeralInstance(VkAccelerationStructureInstanceKHR asi,
             final VRef<VAccelerationStructure> structure, final VRef<VBuffer> geometryBuffer,
             List<Long> bufferOffsets) {
         if (bufferOffsets.isEmpty()) {
-            return;
+            throw new IllegalArgumentException("Cannot add an ephemeral TLAS instance with no geometry");
         }
 
         int numGeometries = bufferOffsets.size();
@@ -334,10 +236,36 @@ public class TLASSectionManager extends TLASInstanceBuffer {
 
         addEphemeralInstance(asi);
 
-        var holder = TLASSectionHolder.create(-1, geometryIndex, numGeometries, structure.addRef(), this);
-        cmd.moveRefGeneric(holder.addRefGeneric());
-        holder.close();
-
         descriptorUpdateJobs.add(new DescriptorUpdateJob(geometryIndex, geometryBuffer.addRef(), bufferOffsets));
+        return TLASSectionHolder.create(-1, geometryIndex, numGeometries, structure.addRef(), this);
+    }
+
+    public void destroy() {
+        for (var holder : List.copyOf(activeSections.values())) {
+            holder.close();
+        }
+        activeSections.clear();
+
+        BLASBuildResult update;
+        while ((update = sectionUpdates.poll()) != null) {
+            update.structure().close();
+            update.data().geometryBuffer().close();
+        }
+        sectionRemovals.clear();
+
+        for (var job : descriptorUpdateJobs) {
+            job.geometryBuffer().close();
+        }
+        descriptorUpdateJobs.clear();
+
+        if (geometryBufferDescSet != null) {
+            geometryBufferDescSet.close();
+            geometryBufferDescSet = null;
+        }
+        if (geometryBufferSetLayout != null) {
+            geometryBufferSetLayout.close();
+            geometryBufferSetLayout = null;
+        }
+        super.destroy();
     }
 }

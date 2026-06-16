@@ -35,7 +35,8 @@ public class FSRUpscaler {
     
     // FSR state
     private boolean initialized;
-    private FSRQualityPreset qualityPreset;
+    // FIX: Use FSRQualityPreset from DLSSConfig instead of local duplicate
+    private me.cortex.vulkanite.client.config.DLSSConfig.FSRQualityPreset qualityPreset;
     private boolean sharpeningEnabled;
     private float sharpeningStrength;
     
@@ -54,32 +55,14 @@ public class FSRUpscaler {
     // Compute pipeline for FSR
     private VRef<VImage> intermediateImage;
     private VRef<VImageView> intermediateView;
-    
-    /**
-     * FSR Quality Presets
-     * Defines the rendering resolution relative to output resolution
-     */
-    public enum FSRQualityPreset {
-        QUALITY(0.667f),      // Render at 66.7% resolution, upscale to native
-        BALANCED(0.59f),      // Render at 59% resolution, upscale to native
-        PERFORMANCE(0.5f),    // Render at 50% resolution, upscale to native
-        ULTRA_PERFORMANCE(0.36f); // Render at 36% resolution, upscale to native
-        
-        private final float scale;
-        
-        FSRQualityPreset(float scale) {
-            this.scale = scale;
-        }
-        
-        public float getScale() {
-            return scale;
-        }
-    }
-    
+   
+    // FIX: Use FSRQualityPreset from DLSSConfig instead of duplicating the enum
+    // The enum is defined in me.cortex.vulkanite.client.config.DLSSConfig.FSRQualityPreset
+   
     public FSRUpscaler(VContext context) {
-        this.context = context;
-        this.initialized = false;
-        this.qualityPreset = FSRQualityPreset.QUALITY;
+    	this.context = context;
+    	this.initialized = false;
+    	this.qualityPreset = me.cortex.vulkanite.client.config.DLSSConfig.FSRQualityPreset.QUALITY;
         this.sharpeningEnabled = true;
         this.sharpeningStrength = 0.5f;
         this.renderWidth = 1920;
@@ -100,20 +83,26 @@ public class FSRUpscaler {
      * @param sharpeningStrength Sharpening strength (0.0 to 1.0)
      * @return true if initialization succeeded
      */
-    public boolean initialize(FSRQualityPreset qualityPreset, 
-                             int outputWidth, 
-                             int outputHeight,
-                             boolean sharpeningEnabled,
-                             float sharpeningStrength) {
-        this.qualityPreset = qualityPreset;
+    public boolean initialize(me.cortex.vulkanite.client.config.DLSSConfig.FSRQualityPreset qualityPreset,
+    	int outputWidth,
+    	int outputHeight,
+    	boolean sharpeningEnabled,
+    	float sharpeningStrength) {
+    	this.qualityPreset = qualityPreset;
         this.outputWidth = outputWidth;
         this.outputHeight = outputHeight;
         this.sharpeningEnabled = sharpeningEnabled;
         this.sharpeningStrength = Math.max(0.0f, Math.min(1.0f, sharpeningStrength));
-        
+      
         // Calculate render resolution based on quality preset
-        this.renderWidth = (int) (outputWidth * qualityPreset.getScale());
-        this.renderHeight = (int) (outputHeight * qualityPreset.getScale());
+        // FIX: Apply 8-pixel alignment for consistency with DLSS and GPU optimization
+        int baseRenderWidth = (int) (outputWidth * qualityPreset.getScale());
+        int baseRenderHeight = (int) (outputHeight * qualityPreset.getScale());
+        this.renderWidth = (baseRenderWidth / 8) * 8;
+        this.renderHeight = (baseRenderHeight / 8) * 8;
+        // Ensure minimum size of 8x8
+        this.renderWidth = Math.max(8, this.renderWidth);
+        this.renderHeight = Math.max(8, this.renderHeight);
         
         System.out.println("[Vulkanite] FSR initialized: " + 
                           renderWidth + "x" + renderHeight + " -> " + 
@@ -195,18 +184,18 @@ public class FSRUpscaler {
     /**
      * Get current quality preset
      */
-    public FSRQualityPreset getQualityPreset() {
-        return qualityPreset;
+    public me.cortex.vulkanite.client.config.DLSSConfig.FSRQualityPreset getQualityPreset() {
+    	return qualityPreset;
     }
-    
+   
     /**
      * Set quality preset (will require reinitialization)
      */
-    public void setQualityPreset(FSRQualityPreset preset) {
-        if (this.qualityPreset != preset) {
-            this.qualityPreset = preset;
-            this.initialized = false; // Require reinitialization
-        }
+    public void setQualityPreset(me.cortex.vulkanite.client.config.DLSSConfig.FSRQualityPreset preset) {
+    	if (this.qualityPreset != preset) {
+    		this.qualityPreset = preset;
+    		this.initialized = false; // Require reinitialization
+    	}
     }
     
     /**

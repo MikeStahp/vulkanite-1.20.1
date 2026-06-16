@@ -11,6 +11,7 @@ import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
 
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
 import static org.lwjgl.vulkan.VK10.*;
 import static org.lwjgl.vulkan.VK12.VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 
@@ -19,32 +20,46 @@ public class SharedQuadVkIndexBuffer {
     private static VRef<VBuffer> indexBuffer = null;
     private static int currentQuadCount = 0;
 
-    public synchronized static VRef<VBuffer> getIndexBuffer(VContext context, VCmdBuff uploaCmdBuff, int quadCount) {
+    public synchronized static VRef<VBuffer> getIndexBuffer(VContext context, VCmdBuff uploadCmdBuff, int quadCount) {
         if (currentQuadCount < quadCount) {
-            makeNewIndexBuffer(context, uploaCmdBuff, quadCount);
+            makeNewIndexBuffer(context, uploadCmdBuff, quadCount);
         }
 
         return indexBuffer.addRef();
     }
 
-    private static void makeNewIndexBuffer(VContext context, VCmdBuff uploaCmdBuff, int quadCount) {
+    private static void makeNewIndexBuffer(VContext context, VCmdBuff uploadCmdBuff, int quadCount) {
         ByteBuffer buffer = genQuadIdxs(quadCount);
+        VRef<VBuffer> newIndexBuffer = null;
+        boolean published = false;
         try {
             // TODO: dont harcode
             // VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR and
             // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
-            indexBuffer = context.memory.createBuffer(buffer.remaining(),
+            newIndexBuffer = context.memory.createBuffer(buffer.remaining(),
                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
                             | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
                             | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                     VK_MEMORY_HEAP_DEVICE_LOCAL_BIT);
-            indexBuffer.get().setDebugUtilsObjectName("Geometry Index Buffer");
+            newIndexBuffer.get().setDebugUtilsObjectName("Geometry Index Buffer");
 
-            uploaCmdBuff.encodeDataUpload(context.memory, MemoryUtil.memAddress(buffer), indexBuffer, 0,
+            uploadCmdBuff.encodeDataUpload(context.memory, MemoryUtil.memAddress(buffer), newIndexBuffer, 0,
                     buffer.remaining());
+            uploadCmdBuff.encodeBufferBarrier(newIndexBuffer, 0, buffer.remaining(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
 
+            VRef<VBuffer> oldIndexBuffer = indexBuffer;
+            indexBuffer = newIndexBuffer;
             currentQuadCount = quadCount;
+            published = true;
+
+            if (oldIndexBuffer != null) {
+                oldIndexBuffer.close();
+            }
         } finally {
+            if (!published && newIndexBuffer != null) {
+                newIndexBuffer.close();
+            }
             MemoryUtil.memFree(buffer);
         }
     }

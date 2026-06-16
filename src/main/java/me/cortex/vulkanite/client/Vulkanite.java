@@ -1,8 +1,6 @@
 package me.cortex.vulkanite.client;
 
 import me.cortex.vulkanite.acceleration.AccelerationManager;
-import me.cortex.vulkanite.client.rendering.DLSSBridge;
-import me.cortex.vulkanite.client.rendering.DLSSLoader;
 import me.cortex.vulkanite.lib.base.VContext;
 
 import me.cortex.vulkanite.lib.base.VRef;
@@ -128,6 +126,7 @@ public class Vulkanite {
 
     public void destroy() {
         vkDeviceWaitIdle(ctx.device);
+        accelerationManager.destroy();
         descriptorPools.clear();
     }
 
@@ -139,22 +138,18 @@ public class Vulkanite {
         instanceExtensions.add(VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME);
         instanceExtensions.add(VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME);
 
-        // Add DLSS instance extensions
-        DLSSBridge bridge = DLSSLoader.getInstance();
-        if (bridge != null) {
-            try {
-                int count = bridge.getNGXInstanceExtensionCount();
-                System.out.println("NGX requires " + count + " instance extensions");
-                for (int i = 0; i < count; i++) {
-                    String extName = bridge.getNGXInstanceExtension(i);
-                    if (!instanceExtensions.contains(extName)) {
-                        instanceExtensions.add(extName);
-                        System.out.println("Adding NGX instance extension: " + extName);
-                    }
+        // Add NGX-required instance extensions for DLSS support
+        // These MUST be enabled at instance creation time or NGX will report FeatureNotSupported
+        try {
+            List<String> ngxInstanceExts = me.cortex.vulkanite.client.rendering.DLSSBridge.getRequiredInstanceExtensions();
+            for (String ext : ngxInstanceExts) {
+                if (!instanceExtensions.contains(ext)) {
+                    instanceExtensions.add(ext);
+                    System.out.println("[Vulkanite] Adding NGX instance extension: " + ext);
                 }
-            } catch (Exception e) {
-                System.err.println("Failed to query NGX instance extensions: " + e.getMessage());
             }
+        } catch (Exception e) {
+            System.out.println("[Vulkanite] Could not query NGX instance extensions: " + e.getMessage());
         }
 
         var init = new VInitializer("Vulkan test", "Vulkanite", 1, 3,
@@ -184,79 +179,6 @@ public class Vulkanite {
 
                 VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME));
 
-        // Add DLSS required extensions if available
-        bridge = DLSSLoader.getInstance();
-        if (bridge != null) {
-            try {
-                long instanceAddr = init.getInstance().address();
-                long physAddr = init.getPhysicalDevice().address();
-                int count = bridge.getNGXDeviceExtensionCount(instanceAddr, physAddr);
-                System.out.println("NGX requires " + count + " device extensions");
-                for (int i = 0; i < count; i++) {
-                    String extName = bridge.getNGXDeviceExtension(instanceAddr, physAddr, i);
-                    if (!extensions.contains(extName)) {
-                        extensions.add(extName);
-                        System.out.println("Enabling NGX device extension: " + extName);
-                    }
-                }
-
-                // FORCE ENABLE VK_NV_ngx if available (Crucial for DLSS)
-                // Sometimes NGX doesn't report it but needs it, or returns 0 extensions
-                String[] criticalExtensions = {
-                        "VK_NVX_binary_import",
-                        "VK_NVX_image_view_handle",
-                        "VK_KHR_push_descriptor",
-                        "VK_KHR_buffer_device_address",
-                        "VK_NV_ngx",
-                        "VK_NV_ngx2"
-                };
-                System.out.println("Available Device Extensions: " + availableExtensions);
-                for (String ext : criticalExtensions) {
-                    if (availableExtensions.contains(ext)) {
-                        if (!extensions.contains(ext)) {
-                            extensions.add(ext);
-                            System.out.println("Force enabling critical DLSS extension: " + ext);
-                        } else {
-                            System.out.println("Critical DLSS extension already enabled: " + ext);
-                        }
-                    } else {
-                        System.err.println("WARNING: " + ext + " is NOT available on this device/driver!");
-                    }
-                }
-
-                System.out.println("Final Enabled Device Extensions: " + extensions);
-
-            } catch (Exception e) {
-                System.err.println("Failed to query NGX device extensions: " + e.getMessage());
-                // Fallback to manual list if query fails
-                List<String> dlssExtensions = List.of(
-                        "VK_NVX_binary_import",
-                        "VK_NVX_image_view_handle",
-                        "VK_EXT_buffer_device_address",
-                        "VK_KHR_push_descriptor",
-                        "VK_NV_ngx");
-                for (var ext : dlssExtensions) {
-                    if (availableExtensions.contains(ext)) {
-                        extensions.add(ext);
-                        System.out.println("Enabling DLSS extension (fallback): " + ext);
-                    }
-                }
-            }
-        } else {
-            // Fallback if DLSSBridge not loaded
-            List<String> dlssExtensions = List.of(
-                    "VK_NVX_binary_import",
-                    "VK_NVX_image_view_handle",
-                    "VK_EXT_buffer_device_address",
-                    "VK_KHR_push_descriptor");
-            for (var ext : dlssExtensions) {
-                if (availableExtensions.contains(ext)) {
-                    extensions.add(ext);
-                    System.out.println("Enabling DLSS extension: " + ext);
-                }
-            }
-        }
-
         if (IS_WINDOWS) {
             extensions.addAll(List.of(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
                     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
@@ -266,6 +188,26 @@ public class Vulkanite {
                     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
                     VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME));
         }
+
+        // Add NGX-required device extensions for DLSS support
+        // Only add extensions that the physical device actually supports
+        try {
+            List<String> ngxDeviceExts = me.cortex.vulkanite.client.rendering.DLSSBridge.getRequiredDeviceExtensions(
+                    init.getInstance().address(), init.getPhysicalDevice().address());
+            for (String ext : ngxDeviceExts) {
+                if (!extensions.contains(ext)) {
+                    if (availableExtensions.contains(ext)) {
+                        extensions.add(ext);
+                        System.out.println("[Vulkanite] Adding NGX device extension: " + ext);
+                    } else {
+                        System.out.println("[Vulkanite] WARNING: NGX requires device extension " + ext + " but it is not available!");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("[Vulkanite] Could not query NGX device extensions: " + e.getMessage());
+        }
+
         init.createDevice(extensions,
                 List.of(),
                 new float[] { 1.0f, 1.0f },

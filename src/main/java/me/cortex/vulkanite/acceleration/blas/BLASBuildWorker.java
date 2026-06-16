@@ -88,27 +88,36 @@ public class BLASBuildWorker implements Runnable {
         LOGGER.info("[BLAS Worker] Starting worker thread");
 
         while (true) {
-            collectJobs(jobs);
-            VRegistry.INSTANCE.threadLocalCollect();
-            var singleUsePoolWorker = context.cmd.getSingleUsePool();
+            try {
+                collectJobs(jobs);
+                VRegistry.INSTANCE.threadLocalCollect();
+                var singleUsePoolWorker = context.cmd.getSingleUsePool();
 
-            // Log memory usage before processing
-            logMemoryUsage("before batch");
+                // Log memory usage before processing
+                logMemoryUsage("before batch");
 
-            try (var stack = bigStack.push()) {
-                var buildContext = memoryManager.createBuildContext(jobs, stack);
-                batchProcessor.processBatch(buildContext, singleUsePoolWorker, priorExecutions, stack);
-                totalBatchesProcessed++;
+                try (var stack = bigStack.push()) {
+                    var buildContext = memoryManager.createBuildContext(jobs, stack);
+                    batchProcessor.processBatch(buildContext, singleUsePoolWorker, priorExecutions, stack);
+                    totalBatchesProcessed++;
+                }
+
+                // Reset allocators for next batch
+                memoryManager.reset();
+
+                // Log memory after processing
+                logMemoryUsage("after batch");
+
+                // Check and handle memory pressure
+                checkAndHandleMemoryPressure();
+            } catch (Throwable t) {
+                LOGGER.error("[BLAS Worker] Batch failed; dropping batch and keeping worker alive", t);
+                memoryManager.reset();
+                for (BLASBuildJob job : jobs) {
+                    job.data().geometryBuffer().close();
+                }
+                jobs.clear();
             }
-
-            // Reset allocators for next batch
-            memoryManager.reset();
-
-            // Log memory after processing
-            logMemoryUsage("after batch");
-
-            // Check and handle memory pressure
-            checkAndHandleMemoryPressure();
         }
     }
     
@@ -129,11 +138,19 @@ public class BLASBuildWorker implements Runnable {
             jobs.addAll(batch);
         }
         
-        // Try to collect more without blocking (up to 32 jobs total)
-        while (jobs.size() < 32 && awaitingJobBatches.tryAcquire()) {
+        // Try to collect more without blocking, but keep batches small enough to avoid
+        // long GPU submissions and query-pool pressure.
+        while (jobs.size() < BLASBatchProcessor.MAX_BATCH_SIZE && awaitingJobBatches.tryAcquire()) {
             batch = batchedJobs.poll();
             if (batch != null) {
-                jobs.addAll(batch);
+                int remaining = BLASBatchProcessor.MAX_BATCH_SIZE - jobs.size();
+                if (batch.size() <= remaining) {
+                    jobs.addAll(batch);
+                } else {
+                    jobs.addAll(batch.subList(0, remaining));
+                    batchedJobs.addFirst(new ArrayList<>(batch.subList(remaining, batch.size())));
+                    awaitingJobBatches.release();
+                }
             }
         }
     }

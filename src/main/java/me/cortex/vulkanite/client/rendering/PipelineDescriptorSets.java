@@ -20,6 +20,12 @@ public final class PipelineDescriptorSets {
                     new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, true)
             });
 
+    private static final ShaderReflection.Set ENTITY_TEXTURE_SET_EXPECTED = new ShaderReflection.Set(
+            new ShaderReflection.Binding[] {
+                    new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                            EntityCapture.MAX_TEXTURES, false)
+            });
+
     // Cache for single image common set (never changes)
     // Includes G-buffer bindings for hybrid rendering
     private static final ShaderReflection.Set COMMON_SET_EXPECTED_SINGLE = new ShaderReflection.Set(
@@ -45,6 +51,12 @@ public final class PipelineDescriptorSets {
                     new ShaderReflection.Binding("", 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
                     // Binding 15: Previous frame reservoir for ReSTIR ping-pong
                     new ShaderReflection.Binding("", 15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 16, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 18, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 19, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 20, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
             });
 
     // Cache for base common set without G-buffer bindings (for full path tracers)
@@ -90,6 +102,12 @@ public final class PipelineDescriptorSets {
                     new ShaderReflection.Binding("", 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
                     // Binding 15: Previous frame reservoir for ReSTIR ping-pong
                     new ShaderReflection.Binding("", 15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 16, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 18, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 19, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 20, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
             });
 
     private PipelineDescriptorSets() {
@@ -127,6 +145,12 @@ public final class PipelineDescriptorSets {
                 new ShaderReflection.Binding("", 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
                 // Binding 15: Previous frame reservoir for ReSTIR ping-pong
                 new ShaderReflection.Binding("", 15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                new ShaderReflection.Binding("", 16, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                new ShaderReflection.Binding("", 17, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                new ShaderReflection.Binding("", 18, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                new ShaderReflection.Binding("", 19, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                new ShaderReflection.Binding("", 20, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                new ShaderReflection.Binding("", 21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
         });
     }
 
@@ -164,6 +188,10 @@ public final class PipelineDescriptorSets {
         return GEOM_SET_EXPECTED;
     }
 
+    public static ShaderReflection.Set createEntityTextureSetExpected() {
+        return ENTITY_TEXTURE_SET_EXPECTED;
+    }
+
     /**
      * Creates the expected custom texture descriptor set layout.
      */
@@ -175,14 +203,46 @@ public final class PipelineDescriptorSets {
         return new ShaderReflection.Set(new ArrayList<>(Arrays.asList(bindings)));
     }
 
-    /**
-     * Creates the expected SSBO descriptor set layout.
-     */
-    public static ShaderReflection.Set createSsboSetExpected(int[] ssboIds) {
-        ShaderReflection.Binding[] bindings = new ShaderReflection.Binding[ssboIds.length];
-        for (int i = 0; i < ssboIds.length; i++) {
-            bindings[i] = new ShaderReflection.Binding("", ssboIds[i], VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false);
-        }
-        return new ShaderReflection.Set(new ArrayList<>(Arrays.asList(bindings)));
-    }
+	/**
+	 * Creates the expected SSBO descriptor set layout.
+	 */
+	public static ShaderReflection.Set createSsboSetExpected(int[] ssboIds) {
+		ShaderReflection.Binding[] bindings = new ShaderReflection.Binding[ssboIds.length];
+		for (int i = 0; i < ssboIds.length; i++) {
+			bindings[i] = new ShaderReflection.Binding("", ssboIds[i], VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false);
+		}
+		return new ShaderReflection.Set(new ArrayList<>(Arrays.asList(bindings)));
+	}
+
+	/**
+	 * Creates the expected deferred lighting descriptor set layout.
+	 * This set contains bindings for the deferred lighting compute shader:
+	 * <ul>
+	 * <li>Binding 0: UBO - Camera/sun uniforms</li>
+	 * <li>Bindings 7-11: G-buffer textures (colortex1-5)</li>
+	 * <li>Binding 20: Shadow map</li>
+	 * <li>Bindings 21-23: Output storage images</li>
+	 * </ul>
+	 */
+	public static ShaderReflection.Set createDeferredLightingSet() {
+		ArrayList<ShaderReflection.Binding> bindings = new ArrayList<>();
+
+		// Binding 0: UBO
+		bindings.add(new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, false));
+
+		// Bindings 7-11: G-buffer inputs (combined image samplers)
+		for (int i = 7; i <= 11; i++) {
+			bindings.add(new ShaderReflection.Binding("", i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false));
+		}
+
+		// Binding 20: Shadow map
+		bindings.add(new ShaderReflection.Binding("", 20, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false));
+
+		// Bindings 21-23: Output storage images
+		for (int i = 21; i <= 23; i++) {
+			bindings.add(new ShaderReflection.Binding("", i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false));
+		}
+
+		return new ShaderReflection.Set(bindings);
+	}
 }

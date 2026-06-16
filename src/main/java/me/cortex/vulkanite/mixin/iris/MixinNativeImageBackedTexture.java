@@ -37,8 +37,10 @@ public abstract class MixinNativeImageBackedTexture extends AbstractTexture impl
             glDeleteTextures(glId);
             glId = -1;
         }
-        if (getVGImage() != null) {
+        var existingImage = getVGImage();
+        if (existingImage != null) {
             System.err.println("Vulkan image already allocated, releasing");
+            existingImage.close();
             setVGImage(null);
         }
 

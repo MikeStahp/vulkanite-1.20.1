@@ -43,6 +43,7 @@ layout(std140, binding = 0, set = 0) uniform CameraInfo {
     uint world_type;        // Offset 168: World dimension type
     mat4 prevViewProj;      // Offset 176: Previous ViewProjection matrix
     vec4 jitter;            // Offset 240: Jitter data (curX, curY, prevX, prevY)
+    mat4 curViewProj;       // Offset 256: Current unjittered ViewProjection matrix
 } cam;
 
 // Set 0, Binding 3: Block Atlas (Albedo)
@@ -485,13 +486,11 @@ bool isSkyPixel(vec3 worldPos) {
     return length(worldPos) < EPSILON;
 }
 
-/// Calculates the view direction from world position
-/// @param worldPos World position of the shading point
+/// Calculates the view direction from camera-relative world position
+/// @param worldPos Camera-relative world position of the shading point
 /// @return View direction (pointing towards camera)
 vec3 calculateViewDir(vec3 worldPos) {
-    // Extract camera position from viewInverse matrix
-    vec3 cameraPos = cam.viewInverse[3].xyz;
-    return normalize(cameraPos - worldPos);
+    return normalize(-worldPos);
 }
 
 #endif // VULKANITE_LIGHTING_GLSL

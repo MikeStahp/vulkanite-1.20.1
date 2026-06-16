@@ -1,0 +1,67 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+
+#include "/lib/rt/data.glsl"
+#include "/lib/rt/payload.glsl"
+#include "/lib/rt/fragment_info.glsl"
+
+layout(location = 0) rayPayloadInEXT Payload payload;
+
+hitAttributeEXT vec2 baryCoord;
+
+layout(std140, binding = 0) uniform CameraInfo {
+  vec3 corners[4];
+  mat4 viewInverse;
+  vec4 sunPosition;
+  vec4 moonPosition;
+  uint frameId;
+  uint flags;
+  vec2 padding1;
+  mat4 prevViewProj;
+  vec4 jitterData;
+} cam;
+
+layout(binding = 3) uniform sampler2D blockTex;
+
+layout(set = 1, binding = 0) buffer Quads {
+  Quad quads[];
+} geometryBuffers[];
+
+Quad getRayQuad() {
+  return geometryBuffers[nonuniformEXT(gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT)].quads[gl_PrimitiveID >> 1];
+}
+
+const float ALPHA_THRESHOLD = 0.1;
+
+void main() {
+  Quad quad = getRayQuad();
+  vec2 uv = getFragmentUV(quad, baryCoord);
+  vec4 texColor = texture(blockTex, uv);
+
+    // OPTIMIZATION: Cache block_id and distance delta
+    float blockId = quad.vertices[0].block_id.x;
+    float distDelta = clamp(gl_RayTmaxEXT - payload.prev_distance, 0.0, 10.0);
+
+  if (payload.inside_block) {
+    payload.shadowTransmission *= refractiveShadowTransmission(blockId, texColor.rgb, texColor.a, distDelta);
+  }
+
+  // OPTIMIZATION: Early-out checks - combine conditions efficiently
+  float alphaThreshold = isFoliageMaterial(blockId) ? 0.5 : ALPHA_THRESHOLD;
+  bool isTransparent = texColor.a < alphaThreshold;
+  bool isIgnoredBlock = abs(blockId - float(payload.ignore_block_id.x)) < 0.5;
+  bool isWaterAndNotIgnoring = isWaterMaterial(blockId) && (payload.ignore_block_id.x != 0);
+
+  // OPTIMIZATION: Only update state and ignore if any condition is met
+  if (isTransparent || isIgnoredBlock || isWaterAndNotIgnoring) {
+  	payload.prev_distance = gl_RayTmaxEXT;
+  	payload.inside_block = !payload.inside_block;
+  	ignoreIntersectionEXT;
+  }
+}

@@ -165,6 +165,7 @@ public class BLASGeometryProcessor {
                 int indexType = SharedQuadVkIndexBuffer.TYPE;
 
                 uploadBuildCmd.addBufferRef(indexBuffer);
+                indexBuffer.close();
 
                 // Setup vertex data
                 VkDeviceOrHostAddressConstKHR vertexData = VkDeviceOrHostAddressConstKHR.calloc(stack)

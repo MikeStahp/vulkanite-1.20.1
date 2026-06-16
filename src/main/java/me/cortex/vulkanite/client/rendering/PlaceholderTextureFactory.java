@@ -31,10 +31,11 @@ public final class PlaceholderTextureFactory {
     }
 
     /**
-     * Creates a 4x4 placeholder specular texture filled with zeros.
+     * Creates a 4x4 placeholder LabPBR specular texture:
+     * smoothness=0, dielectric F0~=0.04, no SSS, alpha=255/no emissive data.
      */
     public static PlaceholderTexture createPlaceholderSpecular(VContext ctx) {
-        return createPlaceholder(ctx, VK_FORMAT_R8G8B8A8_UNORM, 4 * 4 * 4, PlaceholderTextureFactory::fillZeros);
+        return createPlaceholder(ctx, VK_FORMAT_R8G8B8A8_UNORM, 4 * 4 * 4, PlaceholderTextureFactory::fillSpecular);
     }
 
     /**
@@ -69,8 +70,13 @@ public final class PlaceholderTextureFactory {
         return new PlaceholderTexture(image, view);
     }
 
-    private static void fillZeros(org.lwjgl.system.MemoryStack stack, long[] addressHolder) {
-        IntBuffer data = stack.callocInt(4 * 4);
+    private static void fillSpecular(org.lwjgl.system.MemoryStack stack, long[] addressHolder) {
+        IntBuffer data = stack.mallocInt(4 * 4);
+        int defaultLabPbrSpecular = 0xFF000A00;
+        for (int i = 0; i < 4 * 4; i++) {
+            data.put(defaultLabPbrSpecular);
+        }
+        data.rewind();
         addressHolder[0] = MemoryUtil.memAddress(data);
     }
 

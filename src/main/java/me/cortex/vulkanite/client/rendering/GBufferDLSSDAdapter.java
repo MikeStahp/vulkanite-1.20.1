@@ -1,188 +1,164 @@
 package me.cortex.vulkanite.client.rendering;
 
 import me.cortex.vulkanite.lib.base.VRef;
-import me.cortex.vulkanite.lib.memory.VImage;
 import me.cortex.vulkanite.lib.other.VImageView;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
- * Adapter class that maps Iris G-buffer textures to DLSSD inputs.
+ * Adapter for extracting DLSSD inputs from G-buffer views.
  * 
- * Iris G-buffer layout (colortex1-5):
- * - colortex1 (gbufferViews[0]): Albedo/Diffuse color (RGB)
- * - colortex2 (gbufferViews[1]): Material properties (metallic, roughness, etc.)
- * - colortex3 (gbufferViews[2]): World-space normals (RGB, roughness in A if packed)
- * - colortex4 (gbufferViews[3]): World position or other data
- * - colortex5 (gbufferViews[4]): Additional properties (specular, etc.)
+ * <p>This class provides utility methods for mapping Iris G-buffer textures
+ * to DLSSD input parameters as defined in the NVIDIA NGX SDK.</p>
  * 
- * DLSSD Required Inputs:
- * - Diffuse Albedo: RGB surface diffuse color
- * - Specular Albedo: F0 reflectance values
- * - Normals: World-space normals with roughness in .w (packed mode)
- * - Roughness: Separate texture (only if unpacked mode)
+ * <h2>G-Buffer Mapping</h2>
+ * <ul>
+ *   <li>colortex1 (index 0) - Albedo/Diffuse color</li>
+ *   <li>colortex2 (index 1) - Material properties (roughness, metallic, etc.)</li>
+ *   <li>colortex3 (index 2) - World-space normals</li>
+ *   <li>colortex4 (index 3) - World position</li>
+ *   <li>colortex5 (index 4) - Blocklight, skylight, and ambient occlusion</li>
+ * </ul>
  * 
- * This adapter handles the mapping between these formats.
+ * <h2>DLSSD Input Requirements (from nvsdk_ngx_helpers_dlssd_vk.h)</h2>
+ * <ul>
+ *   <li>pInDiffuseAlbedo - RGB diffuse color</li>
+ *   <li>pInSpecularAlbedo - F0 reflectance values</li>
+ *   <li>pInNormals - World-space normals, roughness in .w if packed</li>
+ *   <li>pInRoughness - Separate roughness buffer if unpacked mode</li>
+ * </ul>
+ * 
+ * @see DLSSDProcessor
+ * @see DLSSConfig
  */
 public class GBufferDLSSDAdapter {
+    private static final Logger LOGGER = LoggerFactory.getLogger(GBufferDLSSDAdapter.class);
+
+    // G-buffer indices (matching Iris colortex bindings)
+    public static final int GBUFFER_ALBEDO = 0;      // colortex1
+    public static final int GBUFFER_MATERIAL = 1;    // colortex2
+    public static final int GBUFFER_NORMALS = 2;     // colortex3
+    public static final int GBUFFER_WORLDPOS = 3;    // colortex4
+    public static final int GBUFFER_EXTRA = 4;       // colortex5
 
     /**
-     * Result class containing all DLSSD G-buffer inputs
+     * Container for extracted DLSSD inputs.
      */
-    public static class DLSSDGBufferInputs {
+    public static class DLSSDInputs {
         public VRef<VImageView> diffuseAlbedoView;
         public VRef<VImageView> specularAlbedoView;
         public VRef<VImageView> normalsView;
-        public VRef<VImageView> roughnessView; // May be null if packed in normals.w
-
-        // Image references for transition operations
-        public VRef<VImage> diffuseAlbedoImage;
-        public VRef<VImage> specularAlbedoImage;
-        public VRef<VImage> normalsImage;
-        public VRef<VImage> roughnessImage;
-
+        public VRef<VImageView> roughnessView;
         public boolean roughnessPacked = true;
+
+        /**
+         * Check if the required inputs are available.
+         * 
+         * @return true if minimum required inputs are present
+         */
+        public boolean hasRequiredInputs() {
+            return diffuseAlbedoView != null && normalsView != null;
+        }
     }
 
     /**
-     * Extract DLSSD inputs from Iris G-buffer views.
+     * Extract DLSSD inputs from G-buffer views.
      * 
-     * @param gbufferViews Array of G-buffer views from Iris:
-     *                     [0] = colortex1 (Albedo)
-     *                     [1] = colortex2 (Material)
-     *                     [2] = colortex3 (Normals)
-     *                     [3] = colortex4 (World Position)
-     *                     [4] = colortex5 (Extra)
-     * @param packedRoughness If true, roughness is packed in normals.w
-     * @return DLSSDGBufferInputs containing the mapped views
+     * @param gbufferViews Array of G-buffer image views
+     * @return Container with extracted inputs
      */
-    public static DLSSDGBufferInputs extractDLSSDInputs(
-            VRef<VImageView>[] gbufferViews,
-            boolean packedRoughness) {
+    public static DLSSDInputs extractDLSSDInputs(VRef<VImageView>[] gbufferViews) {
+        DLSSDInputs inputs = new DLSSDInputs();
 
-        DLSSDGBufferInputs inputs = new DLSSDGBufferInputs();
-        inputs.roughnessPacked = packedRoughness;
-
-        if (gbufferViews == null || gbufferViews.length < 3) {
-            System.err.println("[GBufferDLSSDAdapter] Insufficient G-buffer views provided!");
+        if (gbufferViews == null || gbufferViews.length == 0) {
+            LOGGER.warn("G-buffer views array is null or empty");
             return inputs;
         }
 
-        // Diffuse Albedo comes from colortex1 (gbufferViews[0])
-        // This is the primary surface color (albedo)
-        if (gbufferViews[0] != null) {
-            inputs.diffuseAlbedoView = gbufferViews[0];
-            // Note: We don't have direct access to the image here, 
-            // the view contains what we need for DLSSD
-            System.out.println("[GBufferDLSSDAdapter] Diffuse Albedo mapped from colortex1");
-        } else {
-            System.err.println("[GBufferDLSSDAdapter] WARNING: colortex1 (Albedo) is null!");
+        // Extract diffuse albedo (colortex1)
+        if (gbufferViews.length > GBUFFER_ALBEDO && gbufferViews[GBUFFER_ALBEDO] != null) {
+            inputs.diffuseAlbedoView = gbufferViews[GBUFFER_ALBEDO];
+            LOGGER.debug("Diffuse albedo: colortex1");
         }
 
-        // Specular Albedo (F0) - typically comes from colortex2 or colortex5
-        // In many shader packs:
-        // - colortex2 contains material properties (metallic, roughness, ao, etc.)
-        // - colortex5 may contain specular data
-        // 
-        // For DLSSD, we need F0 reflectance values. This is often calculated as:
-        // - For dielectrics: ~0.04 (4% reflectance)
-        // - For metals: albedo value (colored F0)
-        //
-        // If colortex5 has specular data, use it; otherwise use colortex2
-        if (gbufferViews.length > 4 && gbufferViews[4] != null) {
-            inputs.specularAlbedoView = gbufferViews[4];
-            System.out.println("[GBufferDLSSDAdapter] Specular Albedo mapped from colortex5");
-        } else if (gbufferViews[1] != null) {
-            inputs.specularAlbedoView = gbufferViews[1];
-            System.out.println("[GBufferDLSSDAdapter] Specular Albedo mapped from colortex2 (material)");
-        } else {
-            System.err.println("[GBufferDLSSDAdapter] WARNING: No specular albedo source available!");
+        // VulkaniteRT stores specular F0 in colortex2.rgb. colortex5 contains
+        // blocklight/skylight/AO, so using it here corrupts RR's material guide.
+        if (gbufferViews.length > GBUFFER_MATERIAL && gbufferViews[GBUFFER_MATERIAL] != null) {
+            inputs.specularAlbedoView = gbufferViews[GBUFFER_MATERIAL];
+            LOGGER.debug("Specular albedo: colortex2");
         }
 
-        // Normals come from colortex3 (gbufferViews[2])
-        // In packed mode, roughness is stored in the .w component
-        if (gbufferViews[2] != null) {
-            inputs.normalsView = gbufferViews[2];
-            System.out.println("[GBufferDLSSDAdapter] Normals mapped from colortex3 (packed roughness: " + packedRoughness + ")");
-        } else {
-            System.err.println("[GBufferDLSSDAdapter] WARNING: colortex3 (Normals) is null!");
+        // Extract normals (colortex3)
+        if (gbufferViews.length > GBUFFER_NORMALS && gbufferViews[GBUFFER_NORMALS] != null) {
+            inputs.normalsView = gbufferViews[GBUFFER_NORMALS];
+            LOGGER.debug("Normals: colortex3");
         }
 
-        // Roughness - if unpacked mode, we need a separate roughness texture
-        // This could come from colortex2.g (common convention) or a separate buffer
-        if (!packedRoughness && gbufferViews[1] != null) {
-            // In unpacked mode, roughness might be in colortex2
-            // The shader would need to extract it, but for DLSSD we pass the whole texture
-            inputs.roughnessView = gbufferViews[1];
-            System.out.println("[GBufferDLSSDAdapter] Roughness mapped from colortex2 (unpacked mode)");
-        }
+        // Roughness is typically packed in normals.w for DLSSD
+        // If unpacked mode is needed, it would come from material buffer
+        inputs.roughnessPacked = true;
+        inputs.roughnessView = null;
 
         return inputs;
     }
 
     /**
-     * Get the image from a VImageView VRef.
-     * This is a helper method to extract the underlying image for transitions.
+     * Log the current G-buffer configuration for debugging.
      * 
-     * @param viewRef Reference to the image view
-     * @return Reference to the underlying image, or null if not available
+     * @param gbufferViews Array of G-buffer image views
      */
-    public static VRef<VImage> getImageFromView(VRef<VImageView> viewRef) {
-        if (viewRef == null || viewRef.get() == null) {
-            return null;
+    public static void logGBufferConfiguration(VRef<VImageView>[] gbufferViews) {
+        if (gbufferViews == null) {
+            LOGGER.info("[G-Buffer Config] gbufferViews is null");
+            return;
         }
-        // The VImageView has a public 'image' field that references the underlying image
-        return viewRef.get().image;
+
+        LOGGER.info("[G-Buffer Config] {} views available:", gbufferViews.length);
+
+        String[] names = {"Albedo", "Material", "Normals", "WorldPos", "Extra"};
+        for (int i = 0; i < gbufferViews.length; i++) {
+            String name = (i < names.length) ? names[i] : "Unknown";
+            if (gbufferViews[i] != null) {
+                var view = gbufferViews[i].get();
+                if (view != null && view.image != null) {
+                    var img = view.image.get();
+                    LOGGER.info("  [{}] {}: {}x{}, format={}",
+                            i, name, img.width, img.height, img.format);
+                } else {
+                    LOGGER.info("  [{}] {}: view or image is null", i, name);
+                }
+            } else {
+                LOGGER.info("  [{}] {}: null", i, name);
+            }
+        }
     }
 
     /**
-     * Validate that all required DLSSD inputs are present.
+     * Validate that G-buffer has the required textures for DLSSD.
      * 
-     * @param inputs The G-buffer inputs to validate
-     * @return true if all required inputs are present
+     * @param gbufferViews Array of G-buffer image views
+     * @return true if minimum requirements are met
      */
-    public static boolean validateInputs(DLSSDGBufferInputs inputs) {
-        if (inputs == null) {
-            System.err.println("[GBufferDLSSDAdapter] Inputs are null!");
+    public static boolean validateGBufferForDLSSD(VRef<VImageView>[] gbufferViews) {
+        if (gbufferViews == null || gbufferViews.length < 3) {
+            LOGGER.warn("G-buffer validation failed: insufficient views (need at least 3, have {})",
+                    gbufferViews == null ? 0 : gbufferViews.length);
             return false;
         }
 
-        boolean valid = true;
-
-        if (inputs.diffuseAlbedoView == null) {
-            System.err.println("[GBufferDLSSDAdapter] Missing diffuse albedo!");
-            valid = false;
+        // Required: Albedo (index 0) and Normals (index 2)
+        if (gbufferViews[GBUFFER_ALBEDO] == null) {
+            LOGGER.warn("G-buffer validation failed: Albedo (index 0) is null");
+            return false;
         }
 
-        if (inputs.specularAlbedoView == null) {
-            System.err.println("[GBufferDLSSDAdapter] Missing specular albedo!");
-            valid = false;
+        if (gbufferViews[GBUFFER_NORMALS] == null) {
+            LOGGER.warn("G-buffer validation failed: Normals (index 2) is null");
+            return false;
         }
 
-        if (inputs.normalsView == null) {
-            System.err.println("[GBufferDLSSDAdapter] Missing normals!");
-            valid = false;
-        }
-
-        if (!inputs.roughnessPacked && inputs.roughnessView == null) {
-            System.err.println("[GBufferDLSSDAdapter] Missing roughness (unpacked mode)!");
-            valid = false;
-        }
-
-        return valid;
-    }
-
-    /**
-     * Log the current G-buffer configuration for debugging.
-     * 
-     * @param gbufferViews The G-buffer views to log
-     */
-    public static void logGBufferConfiguration(VRef<VImageView>[] gbufferViews) {
-        System.out.println("[GBufferDLSSDAdapter] G-buffer Configuration:");
-        String[] names = {"colortex1 (Albedo)", "colortex2 (Material)", 
-                          "colortex3 (Normals)", "colortex4 (Position)", "colortex5 (Extra)"};
-        
-        for (int i = 0; i < Math.min(gbufferViews.length, names.length); i++) {
-            String status = (gbufferViews[i] != null) ? "present" : "NULL";
-            System.out.println("  [" + i + "] " + names[i] + ": " + status);
-        }
+        LOGGER.debug("G-buffer validation passed for DLSSD");
+        return true;
     }
 }

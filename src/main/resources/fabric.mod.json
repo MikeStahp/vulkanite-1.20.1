@@ -10,7 +10,11 @@
   "contact": {},
   "icon": "assets/vulkanite/icon.png",
   "environment": "client",
-  "entrypoints": {},
+  "entrypoints": {
+    "client": [
+      "me.cortex.vulkanite.client.VulkaniteInitializer"
+    ]
+  },
   "mixins": [
     "vulkanite.mixins.json"
   ],

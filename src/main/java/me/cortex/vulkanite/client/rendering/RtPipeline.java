@@ -11,6 +11,7 @@ public record RtPipeline(
         VRef<VRaytracePipeline> pipeline,
         int commonSet,
         int geomSet,
+        int entityTextureSet,
         int customTexSet,
         int ssboSet) {
 }

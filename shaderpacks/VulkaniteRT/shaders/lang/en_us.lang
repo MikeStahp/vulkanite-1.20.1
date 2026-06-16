@@ -1,0 +1,135 @@
+# General Settings
+option.SPECULAR_INTENSITY=Specular Intensity
+option.SPECULAR_INTENSITY.comment=Adjusts the strength of the specular highlights.
+
+# Lighting Settings
+option.GAMMA=Gamma
+option.GAMMA.comment=Gamma correction for tone mapping. Lower values = brighter, higher values = darker.
+
+option.AMBIENT_FACTOR=Ambient Factor
+option.AMBIENT_FACTOR.comment=Base ambient lighting level. Higher values = brighter shadows.
+
+option.SUN_INTENSITY=Sun Intensity
+option.SUN_INTENSITY.comment=Multiplier for direct sunlight brightness.
+option.HDR_EXPOSURE=HDR Exposure
+option.HDR_EXPOSURE.comment=Linear exposure applied before denoise and upscaling.
+option.COLOR_SATURATION=Color Saturation
+option.COLOR_SATURATION.comment=Linear color saturation before final reconstruction.
+option.COLOR_CONTRAST=Color Contrast
+option.COLOR_CONTRAST.comment=Linear contrast around middle gray.
+
+option.INDIRECT_SCALE=Indirect Scale
+option.INDIRECT_SCALE.comment=Controls the intensity of bounced light (global illumination). When light hits a surface and bounces off to illuminate other surfaces, this slider controls how bright those secondary bounces are. Higher values = more vibrant indirect lighting, lower values = darker shadows and less color bleeding.
+
+option.MIN_LIGHTING=Minimum Lighting
+option.MIN_LIGHTING.comment=Sets the base ambient lighting level (0.0 to 0.5).
+
+# Screen Menus
+screen.LIGHTING_SETTINGS=Lighting Settings
+screen.LIGHTING_SETTINGS.comment=Adjust lighting parameters like gamma, ambient, and sun intensity.
+
+screen.MATERIALS_SETTINGS=Material Settings
+screen.MATERIALS_SETTINGS.comment=Adjust material properties.
+
+screen.EMISSION_SETTINGS=Block Emission
+screen.EMISSION_SETTINGS.comment=Controls emissive surfaces and stable blocklight appearance.
+screen.VOLUMETRIC_SETTINGS=Volumetrics
+screen.VOLUMETRIC_SETTINGS.comment=Controls shadowed atmospheric scattering.
+screen.SHADOW_SETTINGS=Soft Shadows
+screen.ADVANCED_RT_SETTINGS=Advanced RT
+screen.WATER_GLASS_SETTINGS=Water & Glass
+screen.WATER_GLASS_SETTINGS.comment=Controls animated water normals, water clarity, glass transmission, and crystal lighting.
+screen.SKY_FOLIAGE_SETTINGS=Sky & Foliage
+screen.SKY_FOLIAGE_SETTINGS.comment=Controls procedural sky detail and normal-only foliage wind.
+
+option.EMISSIVE_SURFACE_INTENSITY=Emitter Surface Intensity
+option.SHROOMLIGHT_EMISSION=Shroomlight Multiplier
+option.SCULK_EMISSION=Sculk Multiplier
+option.REDSTONE_EMISSION=Redstone Multiplier
+option.SHULKER_EMISSION=Shulker Glow
+option.SHULKER_EMISSION.comment=Controls the custom animated glow for shulker boxes.
+option.BLOCKLIGHT_COLOR_R=Blocklight Red
+option.BLOCKLIGHT_COLOR_G=Blocklight Green
+option.BLOCKLIGHT_COLOR_B=Blocklight Blue
+
+option.VOLUMETRICS_ENABLED=Enable Volumetrics
+option.VOLUMETRIC_SAMPLES=Volumetric Samples
+option.VOLUMETRIC_DENSITY=Fog Density
+option.VOLUMETRIC_DISTANCE=Fog Distance
+option.VOLUMETRIC_INTENSITY=Scattering Intensity
+option.VOLUMETRIC_ANISOTROPY=Forward Scattering
+option.VOLUMETRIC_SHADOWS=Volumetric Shadows
+suffix.VOLUMETRIC_DISTANCE= blocks
+value.VOLUMETRICS_ENABLED.0=Off
+value.VOLUMETRICS_ENABLED.1=On
+value.VOLUMETRIC_SHADOWS.0=Off
+value.VOLUMETRIC_SHADOWS.1=On
+
+option.BLOCKLIGHT_VISUAL_INTENSITY=Smooth Blocklight Intensity
+option.BLOCKLIGHT_VISUAL_RANGE=Smooth Blocklight Range
+option.BLOCKLIGHT_LOW_FLOOR=Low Light Floor
+option.PENUMBRA_RADIUS=Sun Angular Radius
+option.PENUMBRA_SAMPLES=Shadow Samples
+option.PENUMBRA_DIFFUSE_BLEND=Penumbra Blend
+option.METAL_MAX_BOUNCES=Metal Reflection Bounces
+option.METAL_RR_MIN_BOUNCE=Metal RR Start
+option.METAL_REFLECTION_SCALE=Metal Reflection Strength
+option.METAL_GGX_IMPORTANCE=GGX Importance Sampling
+option.REFLECTION_MAX_ROUGHNESS=Reflection Roughness Cutoff
+option.REFLECTION_RAY_DISTANCE=Reflection Ray Distance
+option.DIELECTRIC_REFLECTION_SCALE=Non-Metal Reflection Strength
+option.GOLD_MIN_ROUGHNESS=Gold Roughness Floor
+option.METAL_MIN_ROUGHNESS=Metal Roughness Floor
+option.COPPER_MIN_ROUGHNESS=Copper Roughness Floor
+option.CRYSTAL_MIN_ROUGHNESS=Crystal Roughness
+option.WATER_WAVES=Water Waves
+option.WATER_WAVE_STRENGTH=Water Wave Strength
+option.WATER_WAVE_SCALE=Water Wave Scale
+option.WATER_WAVE_SPEED=Water Wave Speed
+option.WATER_MIN_ROUGHNESS=Water Roughness
+option.WATER_CLARITY=Water Clarity
+option.WATER_REFLECTION_STRENGTH=Water Reflection Strength
+option.WATER_ABSORPTION_STRENGTH=Water Absorption
+option.WATER_TINT_R=Water Tint Red
+option.WATER_TINT_G=Water Tint Green
+option.WATER_TINT_B=Water Tint Blue
+option.ICE_MIN_ROUGHNESS=Ice Roughness
+option.ICE_TRANSMISSION=Ice Transmission
+option.ICE_FROST_STRENGTH=Ice Frost Detail
+option.GLASS_MIN_ROUGHNESS=Glass Roughness
+option.GLASS_TRANSMISSION=Glass Transmission
+option.CRYSTAL_TRANSMISSION=Crystal Transmission
+option.FOLIAGE_WIND=Foliage Wind
+option.FOLIAGE_WIND_STRENGTH=Foliage Wind Strength
+option.FOLIAGE_WIND_SPEED=Foliage Wind Speed
+option.SKY_CLOUDS=Sky Clouds
+option.SKY_CLOUD_COVERAGE=Cloud Coverage
+option.SKY_CLOUD_SPEED=Cloud Speed
+option.SKY_STARS=Stars
+option.SUNSET_WARMTH=Sunset Warmth
+option.SKY_RAYLEIGH_SCALE=Sky Blue Scattering
+option.RESTIR_MAX_HISTORY=ReSTIR History
+option.RESTIR_SPATIAL_RADIUS=ReSTIR Spatial Radius
+option.RESTIR_SPATIAL_SAMPLES=ReSTIR Spatial Samples
+option.RTX_ENTITY_CAPTURE=RTX Entity Capture
+option.RTX_ENTITY_CAPTURE.comment=Includes entities in the ray tracing acceleration structure.
+option.RTX_PARTICLE_CAPTURE=RTX Particle Capture
+option.RTX_PARTICLE_CAPTURE.comment=Includes compatible particles in the ray tracing acceleration structure.
+option.RTX_CAPTURE_INTERVAL=Capture Interval
+option.RTX_CAPTURE_INTERVAL.comment=Frames between entity and particle capture updates.
+option.RTX_MAX_CAPTURED_ENTITIES=Entity Capture Cap
+option.RTX_MAX_CAPTURED_PARTICLES=Particle Capture Cap
+option.RTX_ENTITY_BLAS_CACHE=Entity BLAS Cache
+option.RTX_ENTITY_BLAS_CACHE.comment=Stable entity geometry cache size. Higher reduces rebuild spikes but uses more VRAM.
+value.WATER_WAVES.0=Off
+value.WATER_WAVES.1=On
+value.FOLIAGE_WIND.0=Off
+value.FOLIAGE_WIND.1=On
+value.SKY_CLOUDS.0=Off
+value.SKY_CLOUDS.1=On
+value.SKY_STARS.0=Off
+value.SKY_STARS.1=On
+value.RTX_ENTITY_CAPTURE.0=Off
+value.RTX_ENTITY_CAPTURE.1=On
+value.RTX_PARTICLE_CAPTURE.0=Off
+value.RTX_PARTICLE_CAPTURE.1=On

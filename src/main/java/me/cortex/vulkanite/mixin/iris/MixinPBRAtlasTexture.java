@@ -19,8 +19,10 @@ import static org.lwjgl.vulkan.VK10.*;
 public abstract class MixinPBRAtlasTexture extends AbstractTexture implements IVGImage  {
     @Redirect(method = "upload", at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/platform/TextureUtil;prepareImage(IIII)V"))
     private void redirect(int id, int maxLevel, int width, int height) {
-        if (getVGImage() != null) {
+        var existingImage = getVGImage();
+        if (existingImage != null) {
             System.err.println("Vulkan image already allocated, releasing");
+            existingImage.close();
             setVGImage(null);
         }
 

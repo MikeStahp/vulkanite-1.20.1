@@ -1,401 +1,433 @@
 package me.cortex.vulkanite.client.rendering;
 
+import me.cortex.vulkanite.client.config.DLSSConfig;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.cmd.VCmdBuff;
 import me.cortex.vulkanite.lib.memory.VImage;
 import me.cortex.vulkanite.lib.other.VImageView;
-import net.minecraft.client.MinecraftClient;
+import net.irisshaders.iris.uniforms.CapturedRenderingState;
+import org.joml.Matrix4f;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.lwjgl.vulkan.VK10.*;
 
-import me.cortex.vulkanite.client.config.DLSSConfig;
-
 /**
- * Integrates DLSSD (Ray Reconstruction) into the Vulkanite render pipeline.
+ * Radiance-style DLSS/DLSSD coordinator.
  *
- * This class manages the DLSSD processing step that occurs after ray tracing,
- * denoising the noisy ray-traced output using AI-powered reconstruction.
- *
- * Usage flow:
- * 1. Initialize with VContext and output dimensions
- * 2. Call processFrame() after ray tracing to denoise the output
- * 3. The denoised output can then be composited with the final frame
+ * <p>Radiance treats DLSS as a module with a fixed resource contract. Vulkanite
+ * now follows the same shape: ray tracing produces the named DLSS inputs and
+ * this class only evaluates NGX against those images.</p>
  */
 public class DLSSDProcessor {
+    private static final Logger LOGGER = LoggerFactory.getLogger(DLSSDProcessor.class);
+
+    public static final int DEPTH_TYPE_LINEAR = 0;
+    public static final int DEPTH_TYPE_HW = 1;
+    public static final int ROUGHNESS_MODE_UNPACKED = 0;
+    public static final int ROUGHNESS_MODE_PACKED = 1;
+
+    private static final int MAX_INIT_FAILURES = 3;
+    private static final int MAX_EVALUATION_FAILURES = 3;
+
     private final VContext context;
-    private final DLSSRayReconstruction dlssd;
-    private final DLSSBufferConverter bufferConverter;
-    private boolean initialized = false;
-    private int lastWidth = 0;
-    private int lastHeight = 0;
+    private final Matrix4f rrProjection = new Matrix4f();
+    private final float[] rrWorldToView = new float[16];
+    private final float[] rrViewToClip = new float[16];
 
-    // Frame counter for throttled logging
-    private int frameCount = 0;
-
-    // Configuration
-    private DLSSRayReconstruction.DLSSConfig config;
-    private boolean enabled = true;
+    private boolean initialized;
+    private boolean supported;
+    private boolean usingStandardDLSS;
+    private boolean temporalHistoryValid;
+    private boolean hasValidOutput;
+    private long featureHandle;
+    private int renderWidth;
+    private int renderHeight;
+    private int outputWidth;
+    private int outputHeight;
+    private int initFailures;
+    private int consecutiveEvaluationFailures;
 
     public DLSSDProcessor(VContext context) {
         this.context = context;
-        this.dlssd = new DLSSRayReconstruction(context);
-        this.bufferConverter = new DLSSBufferConverter(context);
-        this.config = new DLSSRayReconstruction.DLSSConfig();
-
-        // Load settings from user configuration
-        updateFromUserConfig();
+        this.supported = DLSSBridge.isNativeLibraryLoaded();
+        LOGGER.info("DLSS processor created. Native library loaded: {}", supported);
     }
 
-    /**
-     * Update internal configuration from the user's DLSSConfig file.
-     */
-    public void updateFromUserConfig() {
-        try {
-            DLSSConfig userConfig = DLSSConfig.load();
-
-            this.enabled = userConfig.isEnabled();
-
-            // Map user config to internal config
-            this.config.enableRayReconstruction = userConfig.isRayReconstructionEnabled();
-
-            // Map quality preset
-            this.config.preset = userConfig.getQualityPreset();
-
-            // Dynamically determine if roughness is packed based on the shader pack
-            // For now, we assume it's packed if the shader pack provides it in normals.w
-            // This could be improved by querying the shader pack configuration directly
-            this.config.roughnessPacked = userConfig.isRoughnessPacked();
-
-            // Force re-initialization if settings changed
-            this.initialized = false;
-
-            System.out.println("[DLSSDProcessor] Updated configuration from file: Enabled=" + enabled +
-                    ", RR=" + config.enableRayReconstruction +
-                    ", Preset=" + config.preset);
-        } catch (Exception e) {
-            System.err.println("[DLSSDProcessor] Failed to load user config: " + e.getMessage());
-            e.printStackTrace();
-            // Fallback defaults
-            this.config.preset = DLSSRayReconstruction.DLSSQualityPreset.NATIVE;
-            this.config.enableRayReconstruction = true;
-            this.config.roughnessPacked = true;
-        }
+    public void initialize(int outputWidth, int outputHeight) {
+        ResolutionScaleManager scaleManager = ResolutionScaleManager.getInstance();
+        scaleManager.update(outputWidth, outputHeight);
+        initialize(scaleManager.getRenderWidth(), scaleManager.getRenderHeight(),
+                scaleManager.getOutputWidth(), scaleManager.getOutputHeight());
     }
 
-    /**
-     * Initialize or reinitialize DLSSD for the given output dimensions.
-     * This should be called when the framebuffer size changes.
-     * 
-     * @param width  Output width
-     * @param height Output height
-     * @return true if initialization succeeded
-     */
-    public boolean initialize(int width, int height) {
-        // Respect user configuration - do not auto-enable if explicitly disabled
-        if (!enabled) {
-            System.out.println("[DLSSDProcessor] Disabled by configuration, skipping initialization");
-            return false;
+    public void initialize(int renderWidth, int renderHeight, int outputWidth, int outputHeight) {
+        if (!supported) {
+            LOGGER.warn("Cannot initialize DLSS - native bridge is not loaded");
+            return;
+        }
+        if (initFailures >= MAX_INIT_FAILURES) {
+            return;
         }
 
-        // Ensure dimensions are multiple of 8 to match DLSS requirements
-        // This prevents off-by-one errors (e.g., 1009 height) which cause NGX InvalidParameter
-        width = width & ~7;
-        height = height & ~7;
+        int[] renderSize = ResolutionScaleManager.alignDimensions(renderWidth, renderHeight);
+        int[] outputSize = ResolutionScaleManager.alignDimensions(outputWidth, outputHeight);
+        renderWidth = renderSize[0];
+        renderHeight = renderSize[1];
+        outputWidth = outputSize[0];
+        outputHeight = outputSize[1];
 
-        // Skip if already initialized with same dimensions
-        if (initialized && lastWidth == width && lastHeight == height) {
-            return true;
+        if (initialized && matchesDimensions(renderWidth, renderHeight, outputWidth, outputHeight)) {
+            return;
         }
 
-        // Check if DLSSD is supported
-        if (!dlssd.isDLSSSupported()) {
-            System.out.println("[DLSSDProcessor] DLSS not supported, processor disabled");
-            enabled = false;
-            return false;
+        cleanup();
+
+        this.renderWidth = renderWidth;
+        this.renderHeight = renderHeight;
+        this.outputWidth = outputWidth;
+        this.outputHeight = outputHeight;
+
+        long instanceHandle = context.instance.address();
+        long physicalDeviceHandle = context.physicalDevice.address();
+        long deviceHandle = context.device.address();
+
+        DLSSConfig config = DLSSConfig.load();
+        int qualityMode = config.getQualityPreset().getNgxValue();
+
+        LOGGER.info("Initializing Radiance-style DLSS module: render={}x{}, output={}x{}, mode={}",
+                renderWidth, renderHeight, outputWidth, outputHeight, config.getDenoiser());
+
+        if (!config.isRayReconstructionEnabled()) {
+            initializeStandardDLSS(instanceHandle, physicalDeviceHandle, deviceHandle);
+            return;
         }
 
-        System.out.println("[DLSSDProcessor] Initializing for " + width + "x" + height);
+        featureHandle = DLSSBridge.createDLSSDFeature(
+                instanceHandle,
+                physicalDeviceHandle,
+                deviceHandle,
+                renderWidth,
+                renderHeight,
+                outputWidth,
+                outputHeight,
+                qualityMode,
+                ROUGHNESS_MODE_PACKED,
+                DEPTH_TYPE_LINEAR);
 
-        boolean success = dlssd.initialize(config, width, height);
+        if (featureHandle == 0) {
+            initFailures++;
+            LOGGER.warn("DLSSD creation failed (attempt {}/{}); trying standard DLSS fallback",
+                    initFailures, MAX_INIT_FAILURES);
+            initializeStandardDLSS(instanceHandle, physicalDeviceHandle, deviceHandle);
+            return;
+        }
 
-        if (success) {
+        initialized = true;
+        usingStandardDLSS = false;
+        initFailures = 0;
+        consecutiveEvaluationFailures = 0;
+        temporalHistoryValid = false;
+        hasValidOutput = false;
+        LOGGER.info("Radiance-style DLSSD initialized");
+    }
+
+    private void initializeStandardDLSS(long instanceHandle, long physicalDeviceHandle, long deviceHandle) {
+        boolean ok = DLSSBridge.initStandardDLSS(
+                instanceHandle,
+                physicalDeviceHandle,
+                deviceHandle,
+                renderWidth,
+                renderHeight,
+                outputWidth,
+                outputHeight);
+
+        if (ok) {
             initialized = true;
-            lastWidth = width;
-            lastHeight = height;
-            System.out.println("[DLSSDProcessor] Initialized successfully. Ray Reconstruction: " +
-                    dlssd.isRayReconstructionEnabled());
+            usingStandardDLSS = true;
+            initFailures = 0;
+            consecutiveEvaluationFailures = 0;
+            temporalHistoryValid = false;
+            hasValidOutput = false;
+            LOGGER.info("Standard DLSS initialized for Radiance-style module");
         } else {
-            System.err.println("[DLSSDProcessor] Initialization failed!");
             initialized = false;
+            initFailures++;
+            LOGGER.error("Standard DLSS initialization failed (attempt {}/{})",
+                    initFailures, MAX_INIT_FAILURES);
+        }
+    }
+
+    public boolean matchesDimensions(int renderWidth, int renderHeight, int outputWidth, int outputHeight) {
+        return this.renderWidth == renderWidth
+                && this.renderHeight == renderHeight
+                && this.outputWidth == outputWidth
+                && this.outputHeight == outputHeight;
+    }
+
+    public VRef<VImage> processFrame(VCmdBuff cmd, RtxFrameImages images, float deltaTime) {
+        if (!initialized || !supported || images == null) {
+            return null;
+        }
+        if (!matchesDimensions(images.renderWidth(), images.renderHeight(),
+                images.outputWidth(), images.outputHeight())) {
+            LOGGER.warn("DLSS dimensions changed without reinitialization; skipping frame");
+            return null;
         }
 
-        return success;
+        if (usingStandardDLSS) {
+            return processStandardDLSS(cmd, images);
+        }
+
+        List<VRef<?>> views = new ArrayList<>();
+        try {
+            VRef<VImageView> radianceView = createView(views, images.radiance());
+            VRef<VImageView> depthView = createView(views, images.linearDepth());
+            VRef<VImageView> motionView = createView(views, images.motionVector());
+            VRef<VImageView> outputView = createView(views, images.processed());
+            VRef<VImageView> diffuseView = createView(views, images.diffuseAlbedoMetallic());
+            VRef<VImageView> specularView = createView(views, images.specularAlbedo());
+            VRef<VImageView> normalRoughnessView = createView(views, images.normalRoughness());
+            VRef<VImageView> specularHitDepthView = createView(views, images.specularHitDepth());
+
+            updateMatrices();
+
+            boolean success = DLSSBridge.evaluateDLSSD(
+                    cmd.buffer().address(),
+                    featureHandle,
+                    radianceView.get().view,
+                    images.radiance().get().image(),
+                    images.radiance().get().format,
+                    depthView.get().view,
+                    images.linearDepth().get().image(),
+                    images.linearDepth().get().format,
+                    motionView.get().view,
+                    images.motionVector().get().image(),
+                    images.motionVector().get().format,
+                    outputView.get().view,
+                    images.processed().get().image(),
+                    images.processed().get().format,
+                    diffuseView.get().view,
+                    images.diffuseAlbedoMetallic().get().image(),
+                    images.diffuseAlbedoMetallic().get().format,
+                    specularView.get().view,
+                    images.specularAlbedo().get().image(),
+                    images.specularAlbedo().get().format,
+                    normalRoughnessView.get().view,
+                    images.normalRoughness().get().image(),
+                    images.normalRoughness().get().format,
+                    0,
+                    0,
+                    0,
+                    specularHitDepthView.get().view,
+                    images.specularHitDepth().get().image(),
+                    images.specularHitDepth().get().format,
+                    JitterManager.getJitterX(),
+                    JitterManager.getJitterY(),
+                    temporalHistoryValid ? 0 : 1,
+                    deltaTime * 1000.0f,
+                    rrWorldToView,
+                    rrViewToClip,
+                    renderWidth,
+                    renderHeight);
+
+            if (!success) {
+                recordEvaluationFailure("DLSSD");
+                return null;
+            }
+
+            temporalHistoryValid = true;
+            consecutiveEvaluationFailures = 0;
+            hasValidOutput = true;
+            return images.processed();
+        } catch (Exception e) {
+            LOGGER.error("DLSSD evaluation failed", e);
+            recordEvaluationFailure("DLSSD");
+            return null;
+        } finally {
+            closeAll(views);
+        }
     }
 
     /**
-     * Process a frame through DLSSD (Ray Reconstruction).
-     * 
-     * This method takes the noisy ray-traced output and G-buffer data,
-     * then processes it through DLSSD for AI-powered denoising.
-     * 
-     * @param cmd           Command buffer to record DLSSD commands
-     * @param noisyOutput   Noisy ray-traced color output
-     * @param motionVectors Screen-space motion vectors
-     * @param depth         Depth buffer
-     * @param gbufferViews  G-buffer views from Iris:
-     *                      [0] = colortex1 (Albedo)
-     *                      [1] = colortex2 (Material)
-     *                      [2] = colortex3 (Normals)
-     *                      [3] = colortex4 (Position)
-     *                      [4] = colortex5 (Extra/Specular)
-     * @param deltaTime     Frame delta time in seconds
-     * @return Denoised output image, or the original noisy input if DLSSD is not
-     *         available
+     * Legacy entry point kept for compatibility with older callers. The Radiance
+     * path uses {@link #processFrame(VCmdBuff, RtxFrameImages, float)}.
      */
     public VRef<VImage> processFrame(
             VCmdBuff cmd,
-            VRef<VImage> noisyOutput,
+            VRef<VImage> noisyInput,
             VRef<VImage> motionVectors,
             VRef<VImage> depth,
             VRef<VImageView>[] gbufferViews,
             float deltaTime) {
-
-        if (!initialized || !enabled) {
-            return noisyOutput;
-        }
-
-        // Extract G-buffer inputs for DLSSD
-        GBufferDLSSDAdapter.DLSSDGBufferInputs gbufferInputs = GBufferDLSSDAdapter.extractDLSSDInputs(gbufferViews,
-            config.roughnessPacked);
-
-        // Validate inputs
-        if (!GBufferDLSSDAdapter.validateInputs(gbufferInputs)) {
-            System.err.println("[DLSSDProcessor] Invalid G-buffer inputs, falling back to standard DLSS");
-            // Fall back to standard DLSS without G-buffer
-            return dlssd.processFrame(cmd, noisyOutput, motionVectors, depth, deltaTime);
-        }
-
-    // Get image references from views for DLSSD processing
-    // Note: We need to extract the underlying images from the views
-    VRef<VImage> diffuseAlbedoRaw = extractImageFromView(gbufferInputs.diffuseAlbedoView);
-    VRef<VImage> specularAlbedoRaw = extractImageFromView(gbufferInputs.specularAlbedoView);
-    VRef<VImage> normalsRaw = extractImageFromView(gbufferInputs.normalsView);
-    VRef<VImage> roughnessRaw = config.roughnessPacked ? null : extractImageFromView(gbufferInputs.roughnessView);
-
-    // =====================================================================
-    // FORMAT CONVERSION: Convert G-buffer images to DLSSD-compatible formats
-    // DLSSD requires R16G16B16A16_SFLOAT for all color buffers
-    // =====================================================================
-    VRef<VImage> diffuseAlbedo = bufferConverter.convertToRGBA16F(cmd, diffuseAlbedoRaw, "diffuseAlbedo");
-    VRef<VImage> specularAlbedo = bufferConverter.convertToRGBA16F(cmd, specularAlbedoRaw, "specularAlbedo");
-    VRef<VImage> normals = bufferConverter.convertToRGBA16F(cmd, normalsRaw, "normals");
-    VRef<VImage> roughness = config.roughnessPacked ? null : bufferConverter.convertToRGBA16F(cmd, roughnessRaw, "roughness");
-    
-    // Also convert noisy output if needed
-    VRef<VImage> noisyOutputConverted = bufferConverter.convertToRGBA16F(cmd, noisyOutput, "noisyOutput");
-
-    // =====================================================================
-    // DLSS BUFFER VALIDATION: Detect and validate buffer formats/usage
-    // =====================================================================
-        int renderWidth = dlssd.getRenderWidth();
-        int renderHeight = dlssd.getRenderHeight();
-        VRef<VImage> outputImage = dlssd.getOutputImage();
-        
-    // Validate all buffers for DLSSD (using converted images)
-    DLSSBufferValidator.ValidationResult[] bufferResults = DLSSBufferValidator.validateAllBuffers(
-        noisyOutputConverted,
-        depth,
-        motionVectors,
-        diffuseAlbedo,
-        specularAlbedo,
-        normals,
-        roughness,
-        outputImage,
-        renderWidth,
-        renderHeight
-    );
-        
-        // Log validation results (throttled to every 300 frames)
-        if (frameCount % 300 == 0) {
-            DLSSBufferValidator.logValidationResults(bufferResults);
-        }
-        
-        // Check if all required buffers are valid
-        if (!DLSSBufferValidator.allBuffersValid(bufferResults)) {
-            System.err.println("[DLSSDProcessor] Buffer validation failed! Check format/usage flags.");
-            System.err.println("[DLSSDProcessor] Required formats:");
-            System.err.println("  - Color buffers: R16G16B16A16_SFLOAT");
-            System.err.println("  - Depth buffer: R32_SFLOAT");
-            System.err.println("  - Required usage: STORAGE, SAMPLED, TRANSFER_SRC, TRANSFER_DST");
-            // Fall back to standard DLSS if buffer validation fails
-            return dlssd.processFrame(cmd, noisyOutput, motionVectors, depth, deltaTime);
-        }
-        // =====================================================================
-
-        // DIAGNOSTIC: Log before calling processFrameDLSSD
-        boolean useRR = dlssd.isRayReconstructionEnabled();
-        System.out.println("[DLSSDProcessor] Calling processFrameDLSSD: useRR=" + useRR +
-            ", diffAlb=" + (diffuseAlbedo != null) + ", specAlb=" + (specularAlbedo != null) +
-            ", normals=" + (normals != null) + ", roughness=" + (roughness != null));
-
-    // Process through DLSSD (using converted images)
-    VRef<VImage> denoisedRef = dlssd.processFrameDLSSD(
-        cmd,
-        noisyOutputConverted,
-        motionVectors,
-        depth,
-        diffuseAlbedo,
-        specularAlbedo,
-        normals,
-        roughness,
-        deltaTime);
-
-    // If DLSSD failed (e.g. native DLL error but isSupported returned true
-    // previously),
-    // we must fallback to the noisy output to avoid rendering black screens.
-    if (denoisedRef == null || denoisedRef.get() == null) {
-        System.err.println("[DLSSDProcessor] DLSSD evaluate failed, falling back to noisy output.");
-        return noisyOutput;
+        LOGGER.debug("Legacy DLSS processFrame called; returning input because Radiance resources are required");
+        return noisyInput;
     }
 
-        frameCount++;
-        return denoisedRef;
-    }
+    private VRef<VImage> processStandardDLSS(VCmdBuff cmd, RtxFrameImages images) {
+        List<VRef<?>> views = new ArrayList<>();
+        try {
+            VRef<VImageView> radianceView = createView(views, images.radiance());
+            VRef<VImageView> depthView = createView(views, images.linearDepth());
+            VRef<VImageView> motionView = createView(views, images.motionVector());
+            VRef<VImageView> outputView = createView(views, images.processed());
 
-    /**
-     * Extract the underlying VImage from a VImageView VRef.
-     * This is a helper method to get the image for DLSSD processing.
-     */
-    private VRef<VImage> extractImageFromView(VRef<VImageView> viewRef) {
-        if (viewRef == null || viewRef.get() == null || viewRef.get().image == null) {
+            boolean success = DLSSBridge.evaluateStandardDLSS(
+                    cmd.buffer().address(),
+                    radianceView.get().view,
+                    images.radiance().get().image(),
+                    images.radiance().get().format,
+                    depthView.get().view,
+                    images.linearDepth().get().image(),
+                    images.linearDepth().get().format,
+                    motionView.get().view,
+                    images.motionVector().get().image(),
+                    images.motionVector().get().format,
+                    outputView.get().view,
+                    images.processed().get().image(),
+                    images.processed().get().format,
+                    JitterManager.getJitterX(),
+                    JitterManager.getJitterY());
+
+            if (!success) {
+                recordEvaluationFailure("Standard DLSS");
+                return null;
+            }
+
+            consecutiveEvaluationFailures = 0;
+            hasValidOutput = true;
+            return images.processed();
+        } catch (Exception e) {
+            LOGGER.error("Standard DLSS evaluation failed", e);
+            recordEvaluationFailure("Standard DLSS");
             return null;
+        } finally {
+            closeAll(views);
         }
-        // The VImageView has an 'image' field that references the underlying image
-        return viewRef.get().image.addRef();
     }
 
-    /**
-     * Check if DLSSD is initialized and ready.
-     */
+    private void updateMatrices() {
+        CapturedRenderingState renderingState = CapturedRenderingState.INSTANCE;
+        renderingState.getGbufferModelView().get(rrWorldToView);
+        JitterManager.copyWithoutJitter(renderingState.getGbufferProjection(), rrProjection)
+                .get(rrViewToClip);
+    }
+
+    private VRef<VImageView> createView(List<VRef<?>> views, VRef<VImage> image) {
+        VRef<VImageView> view = VImageView.create(context, image);
+        views.add(view);
+        return view;
+    }
+
+    private static void closeAll(List<VRef<?>> refs) {
+        for (VRef<?> ref : refs) {
+            if (ref != null) {
+                ref.close();
+            }
+        }
+    }
+
+    public VRef<VImage> getDepthImage() {
+        return null;
+    }
+
+    public boolean isSupported() {
+        return supported;
+    }
+
     public boolean isInitialized() {
         return initialized;
     }
 
-    /**
-     * Check if DLSSD (Ray Reconstruction) is enabled and available.
-     */
+    public boolean hasValidOutput() {
+        return initialized && supported && hasValidOutput;
+    }
+
     public boolean isRayReconstructionEnabled() {
-        return enabled && initialized && dlssd.isRayReconstructionEnabled();
+        return initialized && !usingStandardDLSS;
     }
 
-    /**
-     * Check if DLSSD is supported on this system.
-     */
-    public boolean isSupported() {
-        return dlssd.isDLSSSupported();
+    public boolean isUsingStandardDLSS() {
+        return usingStandardDLSS;
     }
 
-    /**
-     * Get the internal depth buffer image.
-     * This is a properly formatted depth buffer for DLSSD (D32_SFLOAT format).
-     * Use this instead of world position for DLSSD depth input.
-     */
-    public VRef<VImage> getDepthImage() {
-        return dlssd.getDepthImage();
-    }
-
-    /**
-     * Enable or disable DLSSD processing.
-     */
-    public void setEnabled(boolean enabled) {
-        this.enabled = enabled;
-        if (!enabled) {
-            reset();
-        }
-    }
-
-    /**
-     * Get current configuration.
-     */
-    public DLSSRayReconstruction.DLSSConfig getConfig() {
-        return config;
-    }
-
-    /**
-     * Set configuration. Will require reinitialization.
-     */
-    public void setConfig(DLSSRayReconstruction.DLSSConfig config) {
-        this.config = config;
-        this.initialized = false; // Force reinitialization
-    }
-
-    /**
-     * Set quality preset.
-     */
-    public void setQualityPreset(DLSSRayReconstruction.DLSSQualityPreset preset) {
-        if (this.config.preset != preset) {
-            this.config.preset = preset;
-            dlssd.setQualityPreset(preset);
-        }
-    }
-
-    /**
-     * Reset temporal state (call on scene changes, teleports, etc.)
-     */
     public void resetTemporalState() {
-        dlssd.resetTemporalState();
+        temporalHistoryValid = false;
+        hasValidOutput = false;
+        LOGGER.debug("DLSS temporal history reset");
     }
 
-    /**
-     * Reset the processor (call when resizing or disabling)
-     */
-    public void reset() {
-        if (initialized) {
-            dlssd.cleanup();
-            initialized = false;
-            lastWidth = 0;
-            lastHeight = 0;
+    public DLSSDParameterValidator.ValidationResult validateParameters() {
+        if (!initialized) {
+            LOGGER.warn("Cannot validate DLSS parameters - processor is not initialized");
+            return null;
         }
+
+        DLSSDParameterValidator.DLSSDParams params = new DLSSDParameterValidator.DLSSDParams();
+        params.renderWidth = renderWidth;
+        params.renderHeight = renderHeight;
+        params.outputWidth = outputWidth;
+        params.outputHeight = outputHeight;
+        params.qualityMode = DLSSConfig.load().getQualityPreset().getNgxValue();
+        params.roughnessMode = ROUGHNESS_MODE_PACKED;
+        params.depthType = DEPTH_TYPE_LINEAR;
+        params.jitterX = JitterManager.getJitterX();
+        params.jitterY = JitterManager.getJitterY();
+        params.reset = temporalHistoryValid ? 0 : 1;
+        params.deltaTimeMs = 16.667f;
+        params.colorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        params.depthFormat = VK_FORMAT_R16_SFLOAT;
+        params.motionVectorsFormat = VK_FORMAT_R16G16_SFLOAT;
+        params.outputFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        params.diffuseAlbedoFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        params.specularAlbedoFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        params.normalsFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        params.featureHandle = featureHandle;
+        return DLSSDParameterValidator.getInstance().validateAll(params);
     }
 
-    /**
-     * Cleanup resources.
-     */
     public void cleanup() {
-        reset();
+        if (featureHandle != 0) {
+            try {
+                DLSSBridge.releaseDLSSDFeature(featureHandle);
+            } catch (Exception e) {
+                LOGGER.warn("Failed to release DLSSD feature", e);
+            }
+            featureHandle = 0;
+        }
+        if (usingStandardDLSS) {
+            try {
+                DLSSBridge.destroyStandardDLSS(context.device.address());
+            } catch (Exception e) {
+                LOGGER.warn("Failed to destroy standard DLSS", e);
+            }
+        }
+
+        initialized = false;
+        usingStandardDLSS = false;
+        temporalHistoryValid = false;
+        hasValidOutput = false;
+        consecutiveEvaluationFailures = 0;
     }
 
-    /**
-     * Get the internal render resolution for the given output resolution.
-     * Useful for configuring the ray tracer to render at the correct resolution.
-     * 
-     * @param outputWidth  Target output width
-     * @param outputHeight Target output height
-     * @return Array containing [renderWidth, renderHeight]
-     */
-    public int[] getRenderResolution(int outputWidth, int outputHeight) {
-        float scale = config.preset.getScale();
-        return new int[] {
-                (int) (outputWidth * scale),
-                (int) (outputHeight * scale)
-        };
-    }
+    private void recordEvaluationFailure(String pathName) {
+        temporalHistoryValid = false;
+        hasValidOutput = false;
+        consecutiveEvaluationFailures++;
 
-    /**
-     * Get the last processing time in nanoseconds.
-     */
-    public long getLastProcessingTimeNs() {
-        return dlssd.getLastProcessingTimeNs();
-    }
-
-    /**
-     * Auto-initialize based on current Minecraft window size.
-     */
-    public boolean autoInitialize() {
-        MinecraftClient mc = MinecraftClient.getInstance();
-        int width = mc.getWindow().getFramebufferWidth();
-        int height = mc.getWindow().getFramebufferHeight();
-        return initialize(width, height);
+        if (consecutiveEvaluationFailures >= MAX_EVALUATION_FAILURES) {
+            initialized = false;
+            initFailures = MAX_INIT_FAILURES;
+            JitterManager.setDLSSActive(false);
+            LOGGER.error("{} evaluation failed {} consecutive times; disabling DLSS",
+                    pathName, consecutiveEvaluationFailures);
+        } else {
+            LOGGER.warn("{} evaluation failed ({}/{})",
+                    pathName, consecutiveEvaluationFailures, MAX_EVALUATION_FAILURES);
+        }
     }
 }

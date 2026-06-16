@@ -9,6 +9,7 @@ import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VkAccelerationStructureInstanceKHR;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.lwjgl.util.vma.Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
@@ -24,6 +25,8 @@ import static org.lwjgl.vulkan.VK10.*;
  * instance is freed, the last element is moved to fill the hole.
  */
 public class TLASInstanceBuffer {
+    private static final int INSTANCE_UPLOAD_SLOTS = 3;
+
     protected final VContext context;
 
     private final IntArrayFIFOQueue freeIds = new IntArrayFIFOQueue();
@@ -37,9 +40,14 @@ public class TLASInstanceBuffer {
     private int[] id2loc = new int[maxInstances];
 
     private final List<VkAccelerationStructureInstanceKHR> ephemeralInstances = new ArrayList<>();
+    private final VRef<VBuffer>[] instanceUploadBuffers;
+    private final long[] instanceUploadCapacities = new long[INSTANCE_UPLOAD_SLOTS];
+    private int instanceUploadCursor = 0;
 
+    @SuppressWarnings("unchecked")
     public TLASInstanceBuffer(VContext context) {
         this.context = context;
+        this.instanceUploadBuffers = new VRef[INSTANCE_UPLOAD_SLOTS];
         resize(32768);
     }
 
@@ -50,6 +58,18 @@ public class TLASInstanceBuffer {
         v |= v >> 4;
         v |= v >> 8;
         v |= v >> 16;
+        v++;
+        return v;
+    }
+
+    private static long roundUpPow2(long v) {
+        v--;
+        v |= v >> 1;
+        v |= v >> 2;
+        v |= v >> 4;
+        v |= v >> 8;
+        v |= v >> 16;
+        v |= v >> 32;
         v++;
         return v;
     }
@@ -84,8 +104,10 @@ public class TLASInstanceBuffer {
         // Resize the id mapping arrays
         int[] newLoc2Id = new int[newSize];
         int[] newId2Loc = new int[newSize];
+        Arrays.fill(newLoc2Id, -1);
+        Arrays.fill(newId2Loc, -1);
         System.arraycopy(loc2id, 0, newLoc2Id, 0, count);
-        System.arraycopy(id2loc, 0, newId2Loc, 0, count);
+        System.arraycopy(id2loc, 0, newId2Loc, 0, maxInstances);
         loc2id = newLoc2Id;
         id2loc = newId2Loc;
 
@@ -121,7 +143,7 @@ public class TLASInstanceBuffer {
      * @param id The instance ID to free
      */
     protected void free(int id) {
-        if (id < 0) {
+        if (id < 0 || id >= maxInstances || id2loc[id] < 0) {
             throw new IllegalArgumentException("Invalid id");
         }
 
@@ -168,13 +190,7 @@ public class TLASInstanceBuffer {
             size = VkAccelerationStructureInstanceKHR.SIZEOF;
         }
 
-        VRef<VBuffer> data = context.memory.createBuffer(size,
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT
-                        | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
-                        | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR,
-                VK_MEMORY_HEAP_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                0, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
-        data.get().setDebugUtilsObjectName("TLAS Instance Buffer");
+        VRef<VBuffer> data = getUploadBuffer(size);
 
         long persistentSize = VkAccelerationStructureInstanceKHR.SIZEOF * (long) this.count;
         long ptr = data.get().map();
@@ -194,5 +210,48 @@ public class TLASInstanceBuffer {
         data.get().flush();
 
         return new Pair<>(data, totalCount);
+    }
+
+    private VRef<VBuffer> getUploadBuffer(long size) {
+        int slot = instanceUploadCursor;
+        instanceUploadCursor = (instanceUploadCursor + 1) % INSTANCE_UPLOAD_SLOTS;
+
+        if (instanceUploadBuffers[slot] == null || instanceUploadCapacities[slot] < size) {
+            if (instanceUploadBuffers[slot] != null) {
+                instanceUploadBuffers[slot].close();
+            }
+
+            long capacity = roundUpPow2(Math.max(size, VkAccelerationStructureInstanceKHR.SIZEOF));
+            instanceUploadBuffers[slot] = context.memory.createBuffer(capacity,
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                            | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+                            | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR,
+                    VK_MEMORY_HEAP_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                    0, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+            instanceUploadBuffers[slot].get().setDebugUtilsObjectName("TLAS Instance Buffer " + slot);
+            instanceUploadCapacities[slot] = capacity;
+        }
+
+        return instanceUploadBuffers[slot].addRef();
+    }
+
+    public void destroy() {
+        for (var asi : ephemeralInstances) {
+            asi.free();
+        }
+        ephemeralInstances.clear();
+
+        if (instances != null) {
+            instances.free();
+            instances = null;
+        }
+
+        for (int i = 0; i < instanceUploadBuffers.length; i++) {
+            if (instanceUploadBuffers[i] != null) {
+                instanceUploadBuffers[i].close();
+                instanceUploadBuffers[i] = null;
+            }
+            instanceUploadCapacities[i] = 0L;
+        }
     }
 }
