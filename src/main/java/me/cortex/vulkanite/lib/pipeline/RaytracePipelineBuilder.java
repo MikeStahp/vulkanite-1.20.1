@@ -110,36 +110,51 @@ public class RaytracePipelineBuilder {
                 }
             }
 
+            int totalGroups = 1 + missGroups.size() + hitGroups.size() + callGroups.size();
             VkRayTracingShaderGroupCreateInfoKHR.Buffer groupsArr = VkRayTracingShaderGroupCreateInfoKHR
-                    .calloc(1 + missGroups.size() + hitGroups.size() + callGroups.size(), stack);
-            groupsArr.forEach(a -> a.sType$Default()
-                    .generalShader(VK_SHADER_UNUSED_KHR)
-                    .intersectionShader(VK_SHADER_UNUSED_KHR)
-                    .closestHitShader(VK_SHADER_UNUSED_KHR)
-                    .anyHitShader(VK_SHADER_UNUSED_KHR));
+                    .calloc(totalGroups, stack);
+            for (int i = 0; i < totalGroups; i++) {
+                groupsArr.get(i).sType$Default()
+                        .generalShader(VK_SHADER_UNUSED_KHR)
+                        .intersectionShader(VK_SHADER_UNUSED_KHR)
+                        .closestHitShader(VK_SHADER_UNUSED_KHR)
+                        .anyHitShader(VK_SHADER_UNUSED_KHR);
+            }
 
             {
+                int groupIndex = 0;
+
                 // Set ray gen shader
-                groupsArr.get()
+                groupsArr.get(groupIndex++)
                         .type(VK_SHADER_GROUP_SHADER_GENERAL_KHR)
                         .generalShader(shader2id.get(gen));
 
                 // Set the miss groups
-                missGroups.forEach(shader -> {
-                    groupsArr.get()
+                for (int i = 0; i < missGroups.size(); i++) {
+                    ShaderModule shader = missGroups.get(i);
+                    groupsArr.get(groupIndex++)
                             .type(VK_SHADER_GROUP_SHADER_GENERAL_KHR)
                             .generalShader(shader2id.get(shader));
-                });
+                }
 
                 // Set the hit groups shader
-                hitGroups.forEach(hit -> {
-                    groupsArr.get()
+                for (int i = 0; i < hitGroups.size(); i++) {
+                    HitG hit = hitGroups.get(i);
+                    groupsArr.get(groupIndex++)
                             .type(hit.intr == null ? VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR
                                     : VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR)
                             .closestHitShader(hit.chit == null ? VK_SHADER_UNUSED_KHR : shader2id.get(hit.chit))
                             .anyHitShader(hit.ahit == null ? VK_SHADER_UNUSED_KHR : shader2id.get(hit.ahit))
                             .intersectionShader(hit.intr == null ? VK_SHADER_UNUSED_KHR : shader2id.get(hit.intr));
-                });
+                }
+
+                // Set the callable groups
+                for (int i = 0; i < callGroups.size(); i++) {
+                    ShaderModule shader = callGroups.get(i);
+                    groupsArr.get(groupIndex++)
+                            .type(VK_SHADER_GROUP_SHADER_GENERAL_KHR)
+                            .generalShader(shader2id.get(shader));
+                }
 
                 groupsArr.rewind();
             }
@@ -149,7 +164,11 @@ public class RaytracePipelineBuilder {
 
             {
                 // TODO: cleanup and add push constants
-                layoutCreateInfo.pSetLayouts(stack.longs(layouts.stream().mapToLong(a -> a.get().layout).toArray()));
+                LongBuffer setLayouts = stack.mallocLong(layouts.size());
+                for (int i = 0; i < layouts.size(); i++) {
+                    setLayouts.put(i, layouts.get(i).get().layout);
+                }
+                layoutCreateInfo.pSetLayouts(setLayouts);
             }
 
             LongBuffer pLayout = stack.mallocLong(1);
