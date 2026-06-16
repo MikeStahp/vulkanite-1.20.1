@@ -3,7 +3,6 @@ package me.cortex.vulkanite.lib.pipeline;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VObject;
 import me.cortex.vulkanite.lib.base.VRef;
-import me.cortex.vulkanite.lib.cmd.VCmdBuff;
 import me.cortex.vulkanite.lib.memory.VBuffer;
 import me.cortex.vulkanite.lib.shader.ShaderModule;
 import me.cortex.vulkanite.lib.shader.reflection.ShaderReflection;
@@ -11,14 +10,13 @@ import org.lwjgl.vulkan.VkStridedDeviceAddressRegionKHR;
 
 import java.util.Set;
 
-import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR;
-import static org.lwjgl.vulkan.KHRRayTracingPipeline.vkCmdTraceRaysKHR;
-import static org.lwjgl.vulkan.VK10.*;
+import static org.lwjgl.vulkan.VK10.vkDestroyPipeline;
 
 public class VRaytracePipeline extends VObject {
     private final VContext context;
     public final long pipeline;
     public final long layout;
+    public final int stackSize;
     @SuppressWarnings("FieldCanBeLocal")
     private final VRef<VBuffer> shader_binding_table;
     public final VkStridedDeviceAddressRegionKHR gen;
@@ -28,7 +26,7 @@ public class VRaytracePipeline extends VObject {
     private final Set<ShaderModule> shadersUsed;
     public final ShaderReflection reflection;
 
-    VRaytracePipeline(VContext context, long pipeline, long layout, final VRef<VBuffer> sbtMap,
+    VRaytracePipeline(VContext context, long pipeline, long layout, int stackSize, final VRef<VBuffer> sbtMap,
                       VkStridedDeviceAddressRegionKHR raygen,
                       VkStridedDeviceAddressRegionKHR miss,
                       VkStridedDeviceAddressRegionKHR hit,
@@ -38,6 +36,7 @@ public class VRaytracePipeline extends VObject {
         this.context = context;
         this.pipeline = pipeline;
         this.layout = layout;
+        this.stackSize = stackSize;
         this.shader_binding_table = sbtMap.addRef();
         this.gen = raygen;
         this.miss = miss;

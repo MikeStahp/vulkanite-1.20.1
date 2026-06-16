@@ -186,6 +186,9 @@ public class RaytracePipelineBuilder {
                     VkRayTracingPipelineCreateInfoKHR.create(pipelineCreateInfo.address(), 1),
                     null, pPipeline));
 
+            int pipelineStackSize = computePipelineStackSize(context.device, pPipeline.get(0), maxDepth,
+                    missGroups.size(), hitGroups.size(), callGroups.size());
+
             {
                 // Generate the SBT lut
                 var props = context.properties.rtPipelineProperties;
@@ -248,7 +251,7 @@ public class RaytracePipelineBuilder {
                 sbtMap.unmap();
                 sbtMap.flush();
 
-                return new VRef<>(new VRaytracePipeline(context, pPipeline.get(0), pLayout.get(0), sbtMapRef,
+                return new VRef<>(new VRaytracePipeline(context, pPipeline.get(0), pLayout.get(0), pipelineStackSize, sbtMapRef,
                         VkStridedDeviceAddressRegionKHR.calloc().set(sbtMap.deviceAddress() + rgenBase,
                                 handleSizeAligned, handleSizeAligned),
                         VkStridedDeviceAddressRegionKHR.calloc().set(sbtMap.deviceAddress() + missGroupBase,
@@ -261,5 +264,55 @@ public class RaytracePipelineBuilder {
                         reflection));
             }
         }
+    }
+
+    private static int computePipelineStackSize(VkDevice device, long pipeline, int maxDepth,
+                                                int missGroupCount, int hitGroupCount, int callGroupCount) {
+        long raygenStack = vkGetRayTracingShaderGroupStackSizeKHR(device, pipeline, 0,
+                VK_SHADER_GROUP_SHADER_GENERAL_KHR);
+
+        long missStack = 0;
+        int groupIndex = 1;
+        for (int i = 0; i < missGroupCount; i++) {
+            missStack = Math.max(missStack, vkGetRayTracingShaderGroupStackSizeKHR(device, pipeline, groupIndex++,
+                    VK_SHADER_GROUP_SHADER_GENERAL_KHR));
+        }
+
+        long closestHitStack = 0;
+        long anyHitStack = 0;
+        long intersectionStack = 0;
+        for (int i = 0; i < hitGroupCount; i++) {
+            closestHitStack = Math.max(closestHitStack, vkGetRayTracingShaderGroupStackSizeKHR(device, pipeline, groupIndex,
+                    VK_SHADER_GROUP_SHADER_CLOSEST_HIT_KHR));
+            anyHitStack = Math.max(anyHitStack, vkGetRayTracingShaderGroupStackSizeKHR(device, pipeline, groupIndex,
+                    VK_SHADER_GROUP_SHADER_ANY_HIT_KHR));
+            intersectionStack = Math.max(intersectionStack, vkGetRayTracingShaderGroupStackSizeKHR(device, pipeline, groupIndex,
+                    VK_SHADER_GROUP_SHADER_INTERSECTION_KHR));
+            groupIndex++;
+        }
+
+        long callableStack = 0;
+        for (int i = 0; i < callGroupCount; i++) {
+            callableStack = Math.max(callableStack, vkGetRayTracingShaderGroupStackSizeKHR(device, pipeline, groupIndex++,
+                    VK_SHADER_GROUP_SHADER_GENERAL_KHR));
+        }
+
+        long hitStack = Math.max(closestHitStack + anyHitStack, intersectionStack + anyHitStack);
+        long recursiveStack = Math.max(missStack, hitStack);
+        long continuationStack = Math.max(missStack, closestHitStack + anyHitStack);
+
+        long stackSize = raygenStack;
+        if (maxDepth > 0) {
+            stackSize += recursiveStack;
+        }
+        if (maxDepth > 1) {
+            stackSize += (long) (maxDepth - 1) * continuationStack;
+        }
+        stackSize += 2L * callableStack;
+
+        if (stackSize > Integer.MAX_VALUE) {
+            return Integer.MAX_VALUE;
+        }
+        return (int) Math.max(0, stackSize);
     }
 }
