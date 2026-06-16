@@ -89,6 +89,7 @@ public class VCmdBuff extends VObject {
     private int currentPipelineBindPoint = -1;
 
     private VkStridedDeviceAddressRegionKHR gen, miss, hit, callable;
+    private int rtPipelineStackSize = 0;
 
     public void bindCompute(final VRef<VComputePipeline> pipeline) {
         vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.get().pipeline());
@@ -96,6 +97,7 @@ public class VCmdBuff extends VObject {
         currentPipelineLayout = pipeline.get().layout();
         currentShaderStageMask = VK_SHADER_STAGE_COMPUTE_BIT;
         currentPipelineBindPoint = VK_PIPELINE_BIND_POINT_COMPUTE;
+        rtPipelineStackSize = 0;
     }
 
     public void bindRT(final VRef<VRaytracePipeline> pipeline) {
@@ -109,9 +111,13 @@ public class VCmdBuff extends VObject {
         miss = pipeline.get().miss;
         hit = pipeline.get().hit;
         callable = pipeline.get().callable;
+        rtPipelineStackSize = pipeline.get().stackSize;
     }
 
     public void traceRays(int width, int height, int depth) {
+        if (rtPipelineStackSize > 0) {
+            vkCmdSetRayTracingPipelineStackSizeKHR(buffer, rtPipelineStackSize);
+        }
         vkCmdTraceRaysKHR(buffer, gen, miss, hit, callable, width, height, depth);
     }
 
