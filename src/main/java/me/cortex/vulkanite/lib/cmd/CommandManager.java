@@ -225,7 +225,16 @@ public class CommandManager {
 
         public void waitForExecutions(int execQueue, List<Long> executions) {
             synchronized (waitingFor) {
-                long execMax = executions.stream().mapToLong(Long::longValue).max().orElse(waitingFor.getOrDefault(execQueue, 0));
+                long execMax = waitingFor.getOrDefault(execQueue, 0);
+                // Use explicit loop instead of Stream to avoid GC allocations and
+                // correctly compute the strictly monotonically increasing timeline semaphore value.
+                // A lower incoming max shouldn't overwrite a higher current wait.
+                for (int i = 0; i < executions.size(); i++) {
+                    long val = executions.get(i);
+                    if (val > execMax) {
+                        execMax = val;
+                    }
+                }
                 waitingFor.put(execQueue, execMax);
             }
         }
