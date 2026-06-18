@@ -1,5 +1,9 @@
 # Radiance RTX Flow and Vulkanite Comparison
 
+> Extended by `plans/DIRECTIONAL_LIGHTING_RESOURCE_PLAN.md`, which turns the
+> Radiance comparison into the current directional lighting and resource-saving
+> roadmap.
+
 ## Scope
 
 This document compares Vulkanite's current hybrid RTX path with Radiance's
@@ -75,19 +79,16 @@ resources it declares, pushes frame/light/debug values, and calls `traceRays`.
 7. DLSS/RR consumes those outputs plus G-buffer guides when enabled.
 8. The final image is copied to the Iris target and ownership returns to OpenGL.
 
-### Current ownership warning
+### Shader ownership update
 
-The tracked shader
-`src/main/resources/assets/vulkanite/shaders/raytracing/ray0.rgen` is not the
-shader normally compiled for the selected `VulkaniteRT` pack.
+This warning has been resolved by the directional-lighting work. The active
+development shaderpack is now tracked at:
 
-The active development shader is:
+`shaderpacks/VulkaniteRT`
 
-`run/shaderpacks/VulkaniteRT/shaders/ray0.rgen`
-
-The whole `run/` tree is ignored, and `syncVulkaniteShaderpacks` currently copies
-only `VulkaniteDeferred` and `VulkaniteNormal`. As a result, the main RTX
-shaderpack is local mutable state rather than a reproducible tracked artifact.
+`run/shaderpacks/VulkaniteRT` is runtime output produced by
+`syncVulkaniteShaderpacks`, and `validateVulkaniteShaderpackDrift` verifies that
+the runtime copy matches tracked shaderpack sources.
 
 ## Radiance Flow
 
@@ -187,7 +188,7 @@ combined noisy radiance, motion, depth, and shared Iris G-buffers.
 | Object motion | Mostly camera/world-position reprojection | Previous geometry and transforms | Add entity previous-transform support |
 | Denoiser inputs | Combined color plus guides | Separated lighting lobes and richer guides | Add hit distance and separated diffuse/specular |
 | Synchronization | Manual transitions and shared semaphores | Resource-declared barriers inside Vulkan | Centralize resource state tracking |
-| Shader ownership | Active RTX pack under ignored `run/` | Versioned built-in shaderpacks | Track and sync `VulkaniteRT` |
+| Shader ownership | Tracked `shaderpacks/VulkaniteRT` synced into `run/` | Versioned built-in shaderpacks | Keep tracked source and runtime drift validation |
 
 ## Improvements Applied
 
@@ -206,30 +207,32 @@ combined noisy radiance, motion, depth, and shared Iris G-buffers.
 - replaces the ad hoc specular term with an energy-conserving GGX/Fresnel
   direct-light evaluation.
 
-### Active local VulkaniteRT shader
+### Active tracked VulkaniteRT shader
 
-`run/shaderpacks/VulkaniteRT/shaders/ray0.rgen` now:
+`shaderpacks/VulkaniteRT/shaders/ray0.rgen` now:
 
 - uses unfiltered G-buffer reads for first-hit data;
 - rejects NaN, infinite, behind-camera, and out-of-range previous projections;
 - prevents invalid projections from entering motion vectors or ReSTIR temporal
-  reservoir lookup.
-
-Because `run/` is ignored, these live shader changes are local until the
-VulkaniteRT shaderpack is moved into a tracked `shaderpacks/VulkaniteRT` source.
+  reservoir lookup;
+- samples local diffuse block light from the section directional probe cache by
+  default instead of per-pixel RT blocklight probes;
+- looks up probe pages through a bounded hash directory and defaults to nearest
+  probe-cell filtering, with trilinear filtering kept as an explicit quality
+  option.
 
 ## Recommended Next Steps
 
-1. Track `VulkaniteRT` and include it in `syncVulkaniteShaderpacks`.
-2. Introduce a small pass/resource declaration model for ray passes, compute
+1. Introduce a small pass/resource declaration model for ray passes, compute
    reuse passes, and output images.
-3. Move ReSTIR temporal and spatial reuse out of `ray0.rgen` into compute passes.
-4. Store a compact first-hit cache with position, geometric normal, material ID,
+2. Move section probe updates and future ReSTIR temporal/spatial reuse out of
+   `ray0.rgen` into explicit compute/pass-graph nodes.
+3. Store a compact first-hit cache with position, geometric normal, material ID,
    roughness, and validity.
-5. Add previous entity transforms/positions so DLSS and temporal reuse can
+4. Add previous entity transforms/positions so DLSS and temporal reuse can
    distinguish object motion from camera motion.
-6. Add alpha-aware shadow visibility instead of forcing all shadow rays opaque.
-7. Split noisy diffuse and specular radiance and expose ray hit distance to
+5. Add alpha-aware shadow visibility instead of forcing all shadow rays opaque.
+6. Split noisy diffuse and specular radiance and expose ray hit distance to
    DLSS/RR or a future NRD path.
 
 The order matters. Tracking the runtime shaderpack and making pass resources

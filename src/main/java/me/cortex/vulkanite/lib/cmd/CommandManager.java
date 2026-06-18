@@ -84,21 +84,21 @@ public class CommandManager {
     }
 
     public void submitOnceAndWait(int queueId, final VRef<VCmdBuff> cmdBuff) {
-        LOGGER.debug("submitOnceAndWait called with queueId: {}", queueId);
+        LOGGER.trace("submitOnceAndWait called with queueId: {}", queueId);
         long exec = this.submit(queueId, cmdBuff);
-        LOGGER.debug("Submitted execution ID: {}", exec);
+        LOGGER.trace("Submitted execution ID: {}", exec);
         this.hostWaitForExecution(queueId, exec);
-        LOGGER.debug("hostWaitForExecution completed");
+        LOGGER.trace("hostWaitForExecution completed");
         cmdBuff.close();
     }
 
     public void executeWait(Consumer<VCmdBuff> cmdbuf) {
-        LOGGER.debug("executeWait called");
+        LOGGER.trace("executeWait called");
         var cmd = getSingleUsePool().createCommandBuffer();
         cmdbuf.accept(cmd.get());
-        LOGGER.debug("Submitting command buffer in executeWait");
+        LOGGER.trace("Submitting command buffer in executeWait");
         submitOnceAndWait(0, cmd);
-        LOGGER.debug("executeWait completed");
+        LOGGER.trace("executeWait completed");
     }
 
     /**
@@ -131,9 +131,9 @@ public class CommandManager {
      */
     public void hostWaitForExecution(int waitQueueId, long execution) {
         var waitQueue = queues[waitQueueId];
-        LOGGER.debug("hostWaitForExecution START: queueId={}, execution={}, thread={}",
+        LOGGER.trace("hostWaitForExecution START: queueId={}, execution={}, thread={}",
                 waitQueueId, execution, Thread.currentThread().getName());
-        LOGGER.debug("Current completedTimestamp={}, current timeline={}",
+        LOGGER.trace("Current completedTimestamp={}, current timeline={}",
                 waitQueue.completedTimestamp.get(), waitQueue.timeline.get());
 
         try (var stack = stackPush()) {
@@ -171,13 +171,13 @@ public class CommandManager {
                 _CHECK_(result);
             }
             long waitDuration = (System.nanoTime() - waitStart) / 1_000_000;
-            LOGGER.debug("vkWaitSemaphores completed after {}ms", waitDuration);
+            LOGGER.trace("vkWaitSemaphores completed after {}ms", waitDuration);
         }
 
         waitQueue.updateCompletedTimestamp(execution);
-        LOGGER.debug("Updated completedTimestamp to {}", execution);
+        LOGGER.trace("Updated completedTimestamp to {}", execution);
         waitQueue.collect();
-        LOGGER.debug("hostWaitForExecution END");
+        LOGGER.trace("hostWaitForExecution END");
     }
 
     public long getQueueCurrentExecution(int queueId) {
@@ -434,7 +434,7 @@ public class CommandManager {
             synchronized (waitingFor) {
                 long currentValue = waitingFor.getOrDefault(execQueue, 0);
                 long newValue = Long.max(currentValue, execution);
-                LOGGER.debug("Queue.waitForExecution: queueId={}, current={}, new={}, thread={}",
+                LOGGER.trace("Queue.waitForExecution: queueId={}, current={}, new={}, thread={}",
                         execQueue, currentValue, newValue, Thread.currentThread().getName());
                 waitingFor.put(execQueue, newValue);
             }
@@ -445,7 +445,7 @@ public class CommandManager {
                 long currentValue = waitingFor.getOrDefault(execQueue, 0);
                 long execMax = executions.stream().mapToLong(Long::longValue).max()
                         .orElse(currentValue);
-                LOGGER.debug("Queue.waitForExecutions: queueId={}, current={}, max_from_list={}, size={}, thread={}",
+                LOGGER.trace("Queue.waitForExecutions: queueId={}, current={}, max_from_list={}, size={}, thread={}",
                         execQueue, currentValue, execMax, executions.size(), Thread.currentThread().getName());
                 waitingFor.put(execQueue, execMax);
             }
@@ -453,39 +453,39 @@ public class CommandManager {
 
         public synchronized long submit(final VRef<VCmdBuff> cmdBuff, Queue[] queues, List<VRef<VSemaphore>> waits,
                 List<VRef<VSemaphore>> triggers, VFence fence) {
-            LOGGER.debug("Queue.submit called");
+            LOGGER.trace("Queue.submit called");
             long t = timeline.getAndIncrement();
-            LOGGER.debug("Assigned timeline value: {}", t);
+            LOGGER.trace("Assigned timeline value: {}", t);
 
-            LOGGER.debug("Entering synchronized block for waitingFor");
+            LOGGER.trace("Entering synchronized block for waitingFor");
             synchronized (waitingFor) {
-                LOGGER.debug("Processing timelineWaitingEntries, waitingFor size={}, thread={}",
+                LOGGER.trace("Processing timelineWaitingEntries, waitingFor size={}, thread={}",
                         waitingFor.size(), Thread.currentThread().getName());
                 var timelineWaitingEntries = new ArrayList<>(waitingFor.int2LongEntrySet());
                 for (var entry : timelineWaitingEntries) {
                     if (entry.getLongValue() != 0) {
-                        LOGGER.debug("Timeline wait entry: queueId={}, value={}",
+                        LOGGER.trace("Timeline wait entry: queueId={}, value={}",
                                 entry.getIntKey(), entry.getLongValue());
                     }
                 }
                 timelineWaitingEntries.removeIf(e -> e.getLongValue() == 0);
-                LOGGER.debug("After filtering: {} timeline waits", timelineWaitingEntries.size());
+                LOGGER.trace("After filtering: {} timeline waits", timelineWaitingEntries.size());
                 waitingFor.clear();
 
-                LOGGER.debug("Creating MemoryStack");
+                LOGGER.trace("Creating MemoryStack");
                 try (var stack = stackPush()) {
-                    LOGGER.debug("Calculating counts");
+                    LOGGER.trace("Calculating counts");
                     int waitCount = (waits == null ? 0 : waits.size()) + timelineWaitingEntries.size();
                     int triggerCount = (triggers == null ? 0 : triggers.size()) + 1;
 
-                    LOGGER.debug("Allocating buffers: waitCount={}, triggerCount={}", waitCount, triggerCount);
+                    LOGGER.trace("Allocating buffers: waitCount={}, triggerCount={}", waitCount, triggerCount);
                     LongBuffer waitSemaphores = waitCount > 0 ? stack.mallocLong(waitCount) : null;
                     LongBuffer signalSemaphores = triggerCount > 0 ? stack.mallocLong(triggerCount) : null;
                     LongBuffer waitTimelineValues = waitCount > 0 ? stack.mallocLong(waitCount) : null;
                     LongBuffer signalTimelineValues = triggerCount > 0 ? stack.mallocLong(triggerCount) : null;
                     IntBuffer waitStages = waitCount > 0 ? stack.mallocInt(waitCount) : null;
 
-                    LOGGER.debug("Filling binary waits");
+                    LOGGER.trace("Filling binary waits");
                     if (waits != null) {
                         for (var wait : waits) {
                             waitSemaphores.put(wait.get().address());
@@ -494,7 +494,7 @@ public class CommandManager {
                             cmdBuff.get().addSemaphoreRef(wait);
                         }
                     }
-                    LOGGER.debug("Filling binary triggers");
+                    LOGGER.trace("Filling binary triggers");
                     if (triggers != null) {
                         for (var trigger : triggers) {
                             signalSemaphores.put(trigger.get().address());
@@ -502,7 +502,7 @@ public class CommandManager {
                             cmdBuff.get().addSemaphoreRef(trigger);
                         }
                     }
-                    LOGGER.debug("Filling timeline waits");
+                    LOGGER.trace("Filling timeline waits");
                     for (var entry : timelineWaitingEntries) {
                         var sema = queues[entry.getIntKey()].timelineSema;
                         waitSemaphores.put(sema.get().address());
@@ -510,12 +510,12 @@ public class CommandManager {
                         waitStages.put(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
                         cmdBuff.get().addSemaphoreRef(sema);
                     }
-                    LOGGER.debug("Filling fixed timeline signal");
+                    LOGGER.trace("Filling fixed timeline signal");
                     signalSemaphores.put(timelineSema.get().address());
                     signalTimelineValues.put(t);
                     cmdBuff.get().addSemaphoreRef(timelineSema);
 
-                    LOGGER.debug("Rewinding buffers");
+                    LOGGER.trace("Rewinding buffers");
                     if (waitSemaphores != null)
                         waitSemaphores.rewind();
                     if (signalSemaphores != null)
@@ -527,7 +527,7 @@ public class CommandManager {
                     if (waitStages != null)
                         waitStages.rewind();
 
-                    LOGGER.debug("Creating VkTimelineSemaphoreSubmitInfo");
+                    LOGGER.trace("Creating VkTimelineSemaphoreSubmitInfo");
                     var timelineSubmitInfo = VkTimelineSemaphoreSubmitInfo.calloc(stack)
                             .sType$Default()
                             .pWaitSemaphoreValues(waitTimelineValues)
@@ -535,10 +535,10 @@ public class CommandManager {
                             .pSignalSemaphoreValues(signalTimelineValues)
                             .signalSemaphoreValueCount(triggerCount);
 
-                    LOGGER.debug("Sealing command buffer");
+                    LOGGER.trace("Sealing command buffer");
                     var sealedBuffer = cmdBuff.get().seal();
 
-                    LOGGER.debug("Creating VkSubmitInfo");
+                    LOGGER.trace("Creating VkSubmitInfo");
                     VkSubmitInfo.Buffer submit = VkSubmitInfo.calloc(1, stack)
                             .sType$Default()
                             .pCommandBuffers(stack.pointers(sealedBuffer))
@@ -554,14 +554,14 @@ public class CommandManager {
                     MemoryUtil.memPutInt(submit.address() + VkSubmitInfo.COMMANDBUFFERCOUNT, 1);
 
                     // Add debug logging before vkQueueSubmit
-                    LOGGER.debug("About to call vkQueueSubmit");
-                    LOGGER.debug("  Queue address: {}", queue);
-                    LOGGER.debug("  Submit info address: {}", submit.address());
-                    LOGGER.debug("  pNext address: {}", submit.get(0).pNext());
-                    LOGGER.debug("  Fence address: {}", fence == null ? 0 : fence.address());
-                    LOGGER.debug("  Command buffer count: {}", submit.get(0).commandBufferCount());
-                    LOGGER.debug("  Wait semaphore count: {}", submit.get(0).waitSemaphoreCount());
-                    LOGGER.debug("  Signal semaphore count: {}", submit.get(0).signalSemaphoreCount());
+                    LOGGER.trace("About to call vkQueueSubmit");
+                    LOGGER.trace("  Queue address: {}", queue);
+                    LOGGER.trace("  Submit info address: {}", submit.address());
+                    LOGGER.trace("  pNext address: {}", submit.get(0).pNext());
+                    LOGGER.trace("  Fence address: {}", fence == null ? 0 : fence.address());
+                    LOGGER.trace("  Command buffer count: {}", submit.get(0).commandBufferCount());
+                    LOGGER.trace("  Wait semaphore count: {}", submit.get(0).waitSemaphoreCount());
+                    LOGGER.trace("  Signal semaphore count: {}", submit.get(0).signalSemaphoreCount());
 
                     try {
                         int result = vkQueueSubmit(queue, submit, fence == null ? 0 : fence.address());
@@ -569,7 +569,7 @@ public class CommandManager {
                             LOGGER.error("vkQueueSubmit failed with result: {} ({})",
                                     VUtil.translateVulkanResult(result), result);
                         } else {
-                            LOGGER.debug("vkQueueSubmit successful");
+                            LOGGER.trace("vkQueueSubmit successful");
                         }
                         VUtil._CHECK_(result);
                     } catch (DeviceLostException e) {

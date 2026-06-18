@@ -1,50 +1,35 @@
 package me.cortex.vulkanite.mixin.sodium.chunk;
 
-import me.cortex.vulkanite.compat.GeometryData;
 import me.cortex.vulkanite.compat.IAccelerationBuildResult;
+import me.cortex.vulkanite.compat.ISectionLightBuildResult;
+import me.cortex.vulkanite.compat.SectionLightTable;
+import me.cortex.vulkanite.compat.SodiumGeometryBatch;
 import me.jellysquid.mods.sodium.client.render.chunk.compile.ChunkBuildOutput;
-import me.jellysquid.mods.sodium.client.render.chunk.terrain.TerrainRenderPass;
-import me.jellysquid.mods.sodium.client.render.chunk.vertex.format.ChunkVertexType;
-import me.jellysquid.mods.sodium.client.util.NativeBuffer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 
-import java.util.List;
-import java.util.Map;
-
 @Mixin(value = ChunkBuildOutput.class, remap = false)
-public class MixinChunkBuildResult implements IAccelerationBuildResult {
-    @Unique private Map<TerrainRenderPass, GeometryData> geometryMap;
-    @Unique private ChunkVertexType vertexType;
-    @Unique private List<NativeBuffer> nativeBuffers;
+public class MixinChunkBuildResult implements IAccelerationBuildResult, ISectionLightBuildResult {
+    @Unique private SodiumGeometryBatch vulkanite$geometry;
+    @Unique private SectionLightTable vulkanite$sectionLights;
 
     @Override
-    public void setAccelerationGeometryData(Map<TerrainRenderPass, GeometryData> map) {
-        this.geometryMap = map;
-    }
-
-    @Override
-    public Map<TerrainRenderPass, GeometryData> getAccelerationGeometryData() {
-        return geometryMap;
+    public void setAccelerationGeometry(SodiumGeometryBatch geometry) {
+        this.vulkanite$geometry = geometry;
     }
 
     @Override
-    public ChunkVertexType getVertexFormat() {
-        return vertexType;
+    public SodiumGeometryBatch getAccelerationGeometry() {
+        return vulkanite$geometry;
     }
 
     @Override
-    public void setVertexFormat(ChunkVertexType format) {
-        vertexType = format;
+    public void setSectionLights(SectionLightTable lights) {
+        this.vulkanite$sectionLights = lights;
     }
-    
+
     @Override
-    public void setNativeBuffers(List<NativeBuffer> buffers) {
-        this.nativeBuffers = buffers;
-    }
-    
-    @Override
-    public List<NativeBuffer> getNativeBuffers() {
-        return nativeBuffers;
+    public SectionLightTable getSectionLights() {
+        return vulkanite$sectionLights;
     }
 }

@@ -1,12 +1,81 @@
+/**
+ * @file dlss_wrapper.cpp
+ * @brief Modern C++ bridge between Java (JNA) and NVIDIA NGX SDK for DLSS/DLSSD.
+ *
+ * This file implements a clean, modern C++ interface for DLSS (Deep Learning Super Sampling)
+ * and DLSSD (Ray Reconstruction) functionality, wrapping the NVIDIA NGX SDK.
+ *
+ * @section architecture Architecture
+ * - Java Layer: DLSSBridge.java (JNA interface)
+ * - Native Layer: This file (Modern C++17 wrapper around NGX SDK)
+ * - NVIDIA NGX: Official DLSS/DLSSD SDK
+ *
+ * @section features Supported Features
+ * - Standard DLSS upscaling (Quality, Balanced, Performance, Ultra Performance modes)
+ * - DLSSD Ray Reconstruction (AI-powered denoising for ray-traced images)
+ * - Automatic jitter validation and clamping
+ * - Proper image layout transitions for Vulkan
+ * - Thread-safe operations with modern synchronization
+ *
+ * @section thread_safety Thread Safety
+ * All public functions are thread-safe via internal mutex locking.
+ * The DLSSBridge class uses a singleton pattern with proper lifecycle management.
+ *
+ * @see DLSSBridge.java
+ * @see DLSSRayReconstruction.java
+ * @see DLSSDProcessor.java
+ */
+
+// ============================================================================
+// INCLUDES
+// ============================================================================
+
+#ifndef NV_WINDOWS
+#define NV_WINDOWS 1
+#endif
+
 #include <vulkan/vulkan.h>
-#include <windows.h> // For GetTempPathW
+
+// FIX: Define NOMINMAX before including windows.h to prevent min/max macro conflicts
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+// FIX: Define WIN32_LEAN_AND_MEAN to reduce Windows header bloat
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
+#include <windows.h>
+
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+// FIX: Undefine Windows macros that conflict with our enum values
+#ifdef ERROR
+#undef ERROR
+#endif
+#ifdef FATAL
+#undef FATAL
+#endif
 #include <iostream>
 #include <fstream>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <map>
+#include <atomic>
+#include <memory>
+#include <optional>
+#include <functional>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+#include <cstdint>
+#include <algorithm>
 
+// NGX SDK Headers
 #include "nvsdk_ngx_vk.h"
 #include "nvsdk_ngx_helpers.h"
 #include "nvsdk_ngx_helpers_vk.h"
@@ -16,124 +85,1260 @@
 #include "nvsdk_ngx_params_dlssd.h"
 #include "nvsdk_ngx_helpers_dlssd_vk.h"
 
-// --- Logging ---
-static std::ofstream g_LogFile;
-static std::mutex g_LogMutex;
+// ============================================================================
+// CONSTANTS
+// ============================================================================
 
-// === DLSS JITTER AND MOTION VECTOR FIX CONSTANTS ===
-// Per NVIDIA DLSS documentation, jitter offsets should be in pixel units
-// with a typical range of [-0.5, 0.5] for sub-pixel jittering
-constexpr float JITTER_RANGE_MIN = -0.5f;
-constexpr float JITTER_RANGE_MAX = 0.5f;
-// DLSS requires dimensions to be aligned to multiples of 8 for optimal performance
-constexpr int DIMENSION_ALIGNMENT = 8;
+namespace Constants {
+    // Jitter Range: Per NVIDIA DLSS documentation, jitter offsets should be in
+    // pixel units with a typical range of [-0.5, 0.5] for sub-pixel jittering
+    constexpr float JITTER_RANGE_MIN = -0.5f;
+    constexpr float JITTER_RANGE_MAX = 0.5f;
 
-void OpenLog() {
-    std::lock_guard<std::mutex> lock(g_LogMutex);
-    if (!g_LogFile.is_open()) {
-        g_LogFile.open("dlss_bridge_debug.log", std::ios::out | std::ios::trunc);
+    // Dimension Alignment: DLSS requires dimensions to be aligned to multiples of 8
+    // for optimal performance and to avoid visual artifacts
+    constexpr int DIMENSION_ALIGNMENT = 8;
+    constexpr int DIMENSION_MIN = 8;
+
+    // Motion Vector Scale:
+    // Motion vectors are generated at render resolution in pixel space and map
+    // the current pixel center to its previous-frame position. Match Radiance's
+    // NGX contract: the shader writes pixel-space vectors and NGX consumes them
+    // without an additional axis flip.
+    constexpr float MV_SCALE_X = 1.0f;
+    constexpr float MV_SCALE_Y = 1.0f;
+
+    // NGX ProjectID must be GUID-like for CUSTOM engines or Init_with_ProjectID
+    // fails with InvalidParameter. Keep this stable so NGX cache/settings remain stable.
+    constexpr unsigned int NGX_APP_ID = 231313132;
+    constexpr const char* NGX_PROJECT_ID = "b7f2a618-3df1-4e45-9f13-8a3d7d6216ce";
+    constexpr const char* NGX_ENGINE_VERSION = "1.0.0";
+
+    // Feature Flags:
+    // - Motion vectors are generated at render resolution, so MVLowRes is part
+    //   of the NGX contract for both standard DLSS and DLSS-RR.
+    // - DLSS-RR's Vulkan sample uses IsHDR | MVLowRes for feature creation.
+    constexpr unsigned int DLSS_FEATURE_FLAGS =
+        NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
+        NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+        NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    constexpr unsigned int DLSSD_FEATURE_FLAGS =
+        NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
+        NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
+
+    // Logging Configuration
+    constexpr int LOG_THROTTLE_INTERVAL = 300;  // Log every N frames
+    constexpr int MAX_CREATION_FAILURES = 3;    // Max failures before disabling feature
+
+    // Pre-exposure values for HDR rendering
+    constexpr float PRE_EXPOSURE_DEFAULT = 1.0f;
+    constexpr float EXPOSURE_SCALE_DEFAULT = 1.0f;
+}
+
+static NVSDK_NGX_FeatureDiscoveryInfo GetFeatureDiscoveryInfo(NVSDK_NGX_Feature feature);
+
+// ============================================================================
+// ERROR HANDLING
+// ============================================================================
+
+/**
+ * @brief Error categories for classification of DLSS operations.
+ */
+enum class ErrorCategory : uint8_t {
+    None = 0,
+    Initialization,
+    Evaluation,
+    Parameter,
+    Resource,
+    Feature,
+    ThreadSafety,
+    Internal
+};
+
+/**
+ * @brief Converts ErrorCategory to string representation.
+ */
+[[nodiscard]] constexpr const char* to_string(ErrorCategory cat) noexcept {
+    switch (cat) {
+        case ErrorCategory::None:           return "None";
+        case ErrorCategory::Initialization: return "Initialization";
+        case ErrorCategory::Evaluation:     return "Evaluation";
+        case ErrorCategory::Parameter:      return "Parameter";
+        case ErrorCategory::Resource:       return "Resource";
+        case ErrorCategory::Feature:        return "Feature";
+        case ErrorCategory::ThreadSafety:   return "ThreadSafety";
+        case ErrorCategory::Internal:       return "Internal";
+        default:                            return "Unknown";
     }
 }
 
-void Log(const std::string& msg) {
-    OpenLog();
-    std::lock_guard<std::mutex> lock(g_LogMutex);
-    if (g_LogFile.is_open()) {
-        g_LogFile << msg << std::endl;
-        g_LogFile.flush();
-    }
-    // Also print to stdout for console visibility
-    std::cout << "[DLSS Bridge] " << msg << std::endl;
-}
+/**
+ * @brief Rich error information with context.
+ */
+struct ErrorInfo {
+    ErrorCategory category = ErrorCategory::None;
+    NVSDK_NGX_Result ngxResult = NVSDK_NGX_Result_Success;
+    std::string message;
+    std::string context;
+    std::string file;
+    int line = 0;
 
-// Helper function to translate NVSDK_NGX_Result to string
-const char* getNGXErrorString(NVSDK_NGX_Result res) {
+    ErrorInfo() = default;
+
+    ErrorInfo(ErrorCategory cat, NVSDK_NGX_Result res, std::string_view msg,
+              std::string_view ctx, std::string_view f, int l)
+        : category(cat), ngxResult(res), message(msg), context(ctx), file(f), line(l) {}
+
+    [[nodiscard]] bool isOk() const noexcept {
+        return category == ErrorCategory::None && ngxResult == NVSDK_NGX_Result_Success;
+    }
+
+    [[nodiscard]] std::string format() const {
+        std::ostringstream oss;
+        oss << "[" << to_string(category) << "] " << message;
+        if (ngxResult != NVSDK_NGX_Result_Success) {
+            oss << " (NGX: " << getNGXErrorString(ngxResult) << ")";
+        }
+        if (!file.empty()) {
+            oss << " [" << file << ":" << line << "]";
+        }
+        return oss.str();
+    }
+
+    // Public static helper for NGX error strings
+    static const char* getNGXErrorString(NVSDK_NGX_Result res) noexcept;
+    static std::string formatNGXResult(NVSDK_NGX_Result res);
+};
+
+// Forward declaration for error string helper
+const char* ErrorInfo::getNGXErrorString(NVSDK_NGX_Result res) noexcept {
     switch (res) {
-        case NVSDK_NGX_Result_Success: return "Success";
-        case NVSDK_NGX_Result_FAIL_FeatureNotSupported: return "FeatureNotSupported";
-        case NVSDK_NGX_Result_FAIL_PlatformError: return "PlatformError";
+        case NVSDK_NGX_Result_Success:                   return "Success";
+        case NVSDK_NGX_Result_FAIL_FeatureNotSupported:  return "FeatureNotSupported";
+        case NVSDK_NGX_Result_FAIL_PlatformError:        return "PlatformError";
         case NVSDK_NGX_Result_FAIL_FeatureAlreadyExists: return "FeatureAlreadyExists";
-        case NVSDK_NGX_Result_FAIL_FeatureNotFound: return "FeatureNotFound";
-        case NVSDK_NGX_Result_FAIL_InvalidParameter: return "InvalidParameter";
-        case NVSDK_NGX_Result_FAIL_ScratchBufferTooSmall: return "ScratchBufferTooSmall";
-        case NVSDK_NGX_Result_FAIL_NotInitialized: return "NotInitialized";
-        case NVSDK_NGX_Result_FAIL_UnsupportedInputFormat: return "UnsupportedInputFormat";
-        case NVSDK_NGX_Result_FAIL_RWFlagMissing: return "RWFlagMissing";
-        case NVSDK_NGX_Result_FAIL_MissingInput: return "MissingInput";
+        case NVSDK_NGX_Result_FAIL_FeatureNotFound:      return "FeatureNotFound";
+        case NVSDK_NGX_Result_FAIL_InvalidParameter:     return "InvalidParameter";
+        case NVSDK_NGX_Result_FAIL_ScratchBufferTooSmall:return "ScratchBufferTooSmall";
+        case NVSDK_NGX_Result_FAIL_NotInitialized:       return "NotInitialized";
+        case NVSDK_NGX_Result_FAIL_UnsupportedInputFormat:return "UnsupportedInputFormat";
+        case NVSDK_NGX_Result_FAIL_RWFlagMissing:        return "RWFlagMissing";
+        case NVSDK_NGX_Result_FAIL_MissingInput:         return "MissingInput";
         case NVSDK_NGX_Result_FAIL_UnableToInitializeFeature: return "UnableToInitializeFeature";
-        case NVSDK_NGX_Result_FAIL_OutOfDate: return "OutOfDate";
-        case NVSDK_NGX_Result_FAIL_OutOfGPUMemory: return "OutOfGPUMemory";
-        case NVSDK_NGX_Result_FAIL_UnsupportedFormat: return "UnsupportedFormat";
-        default: return (res < 0) ? "Failure (Unknown)" : "Unknown";
+        case NVSDK_NGX_Result_FAIL_OutOfDate:            return "OutOfDate";
+        case NVSDK_NGX_Result_FAIL_OutOfGPUMemory:       return "OutOfGPUMemory";
+        case NVSDK_NGX_Result_FAIL_UnsupportedFormat:    return "UnsupportedFormat";
+        case NVSDK_NGX_Result_FAIL_UnableToWriteToAppDataPath: return "UnableToWriteToAppDataPath";
+        case NVSDK_NGX_Result_FAIL_UnsupportedParameter: return "UnsupportedParameter";
+        case NVSDK_NGX_Result_FAIL_Denied:               return "Denied";
+        case NVSDK_NGX_Result_FAIL_NotImplemented:       return "NotImplemented";
+        default:                                         return (res < 0) ? "Failure" : "Unknown";
     }
-   }
-   
-   // Helper function to convert wide string (wchar_t) to narrow string (char)
-   // Uses WideCharToMultiByte for proper Windows conversion
-   std::string WideToNarrow(const std::wstring& wstr) {
-       if (wstr.empty()) return std::string();
-       int size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.length()),
-                                       nullptr, 0, nullptr, nullptr);
-       if (size <= 0) return std::string();
-       std::string result(size, 0);
-       WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.length()),
-                           &result[0], size, nullptr, nullptr);
-       return result;
-   }
-   
-   // Helper to determine aspect mask from format
-VkImageAspectFlags GetAspectMask(VkFormat format) {
+}
+
+/**
+ * @brief Result type for fallible operations.
+ * @tparam T The value type on success
+ */
+template<typename T>
+class Result {
+public:
+    Result(T value) : m_value(std::move(value)), m_error() {}
+    Result(ErrorInfo error) : m_error(std::move(error)) {}
+
+    [[nodiscard]] bool isOk() const noexcept { return m_error.isOk(); }
+    [[nodiscard]] bool isError() const noexcept { return !isOk(); }
+
+    [[nodiscard]] T& value() & { return m_value; }
+    [[nodiscard]] const T& value() const& { return m_value; }
+    [[nodiscard]] T&& value() && { return std::move(m_value); }
+
+    [[nodiscard]] const ErrorInfo& error() const noexcept { return m_error; }
+
+    [[nodiscard]] T valueOr(T defaultValue) const {
+        return isOk() ? m_value : defaultValue;
+    }
+
+    template<typename F>
+    [[nodiscard]] auto map(F&& f) && -> Result<decltype(f(std::move(m_value)))> {
+        using U = decltype(f(std::move(m_value)));
+        if (isOk()) {
+            return Result<U>(f(std::move(m_value)));
+        }
+        return Result<U>(m_error);
+    }
+
+private:
+    T m_value;
+    ErrorInfo m_error;
+};
+
+// Specialization for void result
+template<>
+class Result<void> {
+public:
+    Result() : m_error() {}
+    Result(ErrorInfo error) : m_error(std::move(error)) {}
+
+    [[nodiscard]] bool isOk() const noexcept { return m_error.isOk(); }
+    [[nodiscard]] bool isError() const noexcept { return !isOk(); }
+    [[nodiscard]] const ErrorInfo& error() const noexcept { return m_error; }
+
+private:
+    ErrorInfo m_error;
+};
+
+// Helper macros for error creation
+#define DLSS_ERROR(cat, res, msg, ctx) \
+    ErrorInfo(ErrorCategory::cat, res, msg, ctx, __FILE__, __LINE__)
+
+#define DLSS_SUCCESS() ErrorInfo()
+
+// ============================================================================
+// LOGGING SYSTEM
+// ============================================================================
+
+/**
+ * @brief Log severity levels.
+ */
+enum class LogLevel : uint8_t {
+    TRACE = 0,
+    DEBUG = 1,
+    INFO  = 2,
+    WARN  = 3,
+    ERROR = 4,
+    FATAL = 5
+};
+
+/**
+ * @brief Converts LogLevel to string representation.
+ */
+[[nodiscard]] constexpr const char* to_string(LogLevel level) noexcept {
+    switch (level) {
+        case LogLevel::TRACE: return "TRACE";
+        case LogLevel::DEBUG: return "DEBUG";
+        case LogLevel::INFO:  return "INFO";
+        case LogLevel::WARN:  return "WARN";
+        case LogLevel::ERROR: return "ERROR";
+        case LogLevel::FATAL: return "FATAL";
+        default:              return "UNKNOWN";
+    }
+}
+
+/**
+ * @brief Thread-safe logging system with severity levels.
+ */
+class Logger {
+public:
+    static Logger& instance() {
+        static Logger inst;
+        return inst;
+    }
+
+    void setLevel(LogLevel level) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_level = level;
+    }
+
+    void setLogFile(const std::string& path) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_logFile.is_open()) {
+            m_logFile.close();
+        }
+        m_logFile.open(path, std::ios::out | std::ios::trunc);
+        m_logPath = path;
+    }
+
+    void log(LogLevel level, std::string_view message) {
+        if (level < m_level.load(std::memory_order_relaxed)) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        // Get timestamp
+        auto now = std::chrono::system_clock::now();
+        auto time = std::chrono::system_clock::to_time_t(now);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()) % 1000;
+
+        std::ostringstream oss;
+        oss << "[" << to_string(level) << "] "
+            << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S")
+            << "." << std::setfill('0') << std::setw(3) << ms.count()
+            << " - " << message;
+
+        std::string logLine = oss.str();
+
+        // Write to file
+        if (m_logFile.is_open()) {
+            m_logFile << logLine << std::endl;
+            m_logFile.flush();
+        }
+
+        // Also output to console
+        std::cout << "[DLSS Bridge] " << logLine << std::endl;
+    }
+
+    void trace(std::string_view msg) { log(LogLevel::TRACE, msg); }
+    void debug(std::string_view msg) { log(LogLevel::DEBUG, msg); }
+    void info(std::string_view msg)  { log(LogLevel::INFO, msg); }
+    void warn(std::string_view msg)  { log(LogLevel::WARN, msg); }
+    void error(std::string_view msg) { log(LogLevel::ERROR, msg); }
+    void fatal(std::string_view msg) { log(LogLevel::FATAL, msg); }
+
+    // Conditional logging for throttled messages
+    [[nodiscard]] bool shouldLogThrottled(std::atomic<int>& counter) {
+        return (++counter) % Constants::LOG_THROTTLE_INTERVAL == 1;
+    }
+
+private:
+    Logger() {
+        m_logFile.open("dlss_bridge_debug.log", std::ios::out | std::ios::trunc);
+    }
+
+    ~Logger() {
+        if (m_logFile.is_open()) {
+            m_logFile.close();
+        }
+    }
+
+    std::mutex m_mutex;
+    std::ofstream m_logFile;
+    std::string m_logPath;
+    std::atomic<LogLevel> m_level{LogLevel::DEBUG};
+};
+
+// Convenience macros for conditional logging (zero overhead when disabled)
+#ifdef DLSS_DISABLE_DEBUG_LOGGING
+    #define DLSS_LOG_TRACE(msg) ((void)0)
+    #define DLSS_LOG_DEBUG(msg) ((void)0)
+#else
+    #define DLSS_LOG_TRACE(msg) Logger::instance().trace(msg)
+    #define DLSS_LOG_DEBUG(msg) Logger::instance().debug(msg)
+#endif
+
+#define DLSS_LOG_INFO(msg)  Logger::instance().info(msg)
+#define DLSS_LOG_WARN(msg)  Logger::instance().warn(msg)
+#define DLSS_LOG_ERROR(msg) Logger::instance().error(msg)
+#define DLSS_LOG_FATAL(msg) Logger::instance().fatal(msg)
+
+static void NVSDK_CONV NGXLogCallback(
+    const char* message,
+    NVSDK_NGX_Logging_Level loggingLevel,
+    NVSDK_NGX_Feature sourceComponent
+) {
+    std::string msg = std::string("[NGX source=") +
+        std::to_string(static_cast<int>(sourceComponent)) + "] " +
+        (message ? message : "<null>");
+
+    if (loggingLevel == NVSDK_NGX_LOGGING_LEVEL_VERBOSE) {
+        DLSS_LOG_DEBUG(msg);
+    } else {
+        DLSS_LOG_INFO(msg);
+    }
+}
+
+// ============================================================================
+// VULKAN HELPERS
+// ============================================================================
+
+namespace VulkanHelpers {
+
+/**
+ * @brief Determines the aspect mask for a given Vulkan format.
+ * @param format The Vulkan format
+ * @return The appropriate aspect mask flags
+ */
+[[nodiscard]] VkImageAspectFlags getAspectMask(VkFormat format) noexcept {
     switch (format) {
         case VK_FORMAT_D16_UNORM:
         case VK_FORMAT_X8_D24_UNORM_PACK32:
         case VK_FORMAT_D32_SFLOAT:
             return VK_IMAGE_ASPECT_DEPTH_BIT;
+
         case VK_FORMAT_S8_UINT:
             return VK_IMAGE_ASPECT_STENCIL_BIT;
+
         case VK_FORMAT_D16_UNORM_S8_UINT:
         case VK_FORMAT_D24_UNORM_S8_UINT:
         case VK_FORMAT_D32_SFLOAT_S8_UINT:
             return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+
         default:
             return VK_IMAGE_ASPECT_COLOR_BIT;
     }
 }
 
-// === JITTER VALIDATION HELPER ===
-// Validates that jitter offsets are within the expected range [-0.5, 0.5]
-// Per NVIDIA DLSS documentation, jitter should be in pixel units with this range
-// Returns true if jitter is valid, false if it's out of range (logs warning)
-bool ValidateJitterRange(float jitterX, float jitterY, const std::string& context) {
-    bool valid = true;
-    if (jitterX < JITTER_RANGE_MIN || jitterX > JITTER_RANGE_MAX) {
-        Log("WARNING: " + context + " - JitterX=" + std::to_string(jitterX) +
-            " is outside expected range [" + std::to_string(JITTER_RANGE_MIN) + ", " +
-            std::to_string(JITTER_RANGE_MAX) + "]");
-        valid = false;
-    }
-    if (jitterY < JITTER_RANGE_MIN || jitterY > JITTER_RANGE_MAX) {
-        Log("WARNING: " + context + " - JitterY=" + std::to_string(jitterY) +
-            " is outside expected range [" + std::to_string(JITTER_RANGE_MIN) + ", " +
-            std::to_string(JITTER_RANGE_MAX) + "]");
-        valid = false;
-    }
-    return valid;
+/**
+ * @brief Transitions a Vulkan image between layouts with proper pipeline barriers.
+ *
+ * @param cmd Command buffer to record the barrier into
+ * @param image The image to transition
+ * @param oldLayout Current layout of the image
+ * @param newLayout Target layout for the image
+ * @param srcStage Source pipeline stage flags
+ * @param dstStage Destination pipeline stage flags
+ * @param srcAccess Source access flags
+ * @param dstAccess Destination access flags
+ * @param aspectMask Image aspect mask (default: COLOR)
+ * @param baseMipLevel First mip level to transition (default: 0)
+ * @param mipCount Number of mip levels to transition (default: 1)
+ */
+void transitionImageLayout(
+    VkCommandBuffer cmd,
+    VkImage image,
+    VkImageLayout oldLayout,
+    VkImageLayout newLayout,
+    VkPipelineStageFlags srcStage,
+    VkPipelineStageFlags dstStage,
+    VkAccessFlags srcAccess,
+    VkAccessFlags dstAccess,
+    VkImageAspectFlags aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+    uint32_t baseMipLevel = 0,
+    uint32_t mipCount = 1
+) {
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = aspectMask;
+    barrier.subresourceRange.baseMipLevel = baseMipLevel;
+    barrier.subresourceRange.levelCount = mipCount;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstAccessMask = dstAccess;
+
+    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
-// === DIMENSION ALIGNMENT HELPER ===
-// Aligns a dimension to the specified alignment (default 8 for DLSS)
-// DLSS performs best with dimensions aligned to multiples of 8
-int AlignDimension(int dimension, int alignment = DIMENSION_ALIGNMENT) {
-    int aligned = (dimension / alignment) * alignment;
-    if (aligned != dimension) {
-        Log("Dimension " + std::to_string(dimension) + " aligned to " + std::to_string(aligned) +
-            " (alignment=" + std::to_string(alignment) + ")");
-    }
-    return aligned;
+/**
+ * @brief Converts wide string to narrow string using Windows API.
+ * @param wstr Wide string to convert
+ * @return Narrow string (UTF-8)
+ */
+[[nodiscard]] std::string wideToNarrow(const std::wstring& wstr) {
+    if (wstr.empty()) return std::string();
+    int size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(),
+        static_cast<int>(wstr.length()), nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return std::string();
+    std::string result(size, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(),
+        static_cast<int>(wstr.length()), &result[0], size, nullptr, nullptr);
+    return result;
 }
 
-// --- DLSS Bridge Class ---
+/**
+ * @brief Returns the folder containing this native bridge DLL.
+ */
+[[nodiscard]] std::wstring getNativeModuleDirectory() {
+    wchar_t path[MAX_PATH] = {};
+    DWORD length = GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), path, MAX_PATH);
 
+    if (length == 0 || length >= MAX_PATH) {
+        length = GetCurrentDirectoryW(MAX_PATH, path);
+        if (length == 0 || length >= MAX_PATH) {
+            return L".";
+        }
+        return std::wstring(path, length);
+    }
+
+    std::wstring modulePath(path, length);
+    const size_t slash = modulePath.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) {
+        return L".";
+    }
+
+    return modulePath.substr(0, slash);
+}
+
+/**
+ * @brief Aligns a dimension value to the required alignment.
+ * @param value The value to align
+ * @param alignment The alignment (must be power of 2)
+ * @return The aligned value
+ */
+[[nodiscard]] constexpr int alignDimension(int value, int alignment) noexcept {
+    return value & ~(alignment - 1);
+}
+
+/**
+ * @brief Validates that dimensions meet DLSS requirements.
+ * @param width Width to validate
+ * @param height Height to validate
+ * @return true if dimensions are valid
+ */
+[[nodiscard]] bool validateDimensions(int width, int height) noexcept {
+    return width >= Constants::DIMENSION_MIN &&
+           height >= Constants::DIMENSION_MIN &&
+           width % Constants::DIMENSION_ALIGNMENT == 0 &&
+           height % Constants::DIMENSION_ALIGNMENT == 0;
+}
+
+} // namespace VulkanHelpers
+
+// ============================================================================
+// JITTER VALIDATION
+// ============================================================================
+
+namespace JitterValidation {
+
+/**
+ * @brief Validates and clamps jitter offsets to the valid DLSS range.
+ *
+ * DLSS expects jitter offsets in pixel units with range [-0.5, 0.5].
+ * This function validates the input and clamps out-of-range values,
+ * logging a warning when clamping occurs.
+ *
+ * @param jitterX Reference to X jitter offset (modified in-place if needed)
+ * @param jitterY Reference to Y jitter offset (modified in-place if needed)
+ * @param context Context string for logging
+ */
+void validateAndClamp(float& jitterX, float& jitterY, std::string_view context) {
+    auto clampValue = [](float& value, float min, float max, std::string_view axis,
+                         std::string_view ctx) {
+        if (value < min || value > max) {
+            float original = value;
+            value = std::max(min, std::min(max, value));
+            std::ostringstream oss;
+            oss << "WARNING: " << ctx << " - Jitter" << axis << "=" << original
+                << " clamped to " << value << " (range ["
+                << Constants::JITTER_RANGE_MIN << ", " << Constants::JITTER_RANGE_MAX << "])";
+            DLSS_LOG_WARN(oss.str());
+        }
+    };
+
+    clampValue(jitterX, Constants::JITTER_RANGE_MIN, Constants::JITTER_RANGE_MAX, "X", context);
+    clampValue(jitterY, Constants::JITTER_RANGE_MIN, Constants::JITTER_RANGE_MAX, "Y", context);
+}
+
+/**
+ * @brief Checks if jitter values are within valid range without modifying them.
+ * @param jitterX X jitter offset
+ * @param jitterY Y jitter offset
+ * @return true if both values are in valid range
+ */
+[[nodiscard]] bool isValid(float jitterX, float jitterY) noexcept {
+    return jitterX >= Constants::JITTER_RANGE_MIN &&
+           jitterX <= Constants::JITTER_RANGE_MAX &&
+           jitterY >= Constants::JITTER_RANGE_MIN &&
+           jitterY <= Constants::JITTER_RANGE_MAX;
+}
+
+} // namespace JitterValidation
+
+// ============================================================================
+// NGX LIFECYCLE MANAGER
+// ============================================================================
+
+/**
+ * @brief Manages NGX SDK initialization and shutdown lifecycle.
+ */
+class NGXLifecycleManager {
+public:
+    struct InitParams {
+        VkInstance instance;
+        VkPhysicalDevice physicalDevice;
+        VkDevice device;
+        std::string dlssPath;
+    };
+
+    [[nodiscard]] Result<void> initialize(const InitParams& params) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        if (m_initialized) {
+            // Check if re-initialization with same parameters
+            if (m_instance == params.instance &&
+                m_physicalDevice == params.physicalDevice &&
+                m_device == params.device) {
+                return DLSS_SUCCESS();
+            }
+            // Need to reinitialize with different device
+            shutdownInternal();
+        }
+
+        if (params.instance == VK_NULL_HANDLE ||
+            params.physicalDevice == VK_NULL_HANDLE ||
+            params.device == VK_NULL_HANDLE) {
+            return DLSS_ERROR(Initialization, NVSDK_NGX_Result_FAIL_InvalidParameter,
+                            "Null Vulkan handles provided", "initialize");
+        }
+
+        DLSS_LOG_INFO("Initializing NGX...");
+
+        // Prepare path info
+        std::wstring wDlssPath;
+        std::wstring wNativeModulePath;
+        const wchar_t* paths[] = { nullptr, nullptr };
+        NVSDK_NGX_PathListInfo pathListInfo = {};
+        NVSDK_NGX_FeatureCommonInfo featureInfo = {};
+        featureInfo.LoggingInfo.LoggingCallback = NGXLogCallback;
+        featureInfo.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
+        featureInfo.LoggingInfo.DisableOtherLoggingSinks = false;
+        const NVSDK_NGX_FeatureCommonInfo* pFeatureInfo = nullptr;
+
+        if (!params.dlssPath.empty()) {
+            wDlssPath.resize(params.dlssPath.length() + 1);
+            size_t convertedChars = 0;
+            errno_t err = mbstowcs_s(&convertedChars, &wDlssPath[0],
+                wDlssPath.length() + 1, params.dlssPath.c_str(), _TRUNCATE);
+
+            if (err == 0) {
+                paths[0] = wDlssPath.c_str();
+                pathListInfo.Path = paths;
+                pathListInfo.Length = 1;
+                featureInfo.PathListInfo = pathListInfo;
+                pFeatureInfo = &featureInfo;
+                DLSS_LOG_INFO("Using custom DLSS search path: " +
+                              VulkanHelpers::wideToNarrow(wDlssPath));
+            } else {
+                DLSS_LOG_WARN("Failed to convert DLSS path to wstring. Using native module directory.");
+            }
+        }
+
+        if (pFeatureInfo == nullptr) {
+            wNativeModulePath = VulkanHelpers::getNativeModuleDirectory();
+            paths[0] = wNativeModulePath.c_str();
+            pathListInfo.Path = paths;
+            pathListInfo.Length = 1;
+            featureInfo.PathListInfo = pathListInfo;
+            pFeatureInfo = &featureInfo;
+            DLSS_LOG_INFO("Using native module directory for DLSS search: " +
+                          VulkanHelpers::wideToNarrow(wNativeModulePath));
+        }
+
+        // Determine application data path
+        std::wstring appDataPath;
+        if (!params.dlssPath.empty()) {
+            appDataPath = wDlssPath;
+        } else {
+            wchar_t tempPath[MAX_PATH];
+            GetTempPathW(MAX_PATH, tempPath);
+            appDataPath = tempPath;
+            DLSS_LOG_INFO("Using temp directory for NGX data: " +
+                         VulkanHelpers::wideToNarrow(appDataPath));
+        }
+
+        DLSS_LOG_INFO("ApplicationDataPath: " + VulkanHelpers::wideToNarrow(appDataPath));
+
+        // Get function pointers
+        PFN_vkGetInstanceProcAddr gipa = vkGetInstanceProcAddr;
+        PFN_vkGetDeviceProcAddr gdpa = vkGetDeviceProcAddr;
+
+        // Prefer ProjectID initialization for custom engines. The generic AppID
+        // can initialize NGX but still leave DLSS/RR capability bits disabled.
+        NVSDK_NGX_Result res = NVSDK_NGX_VULKAN_Init_with_ProjectID(
+            Constants::NGX_PROJECT_ID,
+            NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+            Constants::NGX_ENGINE_VERSION,
+            appDataPath.c_str(),
+            params.instance,
+            params.physicalDevice,
+            params.device,
+            gipa,
+            gdpa,
+            pFeatureInfo,
+            NVSDK_NGX_Version_API
+        );
+
+        if (NVSDK_NGX_FAILED(res)) {
+            DLSS_LOG_WARN("NVSDK_NGX_VULKAN_Init_with_ProjectID failed: " +
+                         ErrorInfo::formatNGXResult(res));
+
+            // Fallback to AppID method for older NGX runtimes.
+            res = NVSDK_NGX_VULKAN_Init(
+                Constants::NGX_APP_ID,
+                appDataPath.c_str(),
+                params.instance,
+                params.physicalDevice,
+                params.device,
+                gipa,
+                gdpa,
+                pFeatureInfo,
+                NVSDK_NGX_Version_API
+            );
+
+            if (NVSDK_NGX_FAILED(res)) {
+                return DLSS_ERROR(Initialization, res,
+                                "NGX initialization failed (both ProjectID and AppID)",
+                                "initialize");
+            }
+        }
+
+        // Get capability parameters
+        res = NVSDK_NGX_VULKAN_GetCapabilityParameters(&m_parameters);
+        if (NVSDK_NGX_FAILED(res)) {
+            NVSDK_NGX_VULKAN_Shutdown1(params.device);
+            return DLSS_ERROR(Initialization, res,
+                            "Failed to get capability parameters", "initialize");
+        }
+
+        m_instance = params.instance;
+        m_physicalDevice = params.physicalDevice;
+        m_device = params.device;
+        m_initialized = true;
+
+        logFeatureRequirements(NVSDK_NGX_Feature_RayReconstruction, "Ray Reconstruction");
+        logFeatureRequirements(NVSDK_NGX_Feature_SuperSampling, "DLSS Super Resolution");
+
+        logCapabilityInfo();
+
+        DLSS_LOG_INFO("NGX Initialized Successfully");
+        return DLSS_SUCCESS();
+    }
+
+    void shutdown() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        shutdownInternal();
+    }
+
+    [[nodiscard]] bool isInitialized() const noexcept { return m_initialized; }
+    [[nodiscard]] VkDevice getDevice() const noexcept { return m_device; }
+    [[nodiscard]] NVSDK_NGX_Parameter* getParameters() const noexcept { return m_parameters; }
+
+    [[nodiscard]] bool isDLSSDAvailable() const {
+        if (!m_initialized || !m_parameters) return false;
+        int available = 0;
+        NVSDK_NGX_Parameter_GetI(m_parameters,
+            NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &available);
+        return available != 0;
+    }
+
+    [[nodiscard]] bool isDLSSAvailable() const {
+        if (!m_initialized || !m_parameters) return false;
+        int available = 0;
+        NVSDK_NGX_Parameter_GetI(m_parameters,
+            NVSDK_NGX_Parameter_SuperSampling_Available, &available);
+        return available != 0;
+    }
+
+private:
+    NGXLifecycleManager() = default;
+    // Java drives NGX teardown while the VkDevice is still valid. Static
+    // destructor shutdown can run during JVM/DLL unload, which is too late.
+    ~NGXLifecycleManager() = default;
+
+    void shutdownInternal() {
+        if (m_parameters) {
+            NVSDK_NGX_VULKAN_DestroyParameters(m_parameters);
+            m_parameters = nullptr;
+        }
+        if (m_initialized && m_device) {
+            NVSDK_NGX_VULKAN_Shutdown1(m_device);
+            m_initialized = false;
+            m_instance = VK_NULL_HANDLE;
+            m_physicalDevice = VK_NULL_HANDLE;
+            m_device = VK_NULL_HANDLE;
+        }
+    }
+
+    void logCapabilityInfo() {
+        if (!m_parameters) return;
+
+        DLSS_LOG_INFO("=== NGX Capability Check ===");
+
+        // DLSSD availability
+        int rrAvailable = 0;
+        NVSDK_NGX_Result res = NVSDK_NGX_Parameter_GetI(m_parameters,
+            NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &rrAvailable);
+        if (NVSDK_NGX_SUCCEED(res)) {
+            DLSS_LOG_INFO(std::string(" - Ray Reconstruction Available: ") +
+                         (rrAvailable ? "YES" : "NO"));
+
+            if (rrAvailable) {
+                int needsUpdate = 0;
+                NVSDK_NGX_Parameter_GetI(m_parameters,
+                    NVSDK_NGX_Parameter_SuperSamplingDenoising_NeedsUpdatedDriver, &needsUpdate);
+                DLSS_LOG_INFO(std::string(" - Needs Updated Driver: ") +
+                             (needsUpdate ? "YES" : "NO"));
+
+                unsigned int majorVer = 0, minorVer = 0;
+                NVSDK_NGX_Parameter_GetUI(m_parameters,
+                    NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMajor, &majorVer);
+                NVSDK_NGX_Parameter_GetUI(m_parameters,
+                    NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMinor, &minorVer);
+                DLSS_LOG_INFO(" - Min Driver Version: " + std::to_string(majorVer) +
+                             "." + std::to_string(minorVer));
+            } else {
+                DLSS_LOG_WARN("Ray Reconstruction is NOT available on this system!");
+            }
+        }
+
+        // DLSS availability
+        int dlssAvailable = 0;
+        res = NVSDK_NGX_Parameter_GetI(m_parameters,
+            NVSDK_NGX_Parameter_SuperSampling_Available, &dlssAvailable);
+        if (NVSDK_NGX_SUCCEED(res)) {
+            DLSS_LOG_INFO(std::string(" - DLSS Super Resolution Available: ") +
+                         (dlssAvailable ? "YES" : "NO"));
+        }
+    }
+
+    void logFeatureRequirements(NVSDK_NGX_Feature feature, const char* label) {
+        NVSDK_NGX_FeatureDiscoveryInfo featureInfo = GetFeatureDiscoveryInfo(feature);
+        NVSDK_NGX_FeatureRequirement requirements = {};
+        NVSDK_NGX_Result res = NVSDK_NGX_VULKAN_GetFeatureRequirements(
+            m_instance, m_physicalDevice, &featureInfo, &requirements);
+
+        if (NVSDK_NGX_FAILED(res)) {
+            DLSS_LOG_WARN(std::string(label) + " requirements query failed: " +
+                         ErrorInfo::formatNGXResult(res));
+            return;
+        }
+
+        DLSS_LOG_INFO(std::string(" - ") + label +
+                     " requirements support mask: " +
+                     std::to_string(static_cast<int>(requirements.FeatureSupported)));
+        if (requirements.FeatureSupported != NVSDK_NGX_FeatureSupportResult_Supported) {
+            if (requirements.FeatureSupported & NVSDK_NGX_FeatureSupportResult_CheckNotPresent) {
+                DLSS_LOG_WARN(std::string("   ") + label + ": NGX check not present");
+            }
+            if (requirements.FeatureSupported & NVSDK_NGX_FeatureSupportResult_DriverVersionUnsupported) {
+                DLSS_LOG_WARN(std::string("   ") + label + ": driver version unsupported");
+            }
+            if (requirements.FeatureSupported & NVSDK_NGX_FeatureSupportResult_AdapterUnsupported) {
+                DLSS_LOG_WARN(std::string("   ") + label + ": adapter unsupported");
+            }
+            if (requirements.FeatureSupported & NVSDK_NGX_FeatureSupportResult_OSVersionBelowMinimumSupported) {
+                DLSS_LOG_WARN(std::string("   ") + label + ": OS version below minimum");
+            }
+            if (requirements.FeatureSupported & NVSDK_NGX_FeatureSupportResult_NotImplemented) {
+                DLSS_LOG_WARN(std::string("   ") + label + ": not implemented by this NGX runtime");
+            }
+        }
+    }
+
+    std::mutex m_mutex;
+    bool m_initialized = false;
+    VkInstance m_instance = VK_NULL_HANDLE;
+    VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
+    VkDevice m_device = VK_NULL_HANDLE;
+    NVSDK_NGX_Parameter* m_parameters = nullptr;
+
+    friend class DLSSBridge;
+};
+
+// ============================================================================
+// DLSS FEATURE MANAGER
+// ============================================================================
+
+/**
+ * @brief Manages standard DLSS feature lifecycle and evaluation.
+ */
+class DLSSFeatureManager {
+public:
+    struct CreateParams {
+        int renderWidth;
+        int renderHeight;
+        int outputWidth;
+        int outputHeight;
+        NVSDK_NGX_PerfQuality_Value quality;
+    };
+
+    [[nodiscard]] Result<void> configure(const CreateParams& params) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        // Validate dimensions
+        if (params.renderWidth == 0 || params.renderHeight == 0 ||
+            params.outputWidth == 0 || params.outputHeight == 0) {
+            return DLSS_ERROR(Parameter, NVSDK_NGX_Result_FAIL_InvalidParameter,
+                            "Invalid dimensions (0 detected)", "configure");
+        }
+
+        // Align dimensions
+        m_renderWidth = VulkanHelpers::alignDimension(params.renderWidth, Constants::DIMENSION_ALIGNMENT);
+        m_renderHeight = VulkanHelpers::alignDimension(params.renderHeight, Constants::DIMENSION_ALIGNMENT);
+        m_outputWidth = VulkanHelpers::alignDimension(params.outputWidth, Constants::DIMENSION_ALIGNMENT);
+        m_outputHeight = VulkanHelpers::alignDimension(params.outputHeight, Constants::DIMENSION_ALIGNMENT);
+        m_quality = params.quality;
+
+        // Check for dimension/quality changes
+        bool dimensionsChanged = (m_lastRenderWidth != m_renderWidth ||
+                                  m_lastRenderHeight != m_renderHeight ||
+                                  m_lastOutputWidth != m_outputWidth ||
+                                  m_lastOutputHeight != m_outputHeight);
+        bool qualityChanged = (m_lastQuality != m_quality);
+
+        m_lastRenderWidth = m_renderWidth;
+        m_lastRenderHeight = m_renderHeight;
+        m_lastOutputWidth = m_outputWidth;
+        m_lastOutputHeight = m_outputHeight;
+        m_lastQuality = m_quality;
+
+        m_needsReset = dimensionsChanged || qualityChanged;
+        if (m_needsReset) {
+            DLSS_LOG_DEBUG("DLSS dimensions/quality changed, reset flag set");
+        }
+
+        m_featurePending = true;
+        m_creationFailures = 0;
+
+        DLSS_LOG_INFO("DLSS configured. Render: " + std::to_string(m_renderWidth) +
+                     "x" + std::to_string(m_renderHeight));
+        return DLSS_SUCCESS();
+    }
+
+    void destroy() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_feature) {
+            NVSDK_NGX_VULKAN_ReleaseFeature(m_feature);
+            m_feature = nullptr;
+        }
+        m_featurePending = false;
+    }
+
+    [[nodiscard]] NVSDK_NGX_Result createFeature(
+        VkDevice device,
+        VkCommandBuffer cmdBuffer,
+        NVSDK_NGX_Parameter* parameters
+    ) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        if (!m_featurePending) {
+            return NVSDK_NGX_Result_Success;
+        }
+
+        DLSS_LOG_INFO("=== CreateDLSSFeature ===");
+
+        // Validate dimensions
+        if (m_renderWidth == 0 || m_renderHeight == 0 ||
+            m_outputWidth == 0 || m_outputHeight == 0) {
+            DLSS_LOG_ERROR("Invalid DLSS dimensions (0 detected)");
+            return NVSDK_NGX_Result_FAIL_InvalidParameter;
+        }
+
+        // Warn about alignment
+        if (m_renderWidth % Constants::DIMENSION_ALIGNMENT != 0 ||
+            m_renderHeight % Constants::DIMENSION_ALIGNMENT != 0) {
+            DLSS_LOG_WARN("Render dimensions not aligned to " +
+                         std::to_string(Constants::DIMENSION_ALIGNMENT));
+        }
+
+        NVSDK_NGX_DLSS_Create_Params createParams = {};
+        createParams.Feature.InWidth = m_renderWidth;
+        createParams.Feature.InHeight = m_renderHeight;
+        createParams.Feature.InTargetWidth = m_outputWidth;
+        createParams.Feature.InTargetHeight = m_outputHeight;
+        createParams.Feature.InPerfQualityValue = m_quality;
+        createParams.InFeatureCreateFlags = Constants::DLSS_FEATURE_FLAGS;
+
+        DLSS_LOG_INFO("Creating DLSS Feature: In(" +
+                     std::to_string(m_renderWidth) + "x" + std::to_string(m_renderHeight) +
+                     ") Out(" + std::to_string(m_outputWidth) + "x" +
+                     std::to_string(m_outputHeight) + ")");
+
+        if (!parameters) {
+            DLSS_LOG_ERROR("Parameters is null during DLSS creation");
+            return NVSDK_NGX_Result_FAIL_NotInitialized;
+        }
+
+        NVSDK_NGX_Result res = NGX_VULKAN_CREATE_DLSS_EXT1(
+            device, cmdBuffer, 1, 1, &m_feature, parameters, &createParams);
+
+        if (NVSDK_NGX_FAILED(res)) {
+            DLSS_LOG_ERROR("Failed to create DLSS Feature: " +
+                          ErrorInfo::formatNGXResult(res));
+            return res;
+        }
+
+        m_featurePending = false;
+        DLSS_LOG_INFO("DLSS Feature Created Successfully");
+        return NVSDK_NGX_Result_Success;
+    }
+
+    [[nodiscard]] NVSDK_NGX_Handle* getFeature() const noexcept { return m_feature; }
+    [[nodiscard]] NVSDK_NGX_Handle** getFeaturePtr() noexcept { return &m_feature; }
+    [[nodiscard]] bool isPending() const noexcept { return m_featurePending; }
+    [[nodiscard]] int getRenderWidth() const noexcept { return m_renderWidth; }
+    [[nodiscard]] int getRenderHeight() const noexcept { return m_renderHeight; }
+    [[nodiscard]] int getOutputWidth() const noexcept { return m_outputWidth; }
+    [[nodiscard]] int getOutputHeight() const noexcept { return m_outputHeight; }
+    [[nodiscard]] bool needsReset() const noexcept { return m_needsReset; }
+    void clearReset() noexcept { m_needsReset = false; }
+    void incrementFailures() noexcept { m_creationFailures++; }
+    [[nodiscard]] int getFailures() const noexcept { return m_creationFailures; }
+    void clearPending() noexcept { m_featurePending = false; }
+
+private:
+    std::mutex m_mutex;
+    NVSDK_NGX_Handle* m_feature = nullptr;
+    bool m_featurePending = false;
+    int m_creationFailures = 0;
+
+    int m_renderWidth = 0;
+    int m_renderHeight = 0;
+    int m_outputWidth = 0;
+    int m_outputHeight = 0;
+    NVSDK_NGX_PerfQuality_Value m_quality = NVSDK_NGX_PerfQuality_Value_Balanced;
+
+    // Change tracking
+    int m_lastRenderWidth = 0;
+    int m_lastRenderHeight = 0;
+    int m_lastOutputWidth = 0;
+    int m_lastOutputHeight = 0;
+    NVSDK_NGX_PerfQuality_Value m_lastQuality = NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    bool m_needsReset = false;
+};
+
+// ============================================================================
+// DLSSD FEATURE MANAGER
+// ============================================================================
+
+/**
+ * @brief Manages DLSSD (Ray Reconstruction) feature lifecycle and evaluation.
+ */
+class DLSSDFeatureManager {
+public:
+    struct CreateParams {
+        int renderWidth;
+        int renderHeight;
+        int outputWidth;
+        int outputHeight;
+        NVSDK_NGX_DLSS_Denoise_Mode denoiseMode;
+        NVSDK_NGX_DLSS_Roughness_Mode roughnessMode;
+        NVSDK_NGX_DLSS_Depth_Type depthType;
+        NVSDK_NGX_PerfQuality_Value quality;
+    };
+
+    [[nodiscard]] Result<void> configure(const CreateParams& params) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        // Validate dimensions
+        if (params.renderWidth == 0 || params.renderHeight == 0 ||
+            params.outputWidth == 0 || params.outputHeight == 0) {
+            return DLSS_ERROR(Parameter, NVSDK_NGX_Result_FAIL_InvalidParameter,
+                            "Invalid dimensions (0 detected)", "configure");
+        }
+
+        m_renderWidth = VulkanHelpers::alignDimension(params.renderWidth, Constants::DIMENSION_ALIGNMENT);
+        m_renderHeight = VulkanHelpers::alignDimension(params.renderHeight, Constants::DIMENSION_ALIGNMENT);
+        m_outputWidth = VulkanHelpers::alignDimension(params.outputWidth, Constants::DIMENSION_ALIGNMENT);
+        m_outputHeight = VulkanHelpers::alignDimension(params.outputHeight, Constants::DIMENSION_ALIGNMENT);
+        m_denoiseMode = params.denoiseMode;
+        m_roughnessMode = params.roughnessMode;
+        m_depthType = params.depthType;
+        m_quality = params.quality;
+
+        // Check for changes
+        bool dimensionsChanged = (m_lastRenderWidth != m_renderWidth ||
+                                  m_lastRenderHeight != m_renderHeight ||
+                                  m_lastOutputWidth != m_outputWidth ||
+                                  m_lastOutputHeight != m_outputHeight);
+        bool qualityChanged = (m_lastQuality != m_quality);
+
+        m_lastRenderWidth = m_renderWidth;
+        m_lastRenderHeight = m_renderHeight;
+        m_lastOutputWidth = m_outputWidth;
+        m_lastOutputHeight = m_outputHeight;
+        m_lastQuality = m_quality;
+
+        m_needsReset = dimensionsChanged || qualityChanged;
+        if (m_needsReset) {
+            m_outputLayoutInitialized = false;
+            DLSS_LOG_DEBUG("DLSSD dimensions/quality changed, reset flag set");
+        }
+
+        m_featurePending = true;
+        m_creationFailures = 0;
+
+        DLSS_LOG_INFO("DLSSD configured. Render: " + std::to_string(m_renderWidth) +
+                     "x" + std::to_string(m_renderHeight));
+        return DLSS_SUCCESS();
+    }
+
+    void destroy() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_feature) {
+            NVSDK_NGX_VULKAN_ReleaseFeature(m_feature);
+            m_feature = nullptr;
+        }
+        m_featurePending = false;
+        m_outputLayoutInitialized = false;
+    }
+
+    [[nodiscard]] NVSDK_NGX_Result createFeature(
+        VkDevice device,
+        VkCommandBuffer cmdBuffer,
+        NVSDK_NGX_Parameter* parameters,
+        NVSDK_NGX_Handle** fallbackDLSSFeature
+    ) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        if (!m_featurePending) {
+            return NVSDK_NGX_Result_Success;
+        }
+
+        DLSS_LOG_INFO("=== CreateDLSSDFeature ===");
+
+        // Validate dimensions
+        if (m_renderWidth == 0 || m_renderHeight == 0 ||
+            m_outputWidth == 0 || m_outputHeight == 0) {
+            DLSS_LOG_ERROR("Invalid DLSSD dimensions (0 detected)");
+            m_featurePending = false;
+            return NVSDK_NGX_Result_FAIL_InvalidParameter;
+        }
+
+        bool tryDLSSD = true;
+
+        // Check for native resolution (not supported by DLSSD)
+        if (m_renderWidth == m_outputWidth && m_renderHeight == m_outputHeight) {
+            DLSS_LOG_WARN("Native resolution not supported by DLSSD. Will use standard DLSS (DLAA).");
+            tryDLSSD = false;
+        }
+
+        // Log availability, but do not hard-gate feature creation on it. Some NGX
+        // runtimes report the capability bit conservatively while CreateFeature
+        // is still the authoritative result for this Vulkan device.
+        int rrAvailable = 0;
+        NVSDK_NGX_Parameter_GetI(parameters,
+            NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &rrAvailable);
+        if (!rrAvailable) {
+            DLSS_LOG_WARN("Ray Reconstruction capability bit is false; attempting DLSSD feature creation anyway.");
+        }
+
+        NVSDK_NGX_Result res = NVSDK_NGX_Result_FAIL_FeatureNotSupported;
+
+        if (tryDLSSD) {
+            NVSDK_NGX_DLSSD_Create_Params createParams = {};
+            createParams.InWidth = m_renderWidth;
+            createParams.InHeight = m_renderHeight;
+            createParams.InTargetWidth = m_outputWidth;
+            createParams.InTargetHeight = m_outputHeight;
+            createParams.InDenoiseMode = m_denoiseMode;
+            createParams.InRoughnessMode = m_roughnessMode;
+            createParams.InUseHWDepth = m_depthType;
+            createParams.InPerfQualityValue = m_quality;
+            createParams.InFeatureCreateFlags = Constants::DLSSD_FEATURE_FLAGS;
+            createParams.InEnableOutputSubrects = false;
+
+            DLSS_LOG_INFO("Creating DLSSD Feature:");
+            DLSS_LOG_INFO(" - Input: " + std::to_string(m_renderWidth) + "x" +
+                         std::to_string(m_renderHeight));
+            DLSS_LOG_INFO(" - Output: " + std::to_string(m_outputWidth) + "x" +
+                         std::to_string(m_outputHeight));
+            DLSS_LOG_INFO(std::string(" - DepthType: ") +
+                         (m_depthType == NVSDK_NGX_DLSS_Depth_Type_Linear ? "LINEAR" : "HW"));
+            DLSS_LOG_INFO(std::string(" - RoughnessMode: ") +
+                         (m_roughnessMode == NVSDK_NGX_DLSS_Roughness_Mode_Packed ? "Packed" : "Unpacked"));
+            DLSS_LOG_INFO(" - FeatureFlags: " + std::to_string(createParams.InFeatureCreateFlags));
+
+            NVSDK_NGX_Parameter_SetUI(parameters,
+                NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality,
+                NVSDK_NGX_RayReconstruction_Hint_Render_Preset_Default);
+            NVSDK_NGX_Parameter_SetUI(parameters,
+                NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality,
+                NVSDK_NGX_RayReconstruction_Hint_Render_Preset_Default);
+            NVSDK_NGX_Parameter_SetUI(parameters,
+                NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced,
+                NVSDK_NGX_RayReconstruction_Hint_Render_Preset_Default);
+            NVSDK_NGX_Parameter_SetUI(parameters,
+                NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance,
+                NVSDK_NGX_RayReconstruction_Hint_Render_Preset_Default);
+            NVSDK_NGX_Parameter_SetUI(parameters,
+                NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance,
+                NVSDK_NGX_RayReconstruction_Hint_Render_Preset_Default);
+
+            // Set RTXValue for compatibility
+            NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_RTXValue, false);
+
+            res = NGX_VULKAN_CREATE_DLSSD_EXT1(
+                device, cmdBuffer, 1, 1, &m_feature, parameters, &createParams);
+        }
+
+        if (NVSDK_NGX_FAILED(res)) {
+            if (tryDLSSD) {
+                DLSS_LOG_WARN("DLSSD creation failed: " +
+                             ErrorInfo::formatNGXResult(res) +
+                             ". Attempting standard DLSS fallback...");
+            }
+
+            // Fallback to standard DLSS
+            NVSDK_NGX_DLSS_Create_Params dlssParams = {};
+            dlssParams.Feature.InWidth = m_renderWidth;
+            dlssParams.Feature.InHeight = m_renderHeight;
+            dlssParams.Feature.InTargetWidth = m_outputWidth;
+            dlssParams.Feature.InTargetHeight = m_outputHeight;
+            dlssParams.Feature.InPerfQualityValue = m_quality;
+            dlssParams.InFeatureCreateFlags = Constants::DLSS_FEATURE_FLAGS;
+
+            NVSDK_NGX_Result fallbackRes = NGX_VULKAN_CREATE_DLSS_EXT1(
+                device, cmdBuffer, 1, 1, fallbackDLSSFeature, parameters, &dlssParams);
+
+            if (NVSDK_NGX_SUCCEED(fallbackRes)) {
+                DLSS_LOG_INFO("FALLBACK SUCCESS: Created standard DLSS instead of DLSSD");
+                m_featurePending = false;
+                return NVSDK_NGX_Result_Success;
+            } else {
+                DLSS_LOG_ERROR("FALLBACK FAILED: " +
+                              ErrorInfo::formatNGXResult(fallbackRes));
+            }
+            m_featurePending = false;
+            return res;
+        }
+
+        m_featurePending = false;
+        DLSS_LOG_INFO("DLSSD Feature Created Successfully");
+        return NVSDK_NGX_Result_Success;
+    }
+
+    [[nodiscard]] NVSDK_NGX_Handle* getFeature() const noexcept { return m_feature; }
+    [[nodiscard]] bool isPending() const noexcept { return m_featurePending; }
+    [[nodiscard]] int getRenderWidth() const noexcept { return m_renderWidth; }
+    [[nodiscard]] int getRenderHeight() const noexcept { return m_renderHeight; }
+    [[nodiscard]] int getOutputWidth() const noexcept { return m_outputWidth; }
+    [[nodiscard]] int getOutputHeight() const noexcept { return m_outputHeight; }
+    [[nodiscard]] NVSDK_NGX_DLSS_Roughness_Mode getRoughnessMode() const noexcept {
+        return m_roughnessMode;
+    }
+    [[nodiscard]] bool needsReset() const noexcept { return m_needsReset; }
+    void clearReset() noexcept { m_needsReset = false; }
+    void incrementFailures() noexcept { m_creationFailures++; }
+    [[nodiscard]] int getFailures() const noexcept { return m_creationFailures; }
+    void clearPending() noexcept { m_featurePending = false; }
+    [[nodiscard]] bool isOutputLayoutInitialized() const noexcept {
+        return m_outputLayoutInitialized;
+    }
+    void setOutputLayoutInitialized() noexcept { m_outputLayoutInitialized = true; }
+
+private:
+    std::mutex m_mutex;
+    NVSDK_NGX_Handle* m_feature = nullptr;
+    bool m_featurePending = false;
+    int m_creationFailures = 0;
+
+    int m_renderWidth = 0;
+    int m_renderHeight = 0;
+    int m_outputWidth = 0;
+    int m_outputHeight = 0;
+    NVSDK_NGX_DLSS_Denoise_Mode m_denoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
+    NVSDK_NGX_DLSS_Roughness_Mode m_roughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Packed;
+    NVSDK_NGX_DLSS_Depth_Type m_depthType = NVSDK_NGX_DLSS_Depth_Type_Linear;
+    NVSDK_NGX_PerfQuality_Value m_quality = NVSDK_NGX_PerfQuality_Value_Balanced;
+
+    // Change tracking
+    int m_lastRenderWidth = 0;
+    int m_lastRenderHeight = 0;
+    int m_lastOutputWidth = 0;
+    int m_lastOutputHeight = 0;
+    NVSDK_NGX_PerfQuality_Value m_lastQuality = NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    bool m_needsReset = false;
+    bool m_outputLayoutInitialized = false;
+};
+
+// ============================================================================
+// DLSS BRIDGE (COORDINATOR)
+// ============================================================================
+
+/**
+ * @brief Main coordinator class for DLSS/DLSSD operations.
+ *
+ * This class provides the main interface for DLSS operations, coordinating
+ * between the NGX lifecycle, DLSS, and DLSSD feature managers.
+ */
 class DLSSBridge {
 public:
     static DLSSBridge& Get() {
@@ -147,424 +1352,220 @@ public:
 
     // --- Initialization / Shutdown ---
 
-    NVSDK_NGX_Result InitializeNGX(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, const char* dlssPath) {
-        std::lock_guard<std::mutex> lock(m_Mutex);
+    NVSDK_NGX_Result InitializeNGX(VkInstance instance, VkPhysicalDevice physicalDevice,
+                                   VkDevice device, const char* dlssPath) {
+        NGXLifecycleManager::InitParams params = {};
+        params.instance = instance;
+        params.physicalDevice = physicalDevice;
+        params.device = device;
+        if (dlssPath) params.dlssPath = dlssPath;
 
-        if (m_Initialized) {
-            bool sameDevice = (m_Instance == instance && m_PhysicalDevice == physicalDevice && m_Device == device);
-            bool samePath = true;
-            if (dlssPath != nullptr) {
-                samePath = (m_DLSSPath == dlssPath);
-            }
-            
-            if (sameDevice && samePath) {
-                return NVSDK_NGX_Result_Success; // Already initialized with same device and path
-            }
-            
-            Log("Re-initializing NGX...");
-            ShutdownNGX_Internal();
-        }
-
-        if (instance == VK_NULL_HANDLE || physicalDevice == VK_NULL_HANDLE || device == VK_NULL_HANDLE) {
-            Log("InitializeNGX called with null Vulkan handles!");
-            return NVSDK_NGX_Result_FAIL_InvalidParameter;
-        }
-
-        Log("Initializing NGX...");
-        if (dlssPath) {
-            Log("DLSS Path: " + std::string(dlssPath));
-            m_DLSSPath = dlssPath;
-        } else {
-            m_DLSSPath.clear();
-        }
-        
-        // Define function pointers
-        PFN_vkGetInstanceProcAddr gipa = vkGetInstanceProcAddr;
-        PFN_vkGetDeviceProcAddr gdpa = vkGetDeviceProcAddr;
-
-        // Prepare path info for custom DLL location
-        std::wstring wDlssPath;
-        const wchar_t* paths[] = { nullptr, nullptr };
-        NVSDK_NGX_PathListInfo pathListInfo = {};
-        NVSDK_NGX_FeatureCommonInfo featureInfo = {};
-        const NVSDK_NGX_FeatureCommonInfo* pFeatureInfo = nullptr;
-
-        if (dlssPath != nullptr && strlen(dlssPath) > 0) {
-            size_t len = strlen(dlssPath);
-            wDlssPath.resize(len + 1);
-            size_t convertedChars = 0;
-            errno_t err = mbstowcs_s(&convertedChars, &wDlssPath[0], len + 1, dlssPath, _TRUNCATE);
-            
-            if (err == 0) {
-                paths[0] = wDlssPath.c_str();
-                pathListInfo.Path = paths;
-                pathListInfo.Length = 1;
-                featureInfo.PathListInfo = pathListInfo;
-                pFeatureInfo = &featureInfo;
-                Log("Using custom DLSS search path.");
-            } else {
-                Log("Failed to convert DLSS path to wstring. Ignoring custom path.");
-            }
-        } else {
-            // FIX: Default to current working directory "." if no path provided
-            // This is required because Minecraft runs as javaw.exe, so default search path is Java bin dir
-            // But DLLs are in the game directory (CWD)
-            Log("No custom DLSS path provided. Defaulting to CWD (.) for DLL search.");
-            paths[0] = L"."; 
-            pathListInfo.Path = paths;
-            pathListInfo.Length = 1;
-            featureInfo.PathListInfo = pathListInfo;
-            pFeatureInfo = &featureInfo;
-        }
-
-        // Use ProjectID method which is more flexible for mods/non-commercial use
-        // and allows passing a UUID string.
-        // AppID 0 (standard Init) often lacks permissions for advanced features like DLSSD.
-        // NOTE: We use "." for ApplicationDataPath to ensure logs/cache go to the CWD (usually game dir),
-        // instead of the DLL path which might be read-only.
-        Log("Calling NVSDK_NGX_VULKAN_Init_with_ProjectID...");
-        Log(" - ProjectID: vulkanite-raytracing-mod");
-        Log(" - EngineType: CUSTOM");
-        Log(" - EngineVersion: 1.0.0");
-    
-        // CRITICAL FIX: NVSDK_NGX_VULKAN_Init_with_ProjectID requires a VALID, WRITABLE directory
-        // for InApplicationDataPath. Using L"." (CWD) can fail if the directory is not writable
-        // or if the path has issues. We need to use an absolute path.
-        //
-        // For Minecraft mods, the best location is the game directory (run/ folder).
-        // The Java side passes this as dlssPath, so we use it if available.
-        //
-        // If dlssPath is not available, we fall back to creating a temp directory.
-        std::wstring appDataPath;
-        if (dlssPath != nullptr && strlen(dlssPath) > 0) {
-        // Use the provided path (game directory)
-        appDataPath = wDlssPath;
-        } else {
-        // Fall back to temp directory
-        wchar_t tempPath[MAX_PATH];
-        GetTempPathW(MAX_PATH, tempPath);
-        appDataPath = tempPath;
-        Log("Using temp directory for NGX data: " + WideToNarrow(appDataPath));
-        }
-        
-        // Log the application data path for debugging
-        Log("ApplicationDataPath: " + WideToNarrow(appDataPath));
-        
-        // Initialize NGX with standard AppID first
-        // AppID 231313132 is NVIDIA's generic/test AppID that supports DLSS features
-        NVSDK_NGX_Result res = NVSDK_NGX_VULKAN_Init(
-        231313132, // AppID 231313132 = NVIDIA Generic/Test AppID
-        appDataPath.c_str(),
-        instance,
-        physicalDevice,
-        device,
-        gipa,
-        gdpa,
-        pFeatureInfo,
-        NVSDK_NGX_Version_API
-        );
-        
-        if (NVSDK_NGX_FAILED(res)) {
-        Log("NVSDK_NGX_VULKAN_Init with AppID 231313132 failed: " + std::string(getNGXErrorString(res)) + " (code: " + std::to_string(res) + ")");
-        Log("Trying ProjectID fallback...");
-        
-        // Fallback: Try ProjectID method
-        res = NVSDK_NGX_VULKAN_Init_with_ProjectID(
-        "vulkanite-raytracing-mod", // Unique project identifier
-        NVSDK_NGX_ENGINE_TYPE_CUSTOM,
-        "1.0.0",
-        appDataPath.c_str(),
-        instance,
-        physicalDevice,
-        device,
-        gipa,
-        gdpa,
-        pFeatureInfo,
-        NVSDK_NGX_Version_API
-        );
-        
-        if (NVSDK_NGX_FAILED(res)) {
-        Log("NVSDK_NGX_VULKAN_Init_with_ProjectID also failed: " + std::string(getNGXErrorString(res)) + " (code: " + std::to_string(res) + ")");
-        return res;
-        }
-        }
-        
-        if (NVSDK_NGX_FAILED(res)) {
-        Log("NVSDK_NGX_VULKAN_Init (both methods) failed: " + std::string(getNGXErrorString(res)));
-        return res;
-        }
-
-        // Acquire capability parameters
-        res = NVSDK_NGX_VULKAN_GetCapabilityParameters(&m_Parameters);
-        if (NVSDK_NGX_FAILED(res)) {
-            Log("Failed to get capability parameters: " + std::string(getNGXErrorString(res)));
-            NVSDK_NGX_VULKAN_Shutdown1(device);
-            return res;
-        }
-
-        m_Instance = instance;
-        m_PhysicalDevice = physicalDevice;
-        m_Device = device;
-        m_Initialized = true;
-        Log("NGX Initialized Successfully (Build ID: 2026-03-20-APPID-FIRST)");
-        
-        // Check and log DLSSD/Ray Reconstruction availability
-        int rrAvailable = 0;
-        res = NVSDK_NGX_Parameter_GetI(m_Parameters, NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &rrAvailable);
-        if (NVSDK_NGX_SUCCEED(res)) {
-            Log("=== DLSSD/Ray Reconstruction Capability Check ===");
-            Log("  - Ray Reconstruction Available: " + std::string(rrAvailable ? "YES" : "NO"));
-            
-            if (rrAvailable) {
-                // Log additional DLSSD info
-                int needsUpdate = 0;
-                NVSDK_NGX_Parameter_GetI(m_Parameters, NVSDK_NGX_Parameter_SuperSamplingDenoising_NeedsUpdatedDriver, &needsUpdate);
-                Log("  - Needs Updated Driver: " + std::string(needsUpdate ? "YES" : "NO"));
-                
-                unsigned int majorVer = 0, minorVer = 0;
-                NVSDK_NGX_Parameter_GetUI(m_Parameters, NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMajor, &majorVer);
-                NVSDK_NGX_Parameter_GetUI(m_Parameters, NVSDK_NGX_Parameter_SuperSamplingDenoising_MinDriverVersionMinor, &minorVer);
-                Log("  - Min Driver Version: " + std::to_string(majorVer) + "." + std::to_string(minorVer));
-            } else {
-                Log("  WARNING: Ray Reconstruction is NOT available on this system!");
-                Log("  Possible reasons: GPU not supported, driver too old, or DLSS DLLs missing/incompatible.");
-            }
-        } else {
-            Log("Failed to query Ray Reconstruction availability: " + std::string(getNGXErrorString(res)));
-        }
-        
-        // Also check standard DLSS availability
-        int dlssAvailable = 0;
-        res = NVSDK_NGX_Parameter_GetI(m_Parameters, NVSDK_NGX_Parameter_SuperSampling_Available, &dlssAvailable);
-        if (NVSDK_NGX_SUCCEED(res)) {
-            Log("  - DLSS Super Resolution Available: " + std::string(dlssAvailable ? "YES" : "NO"));
-        }
-        
-        return NVSDK_NGX_Result_Success;
+        auto result = m_lifecycle.initialize(params);
+        return result.isOk() ? NVSDK_NGX_Result_Success : result.error().ngxResult;
     }
 
     void ShutdownNGX() {
-        std::lock_guard<std::mutex> lock(m_Mutex);
-        ShutdownNGX_Internal();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_dlssManager.destroy();
+        m_dlssdManager.destroy();
+        m_lifecycle.shutdown();
     }
 
     // --- Standard DLSS ---
 
-    NVSDK_NGX_Result InitDLSS(int renderWidth, int renderHeight, int outWidth, int outHeight, NVSDK_NGX_PerfQuality_Value quality) {
-        std::lock_guard<std::mutex> lock(m_Mutex);
-        if (!m_Initialized) {
-            Log("InitDLSS called before NGX Initialization!");
+    NVSDK_NGX_Result InitDLSS(int renderWidth, int renderHeight, int outWidth, int outHeight,
+                              NVSDK_NGX_PerfQuality_Value quality) {
+        if (!m_lifecycle.isInitialized()) {
+            DLSS_LOG_ERROR("InitDLSS called before NGX Initialization!");
             return NVSDK_NGX_Result_FAIL_NotInitialized;
         }
 
-        if (m_DLSSFeature) {
-            Log("DLSS Feature already exists. Destroying old feature.");
-            NVSDK_NGX_VULKAN_ReleaseFeature(m_DLSSFeature);
-            m_DLSSFeature = nullptr;
-        }
+        m_dlssManager.destroy();
 
-        // Ensure dimensions are even (DLSS requirement often)
-        m_DLSSRenderWidth = (renderWidth % 2 != 0) ? renderWidth - 1 : renderWidth;
-        m_DLSSRenderHeight = (renderHeight % 2 != 0) ? renderHeight - 1 : renderHeight;
-        m_DLSSOutWidth = (outWidth % 2 != 0) ? outWidth - 1 : outWidth;
-        m_DLSSOutHeight = (outHeight % 2 != 0) ? outHeight - 1 : outHeight;
-        m_DLSSQuality = quality;
+        DLSSFeatureManager::CreateParams params = {};
+        params.renderWidth = renderWidth;
+        params.renderHeight = renderHeight;
+        params.outputWidth = outWidth;
+        params.outputHeight = outHeight;
+        params.quality = quality;
 
-        // Feature creation is deferred to the first Evaluate call because it requires a CommandBuffer
-        m_DLSSFeaturePending = true;
-        m_DLSSCreationFailures = 0;
-        Log("DLSS Init configured. Feature creation deferred to first frame. Render: " + std::to_string(m_DLSSRenderWidth) + "x" + std::to_string(m_DLSSRenderHeight));
-        return NVSDK_NGX_Result_Success;
+        auto result = m_dlssManager.configure(params);
+        return result.isOk() ? NVSDK_NGX_Result_Success : result.error().ngxResult;
     }
 
     void DestroyDLSS() {
-        std::lock_guard<std::mutex> lock(m_Mutex);
-        if (m_DLSSFeature) {
-            NVSDK_NGX_VULKAN_ReleaseFeature(m_DLSSFeature);
-            m_DLSSFeature = nullptr;
-        }
-        m_DLSSFeaturePending = false;
-        // If DLSSD is also not active, we could shutdown NGX, but let's keep it alive for now to avoid overhead
+        m_dlssManager.destroy();
     }
 
-    // Internal non-locking version for use within DLSSD fallback
-// NOTE: When called from DLSSD fallback, use DLSSD dimensions since the feature was created with those
-NVSDK_NGX_Result EvaluateDLSS_Internal(VkCommandBuffer cmdBuffer,
-    VkImageView color, VkImage colorImg, int colorFormat,
-    VkImageView depth, VkImage depthImg, int depthFormat,
-    VkImageView mv, VkImage mvImg, int mvFormat,
-    VkImageView output, VkImage outputImg, int outputFormat,
-    float jitterX, float jitterY) {
-// NOTE: This is called from within EvaluateDLSSD which already holds the lock
-// DO NOT acquire the lock here!
-
-if (!m_Initialized) return NVSDK_NGX_Result_FAIL_NotInitialized;
-
-// Create feature if pending
-if (m_DLSSFeaturePending) {
-    NVSDK_NGX_Result res = CreateDLSSFeature(cmdBuffer);
-    if (NVSDK_NGX_FAILED(res)) {
-        m_DLSSCreationFailures++;
-        if (m_DLSSCreationFailures >= 3) {
-            m_DLSSFeaturePending = false;
-            Log("DLSS Feature creation failed 3 times. Disabling DLSS for this session.");
-        }
-        return res;
-    }
-    m_DLSSFeaturePending = false;
-}
-
-if (!m_DLSSFeature) return NVSDK_NGX_Result_FAIL_FeatureNotFound;
-
-// CRITICAL FIX: Use DLSSD dimensions if the DLSS feature was created as a fallback from DLSSD
-// The fallback DLSS feature uses m_DLSSDRenderWidth/Height dimensions
-int renderWidth = m_DLSSRenderWidth;
-int renderHeight = m_DLSSRenderHeight;
-int outWidth = m_DLSSOutWidth;
-int outHeight = m_DLSSOutHeight;
-
-// If DLSSD dimensions are set but standard DLSS dimensions are 0, use DLSSD dimensions
-// This happens when the DLSS feature was created as a fallback from DLSSD creation failure
-if (renderWidth == 0 || renderHeight == 0) {
-    renderWidth = m_DLSSDRenderWidth;
-    renderHeight = m_DLSSDRenderHeight;
-    outWidth = m_DLSSDOutWidth;
-    outHeight = m_DLSSDOutHeight;
-    Log("EvaluateDLSS_Internal: Using DLSSD fallback dimensions " + std::to_string(renderWidth) + "x" + std::to_string(renderHeight));
-}
-
-// Prepare Resources
-VkImageSubresourceRange subRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-VkImageSubresourceRange depthRange = { GetAspectMask((VkFormat)depthFormat), 0, 1, 0, 1 };
-
-NVSDK_NGX_Resource_VK rColor = NVSDK_NGX_Create_ImageView_Resource_VK(color, colorImg, subRange, (VkFormat)colorFormat, renderWidth, renderHeight, false);
-NVSDK_NGX_Resource_VK rDepth = NVSDK_NGX_Create_ImageView_Resource_VK(depth, depthImg, depthRange, (VkFormat)depthFormat, renderWidth, renderHeight, false);
-NVSDK_NGX_Resource_VK rMV = NVSDK_NGX_Create_ImageView_Resource_VK(mv, mvImg, subRange, (VkFormat)mvFormat, renderWidth, renderHeight, false);
-NVSDK_NGX_Resource_VK rOutput = NVSDK_NGX_Create_ImageView_Resource_VK(output, outputImg, subRange, (VkFormat)outputFormat, outWidth, outHeight, true);
-
-// === JITTER OFFSET VALIDATION ===
-// Per NVIDIA DLSS documentation, jitter offsets should be in pixel units [-0.5, 0.5]
-// Validate and log jitter values for debugging
-ValidateJitterRange(jitterX, jitterY, "EvaluateDLSS_Internal");
-
-// === MOTION VECTOR HANDLING ===
-// Motion vectors passed to DLSS should:
-// - Be in pixel units (render resolution)
-// - Represent geometric motion WITHOUT jitter compensation
-// - Use scale factor 1.0 for pixel-space vectors
-//
-// IMPORTANT: DLSS handles jitter compensation internally using the jitter offsets.
-// The motion vectors should NOT have any jitter compensation applied to them.
-// If motion vectors already have jitter compensation, it would cause double compensation.
-
-NVSDK_NGX_VK_DLSS_Eval_Params evalParams = {};
-evalParams.Feature.pInColor = &rColor;
-evalParams.Feature.pInOutput = &rOutput;
-evalParams.pInDepth = &rDepth;
-evalParams.pInMotionVectors = &rMV;
-
-// === JITTER PARAMETERS ===
-// Pass jitter offsets to DLSS for internal compensation
-// DLSS uses these to properly align temporal samples
-evalParams.InJitterOffsetX = jitterX;
-evalParams.InJitterOffsetY = jitterY;
-
-evalParams.InRenderSubrectDimensions = { (unsigned int)renderWidth, (unsigned int)renderHeight };
-
-// === MOTION VECTOR SCALE ===
-// MVs are in pixel space, so scale must be 1.0
-// If MVs were normalized [0,1], scale would need to be render dimensions
-// Using 1.0 means MVs are already in pixel units (correct for our implementation)
-evalParams.InMVScaleX = 1.0f;
-evalParams.InMVScaleY = 1.0f;
-
-// === DEBUG LOGGING ===
-// Log evaluation parameters periodically for debugging
-static int dlssEvalCount = 0;
-dlssEvalCount++;
-if (dlssEvalCount % 300 == 1) {
-	Log("=== DLSS Evaluation (frame " + std::to_string(dlssEvalCount) + ") ===");
-	Log(" Jitter: (" + std::to_string(jitterX) + ", " + std::to_string(jitterY) + ")");
-	Log(" RenderDims: " + std::to_string(renderWidth) + "x" + std::to_string(renderHeight));
-	Log(" OutputDims: " + std::to_string(outWidth) + "x" + std::to_string(outHeight));
-	Log(" MVScale: (1.0, 1.0) - pixel space");
-}
-
-NVSDK_NGX_Result res = NGX_VULKAN_EVALUATE_DLSS_EXT(cmdBuffer, m_DLSSFeature, m_Parameters, &evalParams);
-if (NVSDK_NGX_FAILED(res)) {
-	Log("EvaluateDLSS failed: " + std::string(getNGXErrorString(res)));
-	return res;
-}
-if (dlssEvalCount % 300 == 1) {
-	Log("EvaluateDLSS succeeded (frame " + std::to_string(dlssEvalCount) + ")");
-}
-return NVSDK_NGX_Result_Success;
-}
-
-    // Public version that acquires the lock
-    NVSDK_NGX_Result EvaluateDLSS(VkCommandBuffer cmdBuffer,
+    NVSDK_NGX_Result EvaluateDLSS(
+        VkCommandBuffer cmdBuffer,
         VkImageView color, VkImage colorImg, int colorFormat,
         VkImageView depth, VkImage depthImg, int depthFormat,
         VkImageView mv, VkImage mvImg, int mvFormat,
         VkImageView output, VkImage outputImg, int outputFormat,
-        float jitterX, float jitterY) {
-        std::lock_guard<std::mutex> lock(m_Mutex);
-        return EvaluateDLSS_Internal(cmdBuffer, color, colorImg, colorFormat,
-                                    depth, depthImg, depthFormat,
-                                    mv, mvImg, mvFormat,
-                                    output, outputImg, outputFormat,
-                                    jitterX, jitterY);
-    }
+        float jitterX, float jitterY
+    ) {
+        std::lock_guard<std::mutex> lock(m_mutex);
 
-    // --- DLSS Ray Reconstruction (DLSSD) ---
-
-    NVSDK_NGX_Result InitDLSSD(int renderWidth, int renderHeight, int outWidth, int outHeight, 
-                   int denoiseMode, int roughnessMode, int depthType, int quality) {
-        std::lock_guard<std::mutex> lock(m_Mutex);
-        if (!m_Initialized) {
-            Log("InitDLSSD called before NGX Initialization!");
+        if (!m_lifecycle.isInitialized()) {
             return NVSDK_NGX_Result_FAIL_NotInitialized;
         }
 
-        // Check availability
-        int rrAvailable = 0;
-        NVSDK_NGX_Parameter_GetI(m_Parameters, NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &rrAvailable);
-        Log("Ray Reconstruction (DLSSD) availability: " + std::to_string(rrAvailable));
-        if (!rrAvailable) {
-            Log("Ray Reconstruction (DLSSD) not available on this system.");
-            return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
+        // Create feature if pending
+        if (m_dlssManager.isPending()) {
+            NVSDK_NGX_Result res = m_dlssManager.createFeature(
+                m_lifecycle.getDevice(), cmdBuffer, m_lifecycle.getParameters());
+            if (NVSDK_NGX_FAILED(res)) {
+                m_dlssManager.incrementFailures();
+                if (m_dlssManager.getFailures() >= Constants::MAX_CREATION_FAILURES) {
+                    m_dlssManager.clearPending();
+                    DLSS_LOG_ERROR("DLSS Feature creation failed 3 times. Disabling.");
+                }
+                return res;
+            }
         }
 
-        if (m_DLSSDFeature) {
-            NVSDK_NGX_VULKAN_ReleaseFeature(m_DLSSDFeature);
-            m_DLSSDFeature = nullptr;
+        if (!m_dlssManager.getFeature()) {
+            return NVSDK_NGX_Result_FAIL_FeatureNotFound;
         }
 
-        m_DLSSDRenderWidth = renderWidth;
-        m_DLSSDRenderHeight = renderHeight;
-        m_DLSSDOutWidth = outWidth;
-        m_DLSSDOutHeight = outHeight;
-        m_DLSSDDenoiseMode = (NVSDK_NGX_DLSS_Denoise_Mode)denoiseMode;
-        m_DLSSDRoughnessMode = (NVSDK_NGX_DLSS_Roughness_Mode)roughnessMode;
-        m_DLSSDDepthType = (NVSDK_NGX_DLSS_Depth_Type)depthType;
-        m_DLSSDQuality = MapQualityDLSSD(quality); // Use DLSSD-specific quality mapping
+        // Validate and clamp jitter
+        float clampedJitterX = jitterX;
+        float clampedJitterY = jitterY;
+        JitterValidation::validateAndClamp(clampedJitterX, clampedJitterY, "EvaluateDLSS");
 
-        m_DLSSDFeaturePending = true;
-        m_DLSSDCreationFailures = 0;
-        Log("DLSSD Init configured. Feature creation deferred.");
+        // Prepare resources
+        VkImageSubresourceRange subRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkImageSubresourceRange depthRange = {
+            VulkanHelpers::getAspectMask(static_cast<VkFormat>(depthFormat)), 0, 1, 0, 1
+        };
+
+        int renderW = m_dlssManager.getRenderWidth();
+        int renderH = m_dlssManager.getRenderHeight();
+        int outW = m_dlssManager.getOutputWidth();
+        int outH = m_dlssManager.getOutputHeight();
+
+        NVSDK_NGX_Resource_VK rColor = NVSDK_NGX_Create_ImageView_Resource_VK(
+            color, colorImg, subRange, static_cast<VkFormat>(colorFormat), renderW, renderH, false);
+        NVSDK_NGX_Resource_VK rDepth = NVSDK_NGX_Create_ImageView_Resource_VK(
+            depth, depthImg, depthRange, static_cast<VkFormat>(depthFormat), renderW, renderH, false);
+        NVSDK_NGX_Resource_VK rMV = NVSDK_NGX_Create_ImageView_Resource_VK(
+            mv, mvImg, subRange, static_cast<VkFormat>(mvFormat), renderW, renderH, false);
+        NVSDK_NGX_Resource_VK rOutput = NVSDK_NGX_Create_ImageView_Resource_VK(
+            output, outputImg, subRange, static_cast<VkFormat>(outputFormat), outW, outH, true);
+
+        NVSDK_NGX_VK_DLSS_Eval_Params evalParams = {};
+        evalParams.Feature.pInColor = &rColor;
+        evalParams.Feature.pInOutput = &rOutput;
+        evalParams.pInDepth = &rDepth;
+        evalParams.pInMotionVectors = &rMV;
+        evalParams.InJitterOffsetX = -clampedJitterX;
+        evalParams.InJitterOffsetY = -clampedJitterY;
+        evalParams.InRenderSubrectDimensions = {
+            static_cast<unsigned int>(renderW),
+            static_cast<unsigned int>(renderH)
+        };
+        evalParams.InMVScaleX = Constants::MV_SCALE_X;
+        evalParams.InMVScaleY = Constants::MV_SCALE_Y;
+
+        // Throttled logging
+        static std::atomic<int> dlssEvalCount(0);
+        if (Logger::instance().shouldLogThrottled(dlssEvalCount)) {
+            DLSS_LOG_INFO("=== DLSS Evaluation (frame " + std::to_string(dlssEvalCount) + ") ===");
+            DLSS_LOG_INFO(" Jitter: (" + std::to_string(clampedJitterX) + ", " +
+                         std::to_string(clampedJitterY) + ")");
+            DLSS_LOG_INFO(" RenderDims: " + std::to_string(renderW) + "x" + std::to_string(renderH));
+            DLSS_LOG_INFO(" MVScale: (" + std::to_string(Constants::MV_SCALE_X) + ", " +
+                         std::to_string(Constants::MV_SCALE_Y) + ")");
+        }
+
+        // Layout transitions
+        VulkanHelpers::transitionImageLayout(cmdBuffer, colorImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, mvImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, depthImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VulkanHelpers::getAspectMask(static_cast<VkFormat>(depthFormat)));
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, outputImg,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, VK_ACCESS_SHADER_WRITE_BIT);
+
+        NVSDK_NGX_Result res = NGX_VULKAN_EVALUATE_DLSS_EXT(
+            cmdBuffer, m_dlssManager.getFeature(), m_lifecycle.getParameters(), &evalParams);
+
+        // Layout transitions (Restore)
+        VulkanHelpers::transitionImageLayout(cmdBuffer, colorImg,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, mvImg,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, depthImg,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT, VulkanHelpers::getAspectMask(static_cast<VkFormat>(depthFormat)));
+
+
+        if (NVSDK_NGX_FAILED(res)) {
+            DLSS_LOG_ERROR("EvaluateDLSS failed: " +
+                          ErrorInfo::formatNGXResult(res));
+            return res;
+        }
+
         return NVSDK_NGX_Result_Success;
     }
 
-    void DestroyDLSSD() {
-        std::lock_guard<std::mutex> lock(m_Mutex);
-        if (m_DLSSDFeature) {
-            NVSDK_NGX_VULKAN_ReleaseFeature(m_DLSSDFeature);
-            m_DLSSDFeature = nullptr;
+    // --- DLSSD (Ray Reconstruction) ---
+
+    NVSDK_NGX_Result InitDLSSD(int renderWidth, int renderHeight, int outWidth, int outHeight,
+                               int denoiseMode, int roughnessMode, int depthType, int quality) {
+        if (!m_lifecycle.isInitialized()) {
+            DLSS_LOG_ERROR("InitDLSSD called before NGX Initialization!");
+            return NVSDK_NGX_Result_FAIL_NotInitialized;
         }
-        m_DLSSDFeaturePending = false;
+
+        // Do not reject DLSSD solely because the capability parameter is false.
+        // Feature creation below will return the authoritative NGX result.
+        if (!m_lifecycle.isDLSSDAvailable()) {
+            DLSS_LOG_WARN("Ray Reconstruction capability bit is false during init; configuring DLSSD anyway.");
+        }
+
+        m_dlssdManager.destroy();
+
+        DLSSDFeatureManager::CreateParams params = {};
+        params.renderWidth = renderWidth;
+        params.renderHeight = renderHeight;
+        params.outputWidth = outWidth;
+        params.outputHeight = outHeight;
+        params.denoiseMode = static_cast<NVSDK_NGX_DLSS_Denoise_Mode>(denoiseMode);
+        params.roughnessMode = static_cast<NVSDK_NGX_DLSS_Roughness_Mode>(roughnessMode);
+        params.depthType = static_cast<NVSDK_NGX_DLSS_Depth_Type>(depthType);
+        params.quality = mapQualityDLSSD(quality);
+
+        auto result = m_dlssdManager.configure(params);
+        return result.isOk() ? NVSDK_NGX_Result_Success : result.error().ngxResult;
     }
 
-    NVSDK_NGX_Result EvaluateDLSSD(VkCommandBuffer cmdBuffer,
+    void DestroyDLSSD() {
+        m_dlssdManager.destroy();
+    }
+
+    NVSDK_NGX_Result EvaluateDLSSD(
+        VkCommandBuffer cmdBuffer,
         VkImageView color, VkImage colorImg, int colorFormat,
         VkImageView depth, VkImage depthImg, int depthFormat,
         VkImageView mv, VkImage mvImg, int mvFormat,
@@ -572,193 +1573,184 @@ return NVSDK_NGX_Result_Success;
         VkImageView specAlb, VkImage specAlbImg, int specAlbFormat,
         VkImageView normals, VkImage normalsImg, int normalsFormat,
         VkImageView rough, VkImage roughImg, int roughFormat,
+        VkImageView specHitDepth, VkImage specHitDepthImg, int specHitDepthFormat,
         VkImageView output, VkImage outputImg, int outputFormat,
-        float jitterX, float jitterY, int reset, float dt) {
+        float jitterX, float jitterY, int reset, float dt,
+        float* worldToViewMatrix, float* viewToClipMatrix
+    ) {
+        std::lock_guard<std::mutex> lock(m_mutex);
 
-        std::lock_guard<std::mutex> lock(m_Mutex);
-        if (!m_Initialized) return NVSDK_NGX_Result_FAIL_NotInitialized;
+        if (!m_lifecycle.isInitialized()) {
+            return NVSDK_NGX_Result_FAIL_NotInitialized;
+        }
 
-        // === DIAGNOSTIC LOGGING ===
-        // Throttle logging to every 300 frames to avoid huge log files
-        static int dlssdEvalCount = 0;
-        dlssdEvalCount++;
-        bool shouldLog = (dlssdEvalCount % 300 == 1) || reset;
-        
-        // === JITTER OFFSET VALIDATION ===
-        // Per NVIDIA DLSS documentation, jitter offsets should be in pixel units [-0.5, 0.5]
-        // Validate jitter range and log warnings if outside expected range
-        ValidateJitterRange(jitterX, jitterY, "EvaluateDLSSD");
-        
+        // Throttled logging
+        static std::atomic<int> dlssdEvalCount(0);
+        bool shouldLog = Logger::instance().shouldLogThrottled(dlssdEvalCount) || reset;
+
+        // Validate and clamp jitter
+        float clampedJitterX = jitterX;
+        float clampedJitterY = jitterY;
+        JitterValidation::validateAndClamp(clampedJitterX, clampedJitterY, "EvaluateDLSSD");
+
         if (shouldLog) {
-        	Log("=== EvaluateDLSSD Diagnostics (frame " + std::to_string(dlssdEvalCount) + ") ===");
-        	Log("Render dims: " + std::to_string(m_DLSSDRenderWidth) + "x" + std::to_string(m_DLSSDRenderHeight));
-        	Log("Jitter: (" + std::to_string(jitterX) + ", " + std::to_string(jitterY) + ")");
-        	Log("Reset: " + std::to_string(reset) + ", dt: " + std::to_string(dt) + "ms");
+            DLSS_LOG_INFO("=== EvaluateDLSSD (frame " + std::to_string(dlssdEvalCount) + ") ===");
+            DLSS_LOG_INFO(" Jitter: (" + std::to_string(clampedJitterX) + ", " +
+                         std::to_string(clampedJitterY) + ")");
+            DLSS_LOG_INFO(" Reset: " + std::to_string(reset) + ", dt: " + std::to_string(dt) + "ms");
         }
-        
-        // VALIDATE: Check for null handles
-        if (color == 0 || colorImg == 0) {
-            Log("ERROR: Color image/view is NULL!");
+
+        // Validate null handles - images are required, views are optional (can use image directly)
+        if (colorImg == 0) {
+            DLSS_LOG_ERROR("Color image is NULL!");
             return NVSDK_NGX_Result_FAIL_InvalidParameter;
         }
-        if (depth == 0 || depthImg == 0) {
-            Log("ERROR: Depth image/view is NULL!");
+        if (depthImg == 0) {
+            DLSS_LOG_ERROR("Depth image is NULL!");
             return NVSDK_NGX_Result_FAIL_InvalidParameter;
         }
-        if (mv == 0 || mvImg == 0) {
-            Log("ERROR: Motion vector image/view is NULL!");
+        if (mvImg == 0) {
+            DLSS_LOG_ERROR("Motion vector image is NULL!");
             return NVSDK_NGX_Result_FAIL_InvalidParameter;
         }
-        if (diffAlb == 0 || diffAlbImg == 0) {
-            Log("ERROR: Diffuse albedo image/view is NULL!");
+        if (diffAlbImg == 0) {
+            DLSS_LOG_ERROR("Diffuse albedo image is NULL!");
             return NVSDK_NGX_Result_FAIL_InvalidParameter;
         }
-        if (specAlb == 0 || specAlbImg == 0) {
-            Log("ERROR: Specular albedo image/view is NULL!");
+        if (specAlbImg == 0) {
+            DLSS_LOG_ERROR("Specular albedo image is NULL!");
             return NVSDK_NGX_Result_FAIL_InvalidParameter;
         }
-        if (normals == 0 || normalsImg == 0) {
-            Log("ERROR: Normals image/view is NULL!");
+        if (normalsImg == 0) {
+            DLSS_LOG_ERROR("Normals image is NULL!");
             return NVSDK_NGX_Result_FAIL_InvalidParameter;
         }
-        if (output == 0 || outputImg == 0) {
-            Log("ERROR: Output image/view is NULL!");
+        if (specHitDepthImg == 0) {
+            DLSS_LOG_ERROR("Specular hit depth image is NULL!");
+            return NVSDK_NGX_Result_FAIL_InvalidParameter;
+        }
+        if (outputImg == 0) {
+            DLSS_LOG_ERROR("Output image is NULL!");
             return NVSDK_NGX_Result_FAIL_InvalidParameter;
         }
 
-        if (m_DLSSDFeaturePending) {
-            Log("Creating DLSSD feature (pending)...");
-            NVSDK_NGX_Result res = CreateDLSSDFeature(cmdBuffer);
+        // Create feature if pending
+        if (m_dlssdManager.isPending()) {
+            DLSS_LOG_INFO("Creating DLSSD feature (pending)...");
+            NVSDK_NGX_Result res = m_dlssdManager.createFeature(
+                m_lifecycle.getDevice(), cmdBuffer, m_lifecycle.getParameters(),
+                m_dlssManager.getFeaturePtr());
+
             if (NVSDK_NGX_FAILED(res)) {
-                m_DLSSDCreationFailures++;
-                if (m_DLSSDCreationFailures >= 3) {
-                    m_DLSSDFeaturePending = false;
-                    Log("DLSSD Feature creation failed 3 times. Disabling DLSSD for this session.");
+                m_dlssdManager.incrementFailures();
+                if (m_dlssdManager.getFailures() >= Constants::MAX_CREATION_FAILURES) {
+                    m_dlssdManager.clearPending();
+                    DLSS_LOG_ERROR("DLSSD Feature creation failed 3 times. Disabling.");
                 }
                 return res;
             }
-            m_DLSSDFeaturePending = false;
-            Log("DLSSD feature created successfully");
-            
-            // === RESET FLAG HANDLING ===
-            // Only force reset=1 if not already requested by the caller
-            // This prevents overwriting a reset=0 from the Java side if they
-            // specifically don't want a reset (e.g., during continuous rendering)
+
+            // Force reset on first frame
             if (reset == 0) {
-            	Log("Forcing reset=1 for first frame after DLSSD feature creation");
-            	reset = 1; // FORCE reset on first frame after creation
-            } else {
-            	Log("Reset already set to " + std::to_string(reset) + " by caller");
+                DLSS_LOG_INFO("Forcing reset=1 for first frame after DLSSD feature creation");
+                reset = 1;
             }
-           }
-        
-        // CRITICAL FIX: If DLSSD feature is not available but standard DLSS is, use that instead
-        // This handles the case where CreateDLSSDFeature fell back to standard DLSS
-        if (!m_DLSSDFeature) {
-            if (m_DLSSFeature) {
-                Log("DLSSD feature not available, using standard DLSS fallback for evaluation");
-                // Use standard DLSS evaluation with available inputs
-                // Note: Standard DLSS only uses color, depth, motion vectors, and output
-                // IMPORTANT: Use EvaluateDLSS_Internal to avoid deadlock (we already hold the lock)
-                return EvaluateDLSS_Internal(cmdBuffer, color, colorImg, colorFormat,
-                                   depth, depthImg, depthFormat,
-                                   mv, mvImg, mvFormat,
-                                   output, outputImg, outputFormat,
-                                   jitterX, jitterY);
+        }
+
+        // Fallback to standard DLSS if DLSSD not available
+        if (!m_dlssdManager.getFeature()) {
+            if (m_dlssManager.getFeature()) {
+                DLSS_LOG_WARN("DLSSD feature not available, using standard DLSS fallback");
+                return EvaluateDLSS_Internal(cmdBuffer,
+                    color, colorImg, colorFormat,
+                    depth, depthImg, depthFormat,
+                    mv, mvImg, mvFormat,
+                    output, outputImg, outputFormat,
+                    clampedJitterX, clampedJitterY);
             }
+            DLSS_LOG_ERROR("Neither DLSSD nor DLSS feature available!");
             return NVSDK_NGX_Result_FAIL_FeatureNotFound;
         }
 
-        // Prepare Resources
-        // NOTE: DLSSD requires all input resources to have the same dimensions as the render resolution.
-        // The G-buffer images from Iris may have different dimensions, so we use the stored render dimensions.
-        
-        // CRITICAL: Ensure we use the ALIGNED dimensions for creating resource views
-        // If we use the raw image dimensions from Java (e.g. 1009), NGX will crash or return InvalidParameter
-        // because they don't match the feature dimensions (1008).
-        
+        // Prepare resources
         VkImageSubresourceRange subRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        VkImageSubresourceRange depthRange = { GetAspectMask((VkFormat)depthFormat), 0, 1, 0, 1 };
-    
-        // Log diagnostic if image dimensions seem off
-        // Log("Eval dimensions: Render=" + std::to_string(m_DLSSDRenderWidth) + "x" + std::to_string(m_DLSSDRenderHeight));
-    
-        NVSDK_NGX_Resource_VK rColor = NVSDK_NGX_Create_ImageView_Resource_VK(color, colorImg, subRange, (VkFormat)colorFormat, m_DLSSDRenderWidth, m_DLSSDRenderHeight, false);
-        NVSDK_NGX_Resource_VK rDepth = NVSDK_NGX_Create_ImageView_Resource_VK(depth, depthImg, depthRange, (VkFormat)depthFormat, m_DLSSDRenderWidth, m_DLSSDRenderHeight, false);
-        NVSDK_NGX_Resource_VK rMV = NVSDK_NGX_Create_ImageView_Resource_VK(mv, mvImg, subRange, (VkFormat)mvFormat, m_DLSSDRenderWidth, m_DLSSDRenderHeight, false);
-        NVSDK_NGX_Resource_VK rDiffAlb = NVSDK_NGX_Create_ImageView_Resource_VK(diffAlb, diffAlbImg, subRange, (VkFormat)diffAlbFormat, m_DLSSDRenderWidth, m_DLSSDRenderHeight, false);
-        NVSDK_NGX_Resource_VK rSpecAlb = NVSDK_NGX_Create_ImageView_Resource_VK(specAlb, specAlbImg, subRange, (VkFormat)specAlbFormat, m_DLSSDRenderWidth, m_DLSSDRenderHeight, false);
-        NVSDK_NGX_Resource_VK rNormals = NVSDK_NGX_Create_ImageView_Resource_VK(normals, normalsImg, subRange, (VkFormat)normalsFormat, m_DLSSDRenderWidth, m_DLSSDRenderHeight, false);
-        
-        // Output might be different size if upscaling, use Output dimensions
-        NVSDK_NGX_Resource_VK rOutput = NVSDK_NGX_Create_ImageView_Resource_VK(output, outputImg, subRange, (VkFormat)outputFormat, m_DLSSDOutWidth, m_DLSSDOutHeight, true);
+        VkImageSubresourceRange depthRange = {
+            VulkanHelpers::getAspectMask(static_cast<VkFormat>(depthFormat)), 0, 1, 0, 1
+        };
 
-        NVSDK_NGX_Resource_VK* pRough = nullptr;
+        int renderW = m_dlssdManager.getRenderWidth();
+        int renderH = m_dlssdManager.getRenderHeight();
+        int outW = m_dlssdManager.getOutputWidth();
+        int outH = m_dlssdManager.getOutputHeight();
+
+        // Create image views if not provided (view=0 means use image directly)
+        // NGX SDK requires image views, so we create temporary views when needed
+        VkImageView colorView = color;
+        VkImageView depthView = depth;
+        VkImageView mvView = mv;
+        VkImageView outputView = output;
+
+        // Note: When view is 0, we pass the image handle as both view and image
+        // The NGX SDK's NVSDK_NGX_Create_ImageView_Resource_VK will handle this
+        // by using the image directly if the view is VK_NULL_HANDLE (0)
+
+        NVSDK_NGX_Resource_VK rColor = NVSDK_NGX_Create_ImageView_Resource_VK(
+            colorView, colorImg, subRange, static_cast<VkFormat>(colorFormat), renderW, renderH, false);
+        NVSDK_NGX_Resource_VK rDepth = NVSDK_NGX_Create_ImageView_Resource_VK(
+            depthView, depthImg, depthRange, static_cast<VkFormat>(depthFormat), renderW, renderH, false);
+        NVSDK_NGX_Resource_VK rMV = NVSDK_NGX_Create_ImageView_Resource_VK(
+            mvView, mvImg, subRange, static_cast<VkFormat>(mvFormat), renderW, renderH, false);
+        NVSDK_NGX_Resource_VK rDiffAlb = NVSDK_NGX_Create_ImageView_Resource_VK(
+            diffAlb, diffAlbImg, subRange, static_cast<VkFormat>(diffAlbFormat), renderW, renderH, false);
+        NVSDK_NGX_Resource_VK rSpecAlb = NVSDK_NGX_Create_ImageView_Resource_VK(
+            specAlb, specAlbImg, subRange, static_cast<VkFormat>(specAlbFormat), renderW, renderH, false);
+        NVSDK_NGX_Resource_VK rNormals = NVSDK_NGX_Create_ImageView_Resource_VK(
+            normals, normalsImg, subRange, static_cast<VkFormat>(normalsFormat), renderW, renderH, false);
+        VkImageSubresourceRange specHitDepthRange = {
+            VulkanHelpers::getAspectMask(static_cast<VkFormat>(specHitDepthFormat)), 0, 1, 0, 1
+        };
+        NVSDK_NGX_Resource_VK rSpecHitDepth = NVSDK_NGX_Create_ImageView_Resource_VK(
+            specHitDepth, specHitDepthImg, specHitDepthRange,
+            static_cast<VkFormat>(specHitDepthFormat), renderW, renderH, false);
+        NVSDK_NGX_Resource_VK rOutput = NVSDK_NGX_Create_ImageView_Resource_VK(
+            outputView, outputImg, subRange, static_cast<VkFormat>(outputFormat), outW, outH, true);
+
+        // Roughness is packed into normals.w by default. NVIDIA's Vulkan RR
+        // sample still passes the normal/roughness resource as pInRoughness.
+        NVSDK_NGX_Resource_VK* pRough = &rNormals;
         NVSDK_NGX_Resource_VK rRough = {};
-        if (rough && m_DLSSDRoughnessMode == NVSDK_NGX_DLSS_Roughness_Mode_Unpacked) {
-            rRough = NVSDK_NGX_Create_ImageView_Resource_VK(rough, roughImg, subRange, (VkFormat)roughFormat, m_DLSSDRenderWidth, m_DLSSDRenderHeight, false);
+
+        if (m_dlssdManager.getRoughnessMode() == NVSDK_NGX_DLSS_Roughness_Mode_Unpacked) {
+            if (rough == 0 || roughImg == 0) {
+                DLSS_LOG_ERROR("Roughness image/view is NULL but RoughnessMode=Unpacked!");
+                return NVSDK_NGX_Result_FAIL_InvalidParameter;
+            }
+            rRough = NVSDK_NGX_Create_ImageView_Resource_VK(
+                rough, roughImg, subRange, static_cast<VkFormat>(roughFormat), renderW, renderH, false);
             pRough = &rRough;
         }
 
-        // CRITICAL: Initialize all DLSSD evaluate parameters properly
-        // DLSSD requires ALL of these inputs for Ray Reconstruction to work correctly
+        // Setup evaluation parameters
         NVSDK_NGX_VK_DLSSD_Eval_Params evalParams = {};
-        
-        // === REQUIRED INPUTS ===
-        // Noisy ray-traced color at render resolution
         evalParams.pInColor = &rColor;
-        // Linear depth (length(worldPos) for ray-traced, or HW depth)
         evalParams.pInDepth = &rDepth;
-        // Pixel-space motion vectors (2D offsets from prev frame to current)
         evalParams.pInMotionVectors = &rMV;
-        // Output image at display resolution
         evalParams.pInOutput = &rOutput;
-        // Diffuse albedo from G-buffer (for ray reconstruction denoising)
         evalParams.pInDiffuseAlbedo = &rDiffAlb;
-        // Specular albedo from G-buffer (for ray reconstruction denoising)
         evalParams.pInSpecularAlbedo = &rSpecAlb;
-        // World-space normals from G-buffer
         evalParams.pInNormals = &rNormals;
-        // Roughness (optional if packed in normals.w)
         evalParams.pInRoughness = pRough;
-        
-        // === JITTER PARAMETERS ===
-        // Sub-pixel jitter offsets in render pixel space
-        // These should match the jitter used during ray tracing
-        evalParams.InJitterOffsetX = jitterX;
-        evalParams.InJitterOffsetY = jitterY;
-        
-        // === RESET FLAG ===
-        // Set to 1 when scene changes completely (new level, camera cut, etc.)
-        // This tells DLSSD to reset its temporal history
+        evalParams.pInSpecularHitDistance = &rSpecHitDepth;
+        evalParams.InJitterOffsetX = -clampedJitterX;
+        evalParams.InJitterOffsetY = -clampedJitterY;
         evalParams.InReset = reset;
-        
-        // === MOTION VECTOR SCALING ===
-        // CRITICAL: MVs are in PIXEL SPACE (not normalized [0,1])
-        // Scale = 1.0 means MVs are already in pixel units
-        // If MVs were normalized [0,1], scale would need to be render dimensions
-        //
-        // IMPORTANT NOTES ON MOTION VECTORS:
-        // 1. Motion vectors should represent GEOMETRIC motion only (object/camera movement)
-        // 2. Motion vectors should NOT have jitter compensation applied
-        //    - DLSS handles jitter compensation internally using the jitter offsets
-        //    - If motion vectors have jitter compensation, it causes double compensation
-        // 3. Motion vectors should be in pixel units relative to render resolution
-        // 4. Motion vector format: (deltaX, deltaY) where positive = right/down movement
-        evalParams.InMVScaleX = 1.0f;
-        evalParams.InMVScaleY = 1.0f;
-        
-        // === TIMING ===
-        // Frame time delta in milliseconds - helps DLSSD determine denoising strength
-        // based on object velocity from motion vectors
+        evalParams.InMVScaleX = Constants::MV_SCALE_X;
+        evalParams.InMVScaleY = Constants::MV_SCALE_Y;
         evalParams.InFrameTimeDeltaInMsec = dt;
-        
-        // === RENDER SUBRECT ===
-        // Dimensions of the render region (usually full render resolution)
-        evalParams.InRenderSubrectDimensions = { (unsigned int)m_DLSSDRenderWidth, (unsigned int)m_DLSSDRenderHeight };
-        
-        // === OPTIONAL INPUTS (set to nullptr/0 if not used) ===
-        // These are for advanced use cases and are not required for basic RR
+        evalParams.InRenderSubrectDimensions = {
+            static_cast<unsigned int>(renderW),
+            static_cast<unsigned int>(renderH)
+        };
         evalParams.pInTransparencyMask = nullptr;
         evalParams.pInExposureTexture = nullptr;
         evalParams.pInBiasCurrentColorMask = nullptr;
@@ -769,435 +1761,454 @@ return NVSDK_NGX_Result_Success;
         evalParams.pInPositionViewSpace = nullptr;
         evalParams.pInRayTracingHitDistance = nullptr;
         evalParams.pInMotionVectorsReflections = nullptr;
-        
-        // === PRE-EXPOSURE (for HDR) ===
-        // Set to 1.0 if not using manual exposure control
-        evalParams.InPreExposure = 1.0f;
-        evalParams.InExposureScale = 1.0f;
-        
-        // Log detailed info on first frame or when reset
-        if (shouldLog || reset) {
-            Log("=== DLSSD Evaluate Parameters ===");
-            Log("  Jitter: (" + std::to_string(jitterX) + ", " + std::to_string(jitterY) + ")");
-            Log("  Reset: " + std::to_string(reset));
-            Log("  FrameTime: " + std::to_string(dt) + "ms");
-            Log("  MVScale: (1.0, 1.0) - pixel space");
-            Log("  RenderDims: " + std::to_string(m_DLSSDRenderWidth) + "x" + std::to_string(m_DLSSDRenderHeight));
-            Log("  OutputDims: " + std::to_string(m_DLSSDOutWidth) + "x" + std::to_string(m_DLSSDOutHeight));
-            Log("  RoughnessMode: " + std::string(m_DLSSDRoughnessMode == NVSDK_NGX_DLSS_Roughness_Mode_Packed ? "Packed" : "Unpacked"));
+        evalParams.InPreExposure = Constants::PRE_EXPOSURE_DEFAULT;
+        evalParams.InExposureScale = Constants::EXPOSURE_SCALE_DEFAULT;
+        evalParams.pInWorldToViewMatrix = worldToViewMatrix;
+        evalParams.pInViewToClipMatrix = viewToClipMatrix;
+
+        if (shouldLog) {
+            DLSS_LOG_INFO("=== DLSSD Evaluate Parameters ===");
+            DLSS_LOG_INFO(" RenderDims: " + std::to_string(renderW) + "x" + std::to_string(renderH));
+            DLSS_LOG_INFO(" OutputDims: " + std::to_string(outW) + "x" + std::to_string(outH));
+            DLSS_LOG_INFO(" MVScale: (" + std::to_string(Constants::MV_SCALE_X) + ", " +
+                         std::to_string(Constants::MV_SCALE_Y) + ")");
+            DLSS_LOG_INFO(std::string(" RoughnessMode: ") +
+                         (m_dlssdManager.getRoughnessMode() == NVSDK_NGX_DLSS_Roughness_Mode_Packed ?
+                          "Packed" : "Unpacked"));
         }
 
-        NVSDK_NGX_Result res = NGX_VULKAN_EVALUATE_DLSSD_EXT(cmdBuffer, m_DLSSDFeature, m_Parameters, &evalParams);
+        // Layout transitions
+        VulkanHelpers::transitionImageLayout(cmdBuffer, colorImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, mvImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, diffAlbImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, specAlbImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, normalsImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, depthImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VulkanHelpers::getAspectMask(static_cast<VkFormat>(depthFormat)));
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, specHitDepthImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VulkanHelpers::getAspectMask(static_cast<VkFormat>(specHitDepthFormat)));
+
+        if (roughImg != VK_NULL_HANDLE) {
+            VulkanHelpers::transitionImageLayout(cmdBuffer, roughImg,
+                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        }
+
+        // Output transition (track layout state)
+        VkImageLayout outputOldLayout = m_dlssdManager.isOutputLayoutInitialized() ?
+            VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        VulkanHelpers::transitionImageLayout(cmdBuffer, outputImg,
+            outputOldLayout, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+        m_dlssdManager.setOutputLayoutInitialized();
+
+        NVSDK_NGX_Result res = NGX_VULKAN_EVALUATE_DLSSD_EXT(
+            cmdBuffer, m_dlssdManager.getFeature(), m_lifecycle.getParameters(), &evalParams);
+
+        // Layout transitions (Restore)
+        VulkanHelpers::transitionImageLayout(cmdBuffer, colorImg,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, mvImg,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, diffAlbImg,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, specAlbImg,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, normalsImg,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, depthImg,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT, VulkanHelpers::getAspectMask(static_cast<VkFormat>(depthFormat)));
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, specHitDepthImg,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT, VulkanHelpers::getAspectMask(static_cast<VkFormat>(specHitDepthFormat)));
+
+        if (roughImg != VK_NULL_HANDLE) {
+            VulkanHelpers::transitionImageLayout(cmdBuffer, roughImg,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+        }
+
+
         if (NVSDK_NGX_FAILED(res)) {
-            Log("EvaluateDLSSD FAILED: " + std::string(getNGXErrorString(res)) + " (code: " + std::to_string(res) + ")");
-            // Log additional context for debugging
-            Log("  This error occurred during DLSSD evaluation.");
-            Log("  Check that all required G-buffer inputs are valid and correctly formatted.");
+            DLSS_LOG_ERROR("EvaluateDLSSD FAILED: " +
+                          ErrorInfo::formatNGXResult(res));
             return res;
         }
+
         if (shouldLog) {
-            Log("EvaluateDLSSD succeeded (frame " + std::to_string(dlssdEvalCount) + ")");
+            DLSS_LOG_INFO("EvaluateDLSSD succeeded (frame " + std::to_string(dlssdEvalCount) + ")");
         }
+
         return NVSDK_NGX_Result_Success;
     }
 
+    // --- Utility Functions ---
+
     void GetOptimalSettings(int width, int height, int quality, int* renderW, int* renderH) {
-        // Try to use NGX if initialized
         bool usedNGX = false;
-        if (m_Initialized && m_Parameters) {
+        if (m_lifecycle.isInitialized() && m_lifecycle.getParameters()) {
             unsigned int optW, optH, maxW, maxH, minW, minH;
             float sharpness;
             NVSDK_NGX_Result res = NGX_DLSS_GET_OPTIMAL_SETTINGS(
-                m_Parameters, width, height, MapQuality(quality),
+                m_lifecycle.getParameters(), width, height, mapQuality(quality),
                 &optW, &optH, &maxW, &maxH, &minW, &minH, &sharpness);
-            
+
             if (NVSDK_NGX_SUCCEED(res) && optW > 0 && optH > 0) {
-                *renderW = (int)optW;
-                *renderH = (int)optH;
+                *renderW = static_cast<int>(optW);
+                *renderH = static_cast<int>(optH);
                 usedNGX = true;
             }
         }
 
         if (!usedNGX) {
-            // Fallback to standard scaling
-            float scale = 0.5f; // Performance default
+            // Fallback scaling
+            float scale = 0.5f;
             switch (quality) {
-                case 0: scale = 1.0f; break;   // Native/DLAA
+                case 0: scale = 1.0f; break;        // DLAA
                 case 1: scale = 0.6666667f; break; // Quality
                 case 2: scale = 0.5833334f; break; // Balanced
                 case 3: scale = 0.5f; break;       // Performance
                 case 4: scale = 0.3333333f; break; // Ultra Performance
-                default: scale = 0.5f; break;
+                default: break;
             }
-            *renderW = (int)(width * scale);
-            *renderH = (int)(height * scale);
+            *renderW = static_cast<int>(width * scale);
+            *renderH = static_cast<int>(height * scale);
         }
     }
 
     bool IsDLSSDAvailable() {
-        if (!m_Initialized || !m_Parameters) return false;
-        int available = 0;
-        NVSDK_NGX_Parameter_GetI(m_Parameters, NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &available);
-        return (available != 0);
+        return m_lifecycle.isDLSSDAvailable();
     }
 
 private:
     DLSSBridge() = default;
-    ~DLSSBridge() { ShutdownNGX_Internal(); }
+    ~DLSSBridge() = default;
 
-    void ShutdownNGX_Internal() {
-        if (m_DLSSFeature) {
-            NVSDK_NGX_VULKAN_ReleaseFeature(m_DLSSFeature);
-            m_DLSSFeature = nullptr;
-        }
-        if (m_DLSSDFeature) {
-            NVSDK_NGX_VULKAN_ReleaseFeature(m_DLSSDFeature);
-            m_DLSSDFeature = nullptr;
-        }
-        if (m_Parameters) {
-            NVSDK_NGX_VULKAN_DestroyParameters(m_Parameters);
-            m_Parameters = nullptr;
-        }
-        if (m_Initialized && m_Device) {
-            NVSDK_NGX_VULKAN_Shutdown1(m_Device);
-            m_Initialized = false;
-            m_Instance = VK_NULL_HANDLE;
-            m_PhysicalDevice = VK_NULL_HANDLE;
-            m_Device = VK_NULL_HANDLE;
-        }
-    }
-
-    NVSDK_NGX_PerfQuality_Value MapQuality(int q) {
-    	switch (q) {
-    	case 0: return NVSDK_NGX_PerfQuality_Value_DLAA; // SDK: 5 (DLSS SR only - native AA)
-    	case 1: return NVSDK_NGX_PerfQuality_Value_MaxQuality; // SDK: 2
-    	case 2: return NVSDK_NGX_PerfQuality_Value_Balanced; // SDK: 1
-    	case 3: return NVSDK_NGX_PerfQuality_Value_MaxPerf; // SDK: 0
-    	case 4: return NVSDK_NGX_PerfQuality_Value_UltraPerformance; // SDK: 3
-    	default: return NVSDK_NGX_PerfQuality_Value_Balanced;
-    	}
-    }
-    
-    // Map quality for DLSSD (Ray Reconstruction)
-    // NOTE: DLSSD does NOT support DLAA mode (native resolution AA).
-    // DLAA is a DLSS Super Resolution feature only.
-    // For DLSSD at native resolution, use Balanced mode which works well for denoising.
-    NVSDK_NGX_PerfQuality_Value MapQualityDLSSD(int q) {
-    	switch (q) {
-    	case 0: return NVSDK_NGX_PerfQuality_Value_Balanced; // Native -> Balanced (DLAA not supported by DLSSD)
-    	case 1: return NVSDK_NGX_PerfQuality_Value_MaxQuality; // SDK: 2
-    	case 2: return NVSDK_NGX_PerfQuality_Value_Balanced; // SDK: 1
-    	case 3: return NVSDK_NGX_PerfQuality_Value_MaxPerf; // SDK: 0
-    	case 4: return NVSDK_NGX_PerfQuality_Value_UltraPerformance; // SDK: 3
-    	default: return NVSDK_NGX_PerfQuality_Value_Balanced;
-    	}
-    }
-
-    NVSDK_NGX_Result CreateDLSSFeature(VkCommandBuffer cmdBuffer) {
-    	Log("=== CreateDLSSFeature ===");
-    	
-    	// === DIMENSION VALIDATION ===
-    	// Validate dimensions before creating
-    	if (m_DLSSRenderWidth == 0 || m_DLSSRenderHeight == 0 || m_DLSSOutWidth == 0 || m_DLSSOutHeight == 0) {
-    		Log("ERROR: Invalid DLSS dimensions (0 detected). Aborting creation.");
-    		return NVSDK_NGX_Result_FAIL_InvalidParameter;
-    	}
-    
-    	// === DIMENSION ALIGNMENT CHECK ===
-    	// DLSS performs best with dimensions aligned to multiples of 8
-    	if (m_DLSSRenderWidth % DIMENSION_ALIGNMENT != 0 || m_DLSSRenderHeight % DIMENSION_ALIGNMENT != 0) {
-    		Log("WARNING: Render dimensions (" + std::to_string(m_DLSSRenderWidth) + "x" + std::to_string(m_DLSSRenderHeight) +
-    			") are not aligned to " + std::to_string(DIMENSION_ALIGNMENT) + ". This may cause visual artifacts.");
-    	}
-    	if (m_DLSSOutWidth % DIMENSION_ALIGNMENT != 0 || m_DLSSOutHeight % DIMENSION_ALIGNMENT != 0) {
-    		Log("WARNING: Output dimensions (" + std::to_string(m_DLSSOutWidth) + "x" + std::to_string(m_DLSSOutHeight) +
-    			") are not aligned to " + std::to_string(DIMENSION_ALIGNMENT) + ". This may cause visual artifacts.");
-    	}
-    
-    	NVSDK_NGX_DLSS_Create_Params createParams = {};
-    	createParams.Feature.InWidth = m_DLSSRenderWidth;
-    	createParams.Feature.InHeight = m_DLSSRenderHeight;
-    	createParams.Feature.InTargetWidth = m_DLSSOutWidth;
-    	createParams.Feature.InTargetHeight = m_DLSSOutHeight;
-    	createParams.Feature.InPerfQualityValue = m_DLSSQuality;
-    
-    	// === FEATURE FLAGS ===
-    	// FIX: Remove DepthInverted flag - OpenGL/Minecraft depth is NOT inverted
-    	// (0.0 = near, 1.0 = far)
-    	// Also remove MVLowRes - motion vectors are at native resolution
-    	// Keep IsHDR if input is HDR
-    	// IMPORTANT: DLSS requires IsHDR flag if the input format is floating point (R16F/R32F)
-    	createParams.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
-    		NVSDK_NGX_DLSS_Feature_Flags_DoSharpening;
-    
-    	std::string dimLog = "Creating DLSS Feature: In(" + std::to_string(m_DLSSRenderWidth) + "x" + std::to_string(m_DLSSRenderHeight) + ") Out(" + std::to_string(m_DLSSOutWidth) + "x" + std::to_string(m_DLSSOutHeight) + ")";
-    	Log(dimLog);
-    	std::cout << "[DLSS Bridge] " << dimLog << std::endl; // Ensure console output
-
-        // IMPORTANT: We must pass the correct AppId if we initialized with ProjectID.
-        // The SDK documentation suggests that for Init_with_ProjectID, feature creation might need specific handling or
-        // that the ProjectID is sufficient. However, bad00007 (NotInitialized) during CreateFeature often means
-        // the internal state of NGX doesn't match what CreateFeature expects (e.g. mismatched AppID/ProjectID context).
-        // 
-        // Since we used NVSDK_NGX_VULKAN_Init_with_ProjectID, we should verify if we need to pass the ProjectID structure
-        // to CreateFeature, but the standard API doesn't take it.
-        //
-        // Another common cause for bad00007 is calling CreateFeature on a thread/context where NGX wasn't initialized,
-        // OR if the initialization actually failed silently or was incomplete (e.g. missing feature permission).
-        
-        // Let's try to re-ensure initialization state or check parameters.
-        if (!m_Parameters) {
-             Log("CreateDLSSFeature: m_Parameters is null! This should not happen if Init succeeded.");
-             return NVSDK_NGX_Result_FAIL_NotInitialized;
-        }
-
-        NVSDK_NGX_Result res = NGX_VULKAN_CREATE_DLSS_EXT1(m_Device, cmdBuffer, 1, 1, &m_DLSSFeature, m_Parameters, &createParams);
-        if (NVSDK_NGX_FAILED(res)) {
-            Log("Failed to create DLSS Feature: " + std::string(getNGXErrorString(res)) + " Code: " + std::to_string(res));
-            return res;
-        }
-        Log("DLSS Feature Created Successfully.");
-        return NVSDK_NGX_Result_Success;
-    }
-
-    NVSDK_NGX_Result CreateDLSSDFeature(VkCommandBuffer cmdBuffer) {
-    	Log("=== CreateDLSSDFeature ===");
-    
-    	// === DIMENSION VALIDATION ===
-    	// Validate dimensions before creating
-    	if (m_DLSSDRenderWidth == 0 || m_DLSSDRenderHeight == 0 ||
-    		m_DLSSDOutWidth == 0 || m_DLSSDOutHeight == 0) {
-    		Log("ERROR: Invalid DLSSD dimensions (0 detected). Aborting creation.");
-    		return NVSDK_NGX_Result_FAIL_InvalidParameter;
-    	}
-    
-    	// === DIMENSION ALIGNMENT CHECK ===
-    	// DLSS performs best with dimensions aligned to multiples of 8
-    	// Check and warn if dimensions are not aligned
-    	if (m_DLSSDRenderWidth % DIMENSION_ALIGNMENT != 0 || m_DLSSDRenderHeight % DIMENSION_ALIGNMENT != 0) {
-    		Log("WARNING: Render dimensions (" + std::to_string(m_DLSSDRenderWidth) + "x" + std::to_string(m_DLSSDRenderHeight) +
-    			") are not aligned to " + std::to_string(DIMENSION_ALIGNMENT) + ". This may cause visual artifacts.");
-    	}
-    	if (m_DLSSDOutWidth % DIMENSION_ALIGNMENT != 0 || m_DLSSDOutHeight % DIMENSION_ALIGNMENT != 0) {
-    		Log("WARNING: Output dimensions (" + std::to_string(m_DLSSDOutWidth) + "x" + std::to_string(m_DLSSDOutHeight) +
-    			") are not aligned to " + std::to_string(DIMENSION_ALIGNMENT) + ". This may cause visual artifacts.");
-    	}
-    
-    	// Ensure dimensions are even (DLSS requirement)
-    	if (m_DLSSDRenderWidth % 2 != 0 || m_DLSSDRenderHeight % 2 != 0 ||
-    		m_DLSSDOutWidth % 2 != 0 || m_DLSSDOutHeight % 2 != 0) {
-    		Log("WARNING: Dimensions are not even. This may cause issues.");
-    	}
-    
-    	// === DIMENSION RATIO VALIDATION ===
-    	// DLSSD (Ray Reconstruction) is designed for DENOISING with UPSAMPLING.
-    	// When input dimensions equal output dimensions (native resolution), DLSSD may fail
-    	// because there's no upsampling needed. DLSSD does NOT have a DLAA-equivalent mode.
-    	//
-    	// WORKAROUND: If input equals output, we should use standard DLSS instead.
-    	if (m_DLSSDRenderWidth == m_DLSSDOutWidth && m_DLSSDRenderHeight == m_DLSSDOutHeight) {
-    		Log("WARNING: Input dimensions equal output dimensions (native resolution).");
-    		Log("DLSSD (Ray Reconstruction) is designed for denoising WITH upsampling.");
-    		Log("Native resolution mode is not supported by DLSSD - use standard DLSS instead.");
-    		Log("Returning FeatureNotSupported to trigger fallback to standard DLSS.");
-    		return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
-    	}
-    	
-    	// Warn if render dimensions are more than 2x output dimensions (unusual configuration)
-    	if (m_DLSSDRenderWidth > m_DLSSDOutWidth * 2 || m_DLSSDRenderHeight > m_DLSSDOutHeight * 2) {
-    		Log("WARNING: Render dimensions are more than 2x output dimensions. This is unusual and may cause issues.");
-    	}
-        
-        if (!m_Parameters) {
-            Log("ERROR: m_Parameters is NULL during DLSSD Creation!");
+    // Internal evaluation without lock (for DLSSD fallback)
+    NVSDK_NGX_Result EvaluateDLSS_Internal(
+        VkCommandBuffer cmdBuffer,
+        VkImageView color, VkImage colorImg, int colorFormat,
+        VkImageView depth, VkImage depthImg, int depthFormat,
+        VkImageView mv, VkImage mvImg, int mvFormat,
+        VkImageView output, VkImage outputImg, int outputFormat,
+        float jitterX, float jitterY
+    ) {
+        // This is called from within EvaluateDLSSD which already holds the lock
+        if (!m_lifecycle.isInitialized()) {
             return NVSDK_NGX_Result_FAIL_NotInitialized;
         }
-        
-        // Check DLSSD availability before creating
-        int rrAvailable = 0;
-        NVSDK_NGX_Parameter_GetI(m_Parameters, NVSDK_NGX_Parameter_SuperSamplingDenoising_Available, &rrAvailable);
-        if (!rrAvailable) {
-            Log("ERROR: Ray Reconstruction (DLSSD) is NOT available on this system!");
-            Log("Cannot create DLSSD feature. Falling back to standard DLSS may be required.");
-            return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
+
+        if (!m_dlssManager.getFeature()) {
+            return NVSDK_NGX_Result_FAIL_FeatureNotFound;
         }
-        
-        NVSDK_NGX_DLSSD_Create_Params createParams = {};
-        createParams.InWidth = m_DLSSDRenderWidth;
-        createParams.InHeight = m_DLSSDRenderHeight;
-        createParams.InTargetWidth = m_DLSSDOutWidth;
-        createParams.InTargetHeight = m_DLSSDOutHeight;
-        createParams.InDenoiseMode = m_DLSSDDenoiseMode;
-        createParams.InRoughnessMode = m_DLSSDRoughnessMode;
 
-        // Use depth type provided during initialization
-        // DEPTH_TYPE_LINEAR (0) = length(worldPos) from raytracer
-        // DEPTH_TYPE_HW (1) = hardware depth buffer
-        createParams.InUseHWDepth = m_DLSSDDepthType;
-        createParams.InPerfQualityValue = m_DLSSDQuality;
+        // Use DLSSD dimensions if DLSS dimensions are 0 (fallback case)
+        int renderW = m_dlssManager.getRenderWidth();
+        int renderH = m_dlssManager.getRenderHeight();
+        int outW = m_dlssManager.getOutputWidth();
+        int outH = m_dlssManager.getOutputHeight();
 
-        // CRITICAL: Feature flags for Ray Reconstruction
-        // - IsHDR: Required for floating-point input formats (R16F/R32F) which we use for HDR rendering
-        // - DoSharpening: Enable DLSS sharpening for better image quality
-        // - NOTE: Do NOT use MVLowRes since our motion vectors are at full render resolution
-        // - NOTE: Do NOT use DepthInverted since our depth is standard (0=near, 1=far for HW, or linear distance)
-        createParams.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
-        	NVSDK_NGX_DLSS_Feature_Flags_DoSharpening;
-        
-        // Output subrects disabled (we use full image)
-        createParams.InEnableOutputSubrects = false;
+        if (renderW == 0 || renderH == 0) {
+            renderW = m_dlssdManager.getRenderWidth();
+            renderH = m_dlssdManager.getRenderHeight();
+            outW = m_dlssdManager.getOutputWidth();
+            outH = m_dlssdManager.getOutputHeight();
+        }
 
-        Log("Creating DLSSD Feature:");
-        Log(" - Input Resolution: " + std::to_string(m_DLSSDRenderWidth) + "x" + std::to_string(m_DLSSDRenderHeight));
-        Log(" - Output Resolution: " + std::to_string(m_DLSSDOutWidth) + "x" + std::to_string(m_DLSSDOutHeight));
-        Log(" - DepthType: " + std::string(m_DLSSDDepthType == NVSDK_NGX_DLSS_Depth_Type_Linear ? "LINEAR (ray-traced)" : "HW (depth buffer)"));
-        Log(" - DenoiseMode: " + std::string(m_DLSSDDenoiseMode == NVSDK_NGX_DLSS_Denoise_Mode_DLUnified ? "DLUnified" : "Off"));
-        Log(" - RoughnessMode: " + std::string(m_DLSSDRoughnessMode == NVSDK_NGX_DLSS_Roughness_Mode_Packed ? "Packed (in normals.w)" : "Unpacked (separate texture)"));
-        Log(" - Quality: " + std::to_string((int)m_DLSSDQuality));
-        Log(" - Flags: 0x" + std::to_string(createParams.InFeatureCreateFlags) + " (IsHDR=1, DoSharpening=1)");
-        Log(" - InEnableOutputSubrects: " + std::string(createParams.InEnableOutputSubrects ? "true" : "false"));
-        Log(" - InUseHWDepth (raw): " + std::to_string((int)createParams.InUseHWDepth));
-        Log(" - InDenoiseMode (raw): " + std::to_string((int)createParams.InDenoiseMode));
-        Log(" - InRoughnessMode (raw): " + std::to_string((int)createParams.InRoughnessMode));
+        VkImageSubresourceRange subRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkImageSubresourceRange depthRange = {
+            VulkanHelpers::getAspectMask(static_cast<VkFormat>(depthFormat)), 0, 1, 0, 1
+        };
 
-        NVSDK_NGX_Result res = NGX_VULKAN_CREATE_DLSSD_EXT1(m_Device, cmdBuffer, 1, 1, &m_DLSSDFeature, m_Parameters, &createParams);
+        NVSDK_NGX_Resource_VK rColor = NVSDK_NGX_Create_ImageView_Resource_VK(
+            color, colorImg, subRange, static_cast<VkFormat>(colorFormat), renderW, renderH, false);
+        NVSDK_NGX_Resource_VK rDepth = NVSDK_NGX_Create_ImageView_Resource_VK(
+            depth, depthImg, depthRange, static_cast<VkFormat>(depthFormat), renderW, renderH, false);
+        NVSDK_NGX_Resource_VK rMV = NVSDK_NGX_Create_ImageView_Resource_VK(
+            mv, mvImg, subRange, static_cast<VkFormat>(mvFormat), renderW, renderH, false);
+        NVSDK_NGX_Resource_VK rOutput = NVSDK_NGX_Create_ImageView_Resource_VK(
+            output, outputImg, subRange, static_cast<VkFormat>(outputFormat), outW, outH, true);
+
+        NVSDK_NGX_VK_DLSS_Eval_Params evalParams = {};
+        evalParams.Feature.pInColor = &rColor;
+        evalParams.Feature.pInOutput = &rOutput;
+        evalParams.pInDepth = &rDepth;
+        evalParams.pInMotionVectors = &rMV;
+        evalParams.InJitterOffsetX = -jitterX;
+        evalParams.InJitterOffsetY = -jitterY;
+        evalParams.InRenderSubrectDimensions = {
+            static_cast<unsigned int>(renderW),
+            static_cast<unsigned int>(renderH)
+        };
+        evalParams.InMVScaleX = Constants::MV_SCALE_X;
+        evalParams.InMVScaleY = Constants::MV_SCALE_Y;
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, colorImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, mvImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, depthImg,
+            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VulkanHelpers::getAspectMask(static_cast<VkFormat>(depthFormat)));
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, outputImg,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, VK_ACCESS_SHADER_WRITE_BIT);
+
+        NVSDK_NGX_Result res = NGX_VULKAN_EVALUATE_DLSS_EXT(
+            cmdBuffer, m_dlssManager.getFeature(), m_lifecycle.getParameters(), &evalParams);
+
+        // Layout transitions (Restore)
+        VulkanHelpers::transitionImageLayout(cmdBuffer, colorImg,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, mvImg,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+
+        VulkanHelpers::transitionImageLayout(cmdBuffer, depthImg,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT, VulkanHelpers::getAspectMask(static_cast<VkFormat>(depthFormat)));
+
         if (NVSDK_NGX_FAILED(res)) {
-            Log("FAILED to create DLSSD Feature: " + std::string(getNGXErrorString(res)) + " (code: " + std::to_string(res) + ")");
-            Log("Attempting fallback to standard DLSS Super Resolution...");
-            
-            // FALLBACK: Try creating standard DLSS feature instead
-            // NOTE: Standard DLSS DOES support DoSharpening, so we can include it here
-            NVSDK_NGX_DLSS_Create_Params dlssParams = {};
-            dlssParams.Feature.InWidth = m_DLSSDRenderWidth;
-            dlssParams.Feature.InHeight = m_DLSSDRenderHeight;
-            dlssParams.Feature.InTargetWidth = m_DLSSDOutWidth;
-            dlssParams.Feature.InTargetHeight = m_DLSSDOutHeight;
-            dlssParams.Feature.InPerfQualityValue = m_DLSSDQuality;
-            dlssParams.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
-            	NVSDK_NGX_DLSS_Feature_Flags_DoSharpening;
-            
-            NVSDK_NGX_Result fallbackRes = NGX_VULKAN_CREATE_DLSS_EXT1(m_Device, cmdBuffer, 1, 1, &m_DLSSFeature, m_Parameters, &dlssParams);
-            if (NVSDK_NGX_SUCCEED(fallbackRes)) {
-                Log("FALLBACK SUCCESS: Created standard DLSS SR feature instead of DLSSD.");
-                Log("Note: Ray Reconstruction will not be available, but upscaling will work.");
-                m_DLSSDFeaturePending = false;  // Clear DLSSD pending flag
-                m_DLSSFeaturePending = false;   // DLSS feature is now active
-                return NVSDK_NGX_Result_Success;
-            } else {
-                Log("FALLBACK FAILED: Could not create standard DLSS either: " + std::string(getNGXErrorString(fallbackRes)));
-            }
-            return res;
+            DLSS_LOG_ERROR("EvaluateDLSS_Internal failed: " + std::to_string(res));
         }
-        Log("DLSSD Feature Created Successfully!");
-        return NVSDK_NGX_Result_Success;
+
+        return res;
     }
 
-    std::mutex m_Mutex;
-    bool m_Initialized = false;
-    VkInstance m_Instance = VK_NULL_HANDLE;
-    VkPhysicalDevice m_PhysicalDevice = VK_NULL_HANDLE;
-    VkDevice m_Device = VK_NULL_HANDLE;
-    NVSDK_NGX_Parameter* m_Parameters = nullptr;
-    std::string m_DLSSPath;
+    // Quality mapping functions
+    [[nodiscard]] static NVSDK_NGX_PerfQuality_Value mapQuality(int q) noexcept {
+        switch (q) {
+            case 0: return NVSDK_NGX_PerfQuality_Value_MaxPerf;        // Performance
+            case 1: return NVSDK_NGX_PerfQuality_Value_Balanced;      // Balanced
+            case 2: return NVSDK_NGX_PerfQuality_Value_MaxQuality;    // Quality
+            case 3: return NVSDK_NGX_PerfQuality_Value_UltraPerformance; // Ultra Performance
+            case 4: return NVSDK_NGX_PerfQuality_Value_UltraQuality; // Ultra Quality
+            case 5: return NVSDK_NGX_PerfQuality_Value_DLAA;          // DLAA
+            default: return NVSDK_NGX_PerfQuality_Value_Balanced;
+        }
+    }
 
-    // DLSS State
-    NVSDK_NGX_Handle* m_DLSSFeature = nullptr;
-    bool m_DLSSFeaturePending = false;
-    int m_DLSSCreationFailures = 0;
-    int m_DLSSRenderWidth = 0;
-    int m_DLSSRenderHeight = 0;
-    int m_DLSSOutWidth = 0;
-    int m_DLSSOutHeight = 0;
-    NVSDK_NGX_PerfQuality_Value m_DLSSQuality = NVSDK_NGX_PerfQuality_Value_Balanced;
+    [[nodiscard]] static NVSDK_NGX_PerfQuality_Value mapQualityDLSSD(int q) noexcept {
+        // DLSSD does not support DLAA mode
+        switch (q) {
+            case 0: return NVSDK_NGX_PerfQuality_Value_MaxPerf;
+            case 1: return NVSDK_NGX_PerfQuality_Value_Balanced;
+            case 2: return NVSDK_NGX_PerfQuality_Value_MaxQuality;
+            case 3: return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+            case 4: return NVSDK_NGX_PerfQuality_Value_UltraQuality;
+            case 5: return NVSDK_NGX_PerfQuality_Value_Balanced; // DLAA -> Balanced
+            default: return NVSDK_NGX_PerfQuality_Value_Balanced;
+        }
+    }
 
-    // DLSSD State
-    NVSDK_NGX_Handle* m_DLSSDFeature = nullptr;
-    bool m_DLSSDFeaturePending = false;
-    int m_DLSSDCreationFailures = 0;
-    int m_DLSSDRenderWidth = 0;
-    int m_DLSSDRenderHeight = 0;
-    int m_DLSSDOutWidth = 0;
-    int m_DLSSDOutHeight = 0;
-    NVSDK_NGX_DLSS_Denoise_Mode m_DLSSDDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
-    NVSDK_NGX_DLSS_Roughness_Mode m_DLSSDRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Packed;
-    // FIX: Default to Linear depth (raytraced output is linear depth)
-    NVSDK_NGX_DLSS_Depth_Type m_DLSSDDepthType = NVSDK_NGX_DLSS_Depth_Type_Linear;
-    NVSDK_NGX_PerfQuality_Value m_DLSSDQuality = NVSDK_NGX_PerfQuality_Value_Balanced;
+    std::mutex m_mutex;
+    NGXLifecycleManager m_lifecycle;
+    DLSSFeatureManager m_dlssManager;
+    DLSSDFeatureManager m_dlssdManager;
 };
 
-// --- C Interface ---
+// ============================================================================
+// C INTERFACE (JNA EXPORTS)
+// ============================================================================
 
 extern "C" {
 
-__declspec(dllexport) int initializeNGX(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, const char* dlssPath) {
-    return (int)DLSSBridge::Get().InitializeNGX(instance, physicalDevice, device, dlssPath);
+__declspec(dllexport) int initializeNGX(
+    VkInstance instance,
+    VkPhysicalDevice physicalDevice,
+    VkDevice device,
+    const char* dlssPath
+) {
+    return static_cast<int>(DLSSBridge::Get().InitializeNGX(instance, physicalDevice, device, dlssPath));
 }
 
-__declspec(dllexport) int initDLSS(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, int width, int height, int outWidth, int outHeight) {
-    if (NVSDK_NGX_FAILED(DLSSBridge::Get().InitializeNGX(instance, physicalDevice, device, nullptr))) return (int)NVSDK_NGX_Result_FAIL_NotInitialized;
-    
-    // Determine quality based on resolution ratio if not provided explicitly.
-    float ratio = (float)width / (float)outWidth;
+__declspec(dllexport) int initDLSS(
+    VkInstance instance,
+    VkPhysicalDevice physicalDevice,
+    VkDevice device,
+    int width,
+    int height,
+    int outWidth,
+    int outHeight
+) {
+    if (NVSDK_NGX_FAILED(DLSSBridge::Get().InitializeNGX(instance, physicalDevice, device, nullptr))) {
+        return static_cast<int>(NVSDK_NGX_Result_FAIL_NotInitialized);
+    }
+
+    // Determine quality based on resolution ratio
+    float ratio = static_cast<float>(width) / static_cast<float>(outWidth);
     NVSDK_NGX_PerfQuality_Value quality = NVSDK_NGX_PerfQuality_Value_Balanced;
+
     if (ratio > 0.99f) quality = NVSDK_NGX_PerfQuality_Value_DLAA;
     else if (ratio > 0.66f) quality = NVSDK_NGX_PerfQuality_Value_MaxQuality;
     else if (ratio > 0.58f) quality = NVSDK_NGX_PerfQuality_Value_Balanced;
     else if (ratio > 0.49f) quality = NVSDK_NGX_PerfQuality_Value_MaxPerf;
     else quality = NVSDK_NGX_PerfQuality_Value_UltraPerformance;
 
-    return (int)DLSSBridge::Get().InitDLSS(width, height, outWidth, outHeight, quality);
+    return static_cast<int>(DLSSBridge::Get().InitDLSS(width, height, outWidth, outHeight, quality));
 }
 
 __declspec(dllexport) void destroyDLSS(VkDevice device) {
     DLSSBridge::Get().DestroyDLSS();
 }
 
-__declspec(dllexport) int evaluateDLSS(VkCommandBuffer cmdBuffer, 
-    VkImageView colorImageView, VkImage colorImage, int colorFormat,
-    VkImageView depthImageView, VkImage depthImage, int depthFormat,
-    VkImageView mvImageView, VkImage mvImage, int mvFormat,
-    VkImageView outputImageView, VkImage outputImage, int outputFormat,
-    float jitterX, float jitterY) {
-    return (int)DLSSBridge::Get().EvaluateDLSS(cmdBuffer, 
+__declspec(dllexport) int evaluateDLSS(
+    VkCommandBuffer cmdBuffer,
+    VkImageView colorImageView,
+    VkImage colorImage,
+    int colorFormat,
+    VkImageView depthImageView,
+    VkImage depthImage,
+    int depthFormat,
+    VkImageView mvImageView,
+    VkImage mvImage,
+    int mvFormat,
+    VkImageView outputImageView,
+    VkImage outputImage,
+    int outputFormat,
+    float jitterX,
+    float jitterY
+) {
+    return static_cast<int>(DLSSBridge::Get().EvaluateDLSS(
+        cmdBuffer,
         colorImageView, colorImage, colorFormat,
         depthImageView, depthImage, depthFormat,
         mvImageView, mvImage, mvFormat,
         outputImageView, outputImage, outputFormat,
-        jitterX, jitterY);
+        jitterX, jitterY
+    ));
 }
 
 __declspec(dllexport) int initDLSSD(
-  VkInstance instance,
-  VkPhysicalDevice physicalDevice,
-  VkDevice device,
-  int width, int height,
-  int outWidth, int outHeight,
-  int denoiseMode,
-  int roughnessMode,
-  int depthType,
-  int perfQualityValue) {
+    VkInstance instance,
+    VkPhysicalDevice physicalDevice,
+    VkDevice device,
+    int width,
+    int height,
+    int outWidth,
+    int outHeight,
+    int denoiseMode,
+    int roughnessMode,
+    int depthType,
+    int perfQualityValue
+) {
     NVSDK_NGX_Result res = DLSSBridge::Get().InitializeNGX(instance, physicalDevice, device, nullptr);
-    if (NVSDK_NGX_FAILED(res)) return (int)res;
-    return (int)DLSSBridge::Get().InitDLSSD(width, height, outWidth, outHeight, denoiseMode, roughnessMode, depthType, perfQualityValue);
+    if (NVSDK_NGX_FAILED(res)) {
+        return static_cast<int>(res);
+    }
+    return static_cast<int>(DLSSBridge::Get().InitDLSSD(
+        width, height, outWidth, outHeight,
+        denoiseMode, roughnessMode, depthType, perfQualityValue
+    ));
 }
 
 __declspec(dllexport) void destroyDLSSD(VkDevice device) {
     DLSSBridge::Get().DestroyDLSSD();
 }
 
+__declspec(dllexport) void shutdownNGX() {
+    DLSSBridge::Get().ShutdownNGX();
+}
+
 __declspec(dllexport) int evaluateDLSSD(
     VkCommandBuffer cmdBuffer,
-    VkImageView colorImageView, VkImage colorImage, int colorFormat,
-    VkImageView depthImageView, VkImage depthImage, int depthFormat,
-    VkImageView mvImageView, VkImage mvImage, int mvFormat,
-    VkImageView diffuseAlbedoImageView, VkImage diffuseAlbedoImage, int diffuseAlbedoFormat,
-    VkImageView specularAlbedoImageView, VkImage specularAlbedoImage, int specularAlbedoFormat,
-    VkImageView normalsImageView, VkImage normalsImage, int normalsFormat,
-    VkImageView roughnessImageView, VkImage roughnessImage, int roughnessFormat,
-    VkImageView outputImageView, VkImage outputImage, int outputFormat,
-    float jitterX, float jitterY,
-    int reset, float frameTimeDeltaMs) {
-    return (int)DLSSBridge::Get().EvaluateDLSSD(cmdBuffer,
+    VkImageView colorImageView,
+    VkImage colorImage,
+    int colorFormat,
+    VkImageView depthImageView,
+    VkImage depthImage,
+    int depthFormat,
+    VkImageView mvImageView,
+    VkImage mvImage,
+    int mvFormat,
+    VkImageView diffuseAlbedoImageView,
+    VkImage diffuseAlbedoImage,
+    int diffuseAlbedoFormat,
+    VkImageView specularAlbedoImageView,
+    VkImage specularAlbedoImage,
+    int specularAlbedoFormat,
+    VkImageView normalsImageView,
+    VkImage normalsImage,
+    int normalsFormat,
+    VkImageView roughnessImageView,
+    VkImage roughnessImage,
+    int roughnessFormat,
+    VkImageView specularHitDepthImageView,
+    VkImage specularHitDepthImage,
+    int specularHitDepthFormat,
+    VkImageView outputImageView,
+    VkImage outputImage,
+    int outputFormat,
+    float jitterX,
+    float jitterY,
+    int reset,
+    float frameTimeDeltaMs,
+    float* worldToViewMatrix,
+    float* viewToClipMatrix
+) {
+    return static_cast<int>(DLSSBridge::Get().EvaluateDLSSD(
+        cmdBuffer,
         colorImageView, colorImage, colorFormat,
         depthImageView, depthImage, depthFormat,
         mvImageView, mvImage, mvFormat,
@@ -1205,8 +2216,11 @@ __declspec(dllexport) int evaluateDLSSD(
         specularAlbedoImageView, specularAlbedoImage, specularAlbedoFormat,
         normalsImageView, normalsImage, normalsFormat,
         roughnessImageView, roughnessImage, roughnessFormat,
+        specularHitDepthImageView, specularHitDepthImage, specularHitDepthFormat,
         outputImageView, outputImage, outputFormat,
-        jitterX, jitterY, reset, frameTimeDeltaMs);
+        jitterX, jitterY, reset, frameTimeDeltaMs,
+        worldToViewMatrix, viewToClipMatrix
+    ));
 }
 
 __declspec(dllexport) int isDLSSDAvailable() {
@@ -1214,97 +2228,180 @@ __declspec(dllexport) int isDLSSDAvailable() {
 }
 
 __declspec(dllexport) void getDLSSDRenderResolution(
-    int outWidth, int outHeight,
+    int outWidth,
+    int outHeight,
     int qualityPreset,
-    int* outRenderWidth, int* outRenderHeight) {
-    DLSSBridge::Get().GetOptimalSettings(outWidth, outHeight, qualityPreset, outRenderWidth, outRenderHeight);
+    int* outRenderWidth,
+    int* outRenderHeight
+) {
+    DLSSBridge::Get().GetOptimalSettings(outWidth, outHeight, qualityPreset,
+                                          outRenderWidth, outRenderHeight);
 }
 
-// Helper to tell NVIDIA where the DLLs are before starting
-// Updated to use consistent project ID with initialization
-NVSDK_NGX_FeatureDiscoveryInfo GetFeatureDiscoveryInfo() {
-    static const wchar_t* paths[] = { L"." };
-    static NVSDK_NGX_PathListInfo pathListInfo = { paths, 1 };
-    static NVSDK_NGX_FeatureCommonInfo featureInfo = {};
-    featureInfo.PathListInfo = pathListInfo;
+} // extern "C"
 
-    static NVSDK_NGX_FeatureDiscoveryInfo discoveryInfo = {};
+// Feature discovery info holder
+class FeatureDiscoveryInfoHolder {
+public:
+    std::wstring searchPath = VulkanHelpers::getNativeModuleDirectory();
+    const wchar_t* paths[1] = { searchPath.c_str() };
+    NVSDK_NGX_PathListInfo pathListInfo = { paths, 1 };
+    NVSDK_NGX_FeatureCommonInfo featureInfo = {};
+
+    FeatureDiscoveryInfoHolder() {
+        featureInfo.PathListInfo = pathListInfo;
+    }
+};
+
+static NVSDK_NGX_FeatureDiscoveryInfo GetFeatureDiscoveryInfo(NVSDK_NGX_Feature feature) {
+    static FeatureDiscoveryInfoHolder holder;
+    NVSDK_NGX_FeatureDiscoveryInfo discoveryInfo = {};
     discoveryInfo.SDKVersion = NVSDK_NGX_Version_API;
-    // Use RayReconstruction feature ID for DLSSD capability queries
-    discoveryInfo.FeatureID = NVSDK_NGX_Feature_RayReconstruction;
+    discoveryInfo.FeatureID = feature;
     discoveryInfo.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Project_Id;
     discoveryInfo.Identifier.v.ProjectDesc.EngineType = NVSDK_NGX_ENGINE_TYPE_CUSTOM;
-    discoveryInfo.Identifier.v.ProjectDesc.EngineVersion = "1.0.0";
-    // Use consistent project ID with initialization
-    discoveryInfo.Identifier.v.ProjectDesc.ProjectId = "vulkanite-raytracing-mod";
-    discoveryInfo.ApplicationDataPath = L".";
-    discoveryInfo.FeatureInfo = &featureInfo;
-
+    discoveryInfo.Identifier.v.ProjectDesc.EngineVersion = Constants::NGX_ENGINE_VERSION;
+    discoveryInfo.Identifier.v.ProjectDesc.ProjectId = Constants::NGX_PROJECT_ID;
+    discoveryInfo.ApplicationDataPath = holder.searchPath.c_str();
+    discoveryInfo.FeatureInfo = &holder.featureInfo;
     return discoveryInfo;
 }
 
-// Extended availability check with detailed info
-__declspec(dllexport) int getDLSSDAvailabilityInfo(int* needsDriverUpdate, int* minDriverMajor, int* minDriverMinor) {
+static void AddUniqueExtension(std::vector<std::string>& extensions, const char* extensionName) {
+    if (extensionName == nullptr || extensionName[0] == '\0') {
+        return;
+    }
+    if (std::find(extensions.begin(), extensions.end(), extensionName) == extensions.end()) {
+        extensions.emplace_back(extensionName);
+    }
+}
+
+std::string ErrorInfo::formatNGXResult(NVSDK_NGX_Result res) {
+    std::ostringstream oss;
+    oss << getNGXErrorString(res)
+        << " (dec=" << static_cast<int>(res)
+        << ", hex=0x" << std::hex << static_cast<uint32_t>(res) << ")";
+    return oss.str();
+}
+
+static std::vector<std::string> CollectInstanceExtensions() {
+    std::vector<std::string> extensions;
+    const std::pair<NVSDK_NGX_Feature, const char*> features[] = {
+        { NVSDK_NGX_Feature_RayReconstruction, "Ray Reconstruction" },
+        { NVSDK_NGX_Feature_SuperSampling, "DLSS Super Resolution" }
+    };
+
+    for (const auto& feature : features) {
+        uint32_t count = 0;
+        VkExtensionProperties* props = nullptr;
+        NVSDK_NGX_FeatureDiscoveryInfo featureInfo = GetFeatureDiscoveryInfo(feature.first);
+        NVSDK_NGX_Result res = NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(
+            &featureInfo, &count, &props);
+        if (NVSDK_NGX_FAILED(res)) {
+            DLSS_LOG_WARN(std::string("Instance extension query failed for ") +
+                         feature.second + ": " + ErrorInfo::formatNGXResult(res));
+            continue;
+        }
+        DLSS_LOG_INFO(std::string("NGX instance extensions for ") +
+                     feature.second + ": " + std::to_string(count));
+        for (uint32_t i = 0; i < count && props != nullptr; i++) {
+            AddUniqueExtension(extensions, props[i].extensionName);
+        }
+    }
+
+    return extensions;
+}
+
+static std::vector<std::string> CollectDeviceExtensions(VkInstance instance, VkPhysicalDevice physicalDevice) {
+    std::vector<std::string> extensions;
+    const std::pair<NVSDK_NGX_Feature, const char*> features[] = {
+        { NVSDK_NGX_Feature_RayReconstruction, "Ray Reconstruction" },
+        { NVSDK_NGX_Feature_SuperSampling, "DLSS Super Resolution" }
+    };
+
+    for (const auto& feature : features) {
+        uint32_t count = 0;
+        VkExtensionProperties* props = nullptr;
+        NVSDK_NGX_FeatureDiscoveryInfo featureInfo = GetFeatureDiscoveryInfo(feature.first);
+        NVSDK_NGX_Result res = NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(
+            instance, physicalDevice, &featureInfo, &count, &props);
+        if (NVSDK_NGX_FAILED(res)) {
+            DLSS_LOG_WARN(std::string("Device extension query failed for ") +
+                         feature.second + ": " + ErrorInfo::formatNGXResult(res));
+            continue;
+        }
+        DLSS_LOG_INFO(std::string("NGX device extensions for ") +
+                     feature.second + ": " + std::to_string(count));
+        for (uint32_t i = 0; i < count && props != nullptr; i++) {
+            AddUniqueExtension(extensions, props[i].extensionName);
+        }
+    }
+
+    return extensions;
+}
+
+static std::vector<std::string> g_instanceExtensionCache;
+static std::vector<std::string> g_deviceExtensionCache;
+
+extern "C" {
+
+__declspec(dllexport) int getDLSSDAvailabilityInfo(
+    int* needsDriverUpdate,
+    int* minDriverMajor,
+    int* minDriverMinor
+) {
     if (!DLSSBridge::Get().IsDLSSDAvailable()) {
         if (needsDriverUpdate) *needsDriverUpdate = 0;
         if (minDriverMajor) *minDriverMajor = 0;
         if (minDriverMinor) *minDriverMinor = 0;
-        return 0; // Not available
+        return 0;
     }
-    
-    // Get additional info from NGX parameters
-    NVSDK_NGX_Parameter* params = nullptr;
-    // Note: We can't easily access m_Parameters from here, so we return basic info
+
     if (needsDriverUpdate) *needsDriverUpdate = 0;
     if (minDriverMajor) *minDriverMajor = 0;
     if (minDriverMinor) *minDriverMinor = 0;
-    
-    return 1; // Available
+    return 1;
 }
 
-// Get detailed NGX error description
 __declspec(dllexport) const char* getNGXErrorDescription(int errorCode) {
-    return getNGXErrorString((NVSDK_NGX_Result)errorCode);
+    return ErrorInfo::getNGXErrorString(static_cast<NVSDK_NGX_Result>(errorCode));
 }
 
-__declspec(dllexport) uint32_t getNGXInstanceExtensionCount() { 
-    uint32_t count = 0; 
-    VkExtensionProperties* props = nullptr; 
-    NVSDK_NGX_FeatureDiscoveryInfo featureInfo = GetFeatureDiscoveryInfo(); 
-    if (NVSDK_NGX_SUCCEED(NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(&featureInfo, &count, &props))) { 
-        return count; 
-    } 
-    return 0; 
-} 
+__declspec(dllexport) uint32_t getNGXInstanceExtensionCount() {
+    g_instanceExtensionCache = CollectInstanceExtensions();
+    return static_cast<uint32_t>(g_instanceExtensionCache.size());
+}
 
-__declspec(dllexport) const char* getNGXInstanceExtension(uint32_t index) { 
-    uint32_t count = 0; 
-    VkExtensionProperties* props = nullptr; 
-    NVSDK_NGX_FeatureDiscoveryInfo featureInfo = GetFeatureDiscoveryInfo(); 
-    if (NVSDK_NGX_SUCCEED(NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(&featureInfo, &count, &props))) { 
-        if (index < count && props != nullptr) return props[index].extensionName; 
-    } 
-    return nullptr; 
-} 
+__declspec(dllexport) const char* getNGXInstanceExtension(uint32_t index) {
+    if (g_instanceExtensionCache.empty()) {
+        g_instanceExtensionCache = CollectInstanceExtensions();
+    }
+    if (index < g_instanceExtensionCache.size()) {
+        return g_instanceExtensionCache[index].c_str();
+    }
+    return nullptr;
+}
 
-__declspec(dllexport) uint32_t getNGXDeviceExtensionCount(VkInstance instance, VkPhysicalDevice physicalDevice) { 
-    uint32_t count = 0; 
-    VkExtensionProperties* props = nullptr; 
-    NVSDK_NGX_FeatureDiscoveryInfo featureInfo = GetFeatureDiscoveryInfo(); 
-    if (NVSDK_NGX_SUCCEED(NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(instance, physicalDevice, &featureInfo, &count, &props))) { 
-        return count; 
-    } 
-    return 0; 
-} 
+__declspec(dllexport) uint32_t getNGXDeviceExtensionCount(
+    VkInstance instance,
+    VkPhysicalDevice physicalDevice
+) {
+    g_deviceExtensionCache = CollectDeviceExtensions(instance, physicalDevice);
+    return static_cast<uint32_t>(g_deviceExtensionCache.size());
+}
 
-__declspec(dllexport) const char* getNGXDeviceExtension(VkInstance instance, VkPhysicalDevice physicalDevice, uint32_t index) { 
-    uint32_t count = 0; 
-    VkExtensionProperties* props = nullptr; 
-    NVSDK_NGX_FeatureDiscoveryInfo featureInfo = GetFeatureDiscoveryInfo(); 
-    if (NVSDK_NGX_SUCCEED(NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(instance, physicalDevice, &featureInfo, &count, &props))) { 
-        if (index < count && props != nullptr) return props[index].extensionName; 
-    } 
-    return nullptr; 
+__declspec(dllexport) const char* getNGXDeviceExtension(
+    VkInstance instance,
+    VkPhysicalDevice physicalDevice,
+    uint32_t index
+) {
+    if (g_deviceExtensionCache.empty()) {
+        g_deviceExtensionCache = CollectDeviceExtensions(instance, physicalDevice);
+    }
+    if (index < g_deviceExtensionCache.size()) {
+        return g_deviceExtensionCache[index].c_str();
+    }
+    return nullptr;
 }
 
 } // extern "C"

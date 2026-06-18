@@ -120,3 +120,32 @@ run/
 
 # Avoid ignoring Gradle wrapper jar file (.jar files are usually ignored)
 !gradle-wrapper.jar
+
+# Local assistant/tool state
+.kilocode/
+
+# Python shader preprocessing helpers
+__pycache__/
+*.py[cod]
+preprocessed_shaders/
+
+# Shader compiler output and scratch shader dumps
+*.spv
+*.clean
+*.preprocessed
+*.preprocessed.*
+
+# Native bridge build products
+*.dll
+*.exe
+*.lib
+*.exp
+*.pdb
+
+# Local investigation/output artifacts
+temp/
+temp_*.txt
+*_diff.txt
+compile_output.txt
+debug-game-launch-crash.md
+replay_pid*.log

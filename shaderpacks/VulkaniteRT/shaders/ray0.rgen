@@ -118,25 +118,79 @@ layout(push_constant) uniform PushConstants {
 #ifndef MIN_LIGHTING
 #define MIN_LIGHTING 0.05
 #endif
-// Blocklight visual range/intensity. These operate on the Minecraft lightmap
-// signal before DLSS so low local-light levels keep texture detail instead of
-// being reconstructed as muddy, underlit color.
-#ifndef BLOCKLIGHT_VISUAL_RANGE
-#define BLOCKLIGHT_VISUAL_RANGE 1.45
+#ifndef BAREBONES_GBUFFER_ALBEDO
+#define BAREBONES_GBUFFER_ALBEDO 1
 #endif
-#ifndef BLOCKLIGHT_VISUAL_INTENSITY
-#define BLOCKLIGHT_VISUAL_INTENSITY 8.0
+#ifndef SECTION_LIGHT_TABLE_ENABLE
+#define SECTION_LIGHT_TABLE_ENABLE 1
 #endif
-#ifndef BLOCKLIGHT_LOW_FLOOR
-#define BLOCKLIGHT_LOW_FLOOR 0.08
+#ifndef SECTION_LIGHT_PROBE_VOLUME_ENABLE
+#define SECTION_LIGHT_PROBE_VOLUME_ENABLE 1
+#endif
+#ifndef SECTION_LIGHT_PROBE_INTENSITY
+#define SECTION_LIGHT_PROBE_INTENSITY 2.0
+#endif
+#ifndef SECTION_LIGHT_PROBE_ISOTROPIC_FILL
+#define SECTION_LIGHT_PROBE_ISOTROPIC_FILL 0.0
+#endif
+#ifndef SECTION_LIGHT_PROBE_SURFACE_OFFSET
+#define SECTION_LIGHT_PROBE_SURFACE_OFFSET 0.0
+#endif
+#ifndef SECTION_LIGHT_PROBE_DEBUG_MODE
+#define SECTION_LIGHT_PROBE_DEBUG_MODE 0
+#endif
+#ifndef SECTION_LIGHT_PROBE_CONFIDENCE_FLOOR
+#define SECTION_LIGHT_PROBE_CONFIDENCE_FLOOR 0.0
+#endif
+#ifndef SECTION_LIGHT_SPARSE_RT_CORRECTION
+#define SECTION_LIGHT_SPARSE_RT_CORRECTION 1
+#endif
+#ifndef SECTION_LIGHT_SPARSE_RT_SAMPLES
+#define SECTION_LIGHT_SPARSE_RT_SAMPLES 1
+#endif
+#ifndef SECTION_LIGHT_SPARSE_RT_CONFIDENCE_THRESHOLD
+#define SECTION_LIGHT_SPARSE_RT_CONFIDENCE_THRESHOLD 0.45
+#endif
+#ifndef SECTION_LIGHT_SPARSE_RT_LEAK_LUMA
+#define SECTION_LIGHT_SPARSE_RT_LEAK_LUMA 0.035
+#endif
+#ifndef SECTION_LIGHT_TABLE_FALLBACK_ENABLE
+#define SECTION_LIGHT_TABLE_FALLBACK_ENABLE 0
+#endif
+#ifndef SECTION_LIGHT_PROBE_GRID_SIZE
+#define SECTION_LIGHT_PROBE_GRID_SIZE 8
+#endif
+#ifndef SECTION_LIGHT_PROBE_MAX_PAGES
+#define SECTION_LIGHT_PROBE_MAX_PAGES 1024
+#endif
+#ifndef SECTION_LIGHT_PROBE_HASH_PROBES
+#define SECTION_LIGHT_PROBE_HASH_PROBES 64
+#endif
+#ifndef SECTION_LIGHT_PROBE_TRILINEAR
+#define SECTION_LIGHT_PROBE_TRILINEAR 1
+#endif
+#define SECTION_LIGHT_PROBE_FACE_COUNT 6
+#define SECTION_LIGHT_PROBE_PACKED_VALUES_PER_RECORD 4
+#define SECTION_LIGHT_PROBE_FACE_VALUE_COUNT (SECTION_LIGHT_PROBE_GRID_SIZE * SECTION_LIGHT_PROBE_GRID_SIZE * SECTION_LIGHT_PROBE_GRID_SIZE * SECTION_LIGHT_PROBE_FACE_COUNT)
+#define SECTION_LIGHT_PROBE_RADIANCE_RECORDS_PER_PAGE ((SECTION_LIGHT_PROBE_FACE_VALUE_COUNT + SECTION_LIGHT_PROBE_PACKED_VALUES_PER_RECORD - 1) / SECTION_LIGHT_PROBE_PACKED_VALUES_PER_RECORD)
+#define SECTION_LIGHT_PROBE_CONFIDENCE_VALUES_PER_WORD 4
+#define SECTION_LIGHT_PROBE_CONFIDENCE_WORDS_PER_PAGE ((SECTION_LIGHT_PROBE_FACE_VALUE_COUNT + SECTION_LIGHT_PROBE_CONFIDENCE_VALUES_PER_WORD - 1) / SECTION_LIGHT_PROBE_CONFIDENCE_VALUES_PER_WORD)
+#define SECTION_LIGHT_PROBE_CONFIDENCE_RECORDS_PER_PAGE ((SECTION_LIGHT_PROBE_CONFIDENCE_WORDS_PER_PAGE + SECTION_LIGHT_PROBE_PACKED_VALUES_PER_RECORD - 1) / SECTION_LIGHT_PROBE_PACKED_VALUES_PER_RECORD)
+#define SECTION_LIGHT_PROBE_CONFIDENCE_RECORD_OFFSET SECTION_LIGHT_PROBE_RADIANCE_RECORDS_PER_PAGE
+#define SECTION_LIGHT_PROBE_RECORDS_PER_PAGE (SECTION_LIGHT_PROBE_RADIANCE_RECORDS_PER_PAGE + SECTION_LIGHT_PROBE_CONFIDENCE_RECORDS_PER_PAGE)
+#ifndef SECTION_LIGHT_SAMPLE_LIMIT
+#define SECTION_LIGHT_SAMPLE_LIMIT 96
 #endif
 // Soft shadow controls. A larger source radius makes the penumbra visible,
 // while the diffuse blend keeps contact shadows stable.
+#ifndef SUN_SHADOW_MODE
+#define SUN_SHADOW_MODE 1
+#endif
 #ifndef PENUMBRA_RADIUS
 #define PENUMBRA_RADIUS 0.034
 #endif
 #ifndef PENUMBRA_SAMPLES
-#define PENUMBRA_SAMPLES 8
+#define PENUMBRA_SAMPLES 1
 #endif
 #ifndef PENUMBRA_DIFFUSE_BLEND
 #define PENUMBRA_DIFFUSE_BLEND 0.75
@@ -160,6 +214,21 @@ layout(set = 1, binding = 0, std430) readonly buffer Quads {
 // DLSS Ray Reconstruction expects floating-point input when IsHDR flag is set
 layout(binding = 12, rgba16f) uniform image2D outputImage;
 layout(binding = 21, rgba16f) uniform image2D blocklightDetailImage;
+
+struct GpuSectionLight {
+    ivec4 posRadiusFlags;
+    uvec4 colorEmission;
+};
+
+layout(binding = 22, std430) readonly buffer SectionLightTableBuffer {
+    uvec4 sectionLightHeader; // x=light count, y=active sections, z=version
+    GpuSectionLight sectionLightRecords[];
+};
+
+layout(binding = 23, std430) readonly buffer SectionLightProbeBuffer {
+    ivec4 sectionLightProbeHeader; // x=active pages, y=slot limit, z=version, w=dirty pages at upload
+    ivec4 sectionLightProbeRecords[]; // directory records first, then RGB9E5 radiance and R8 confidence pages
+};
 
 #if ENABLE_DLSS_RR
 // DLSS Motion Vectors (RG16F) - pixel-space motion for temporal reprojection
@@ -272,8 +341,17 @@ float radicalInverse(uint bits) {
     return float(bitfieldReverse(bits)) * 2.3283064365386963e-10;
 }
 
-vec3 stratifiedCosineHemisphere(vec3 normal, int sampleIndex, uint seed) {
-    float u = (float(sampleIndex) + 0.5) / float(BLOCKLIGHT_SAMPLES);
+vec2 deterministicSunDiskOffset(uint pixelSeed, uint frameId, float radius) {
+    uint sampleSeed = hashUint(pixelSeed, frameId ^ 0xa511e9b3u);
+    float u = radicalInverse(sampleSeed);
+    float v = radicalInverse(hashUint(sampleSeed, 0x7f4a7c15u));
+    float r = radius * sqrt(clamp(u, 0.0, 1.0));
+    float theta = TWO_PI * v;
+    return r * vec2(cos(theta), sin(theta));
+}
+
+vec3 stratifiedCosineHemisphere(vec3 normal, int sampleIndex, int sampleCount, uint seed) {
+    float u = (float(sampleIndex) + 0.5) / max(float(sampleCount), 1.0);
     float rotation = float(seed & 0x00ffffffu) * (1.0 / 16777216.0);
     float v = fract(radicalInverse(uint(sampleIndex)) + rotation);
     float radius = sqrt(u);
@@ -347,16 +425,20 @@ vec4 integrateVolumetrics(
 
 vec3 sampleBlockLightRT(vec3 ro, vec3 normal, vec3 albedo, vec3 F0, 
                         float roughness, float metallic, vec3 viewDir, 
-                        float specularIntensity, inout uint seed) {
+                        float specularIntensity, int sampleCount, inout uint seed) {
     vec3 rayOrigin = ro + normal * 0.02;
     vec3 totalContrib = vec3(0.0);
+    int clampedSampleCount = clamp(sampleCount, 0, BLOCKLIGHT_SAMPLES);
     
     float NdotV = max(dot(normal, viewDir), 0.001);
     
     for (int i = 0; i < BLOCKLIGHT_SAMPLES; i++) {
+        if (i >= clampedSampleCount) {
+            break;
+        }
         // Keep local-light samples stable in world space. Frame-varying samples
         // made stationary emissive lighting crawl and forced RR to blur block edges.
-        vec3 sampleDir = stratifiedCosineHemisphere(normal, i, seed);
+        vec3 sampleDir = stratifiedCosineHemisphere(normal, i, clampedSampleCount, seed);
 
         rayQueryEXT query;
         rayQueryInitializeEXT(
@@ -461,8 +543,963 @@ vec3 sampleBlockLightRT(vec3 ro, vec3 normal, vec3 albedo, vec3 F0,
     }
     
 	// Return average contribution from all samples
-	return BLOCKLIGHT_SAMPLES > 0 ? max(vec3(0.0), totalContrib / float(BLOCKLIGHT_SAMPLES)) : vec3(0.0);
+	return clampedSampleCount > 0 ? max(vec3(0.0), totalContrib / float(clampedSampleCount)) : vec3(0.0);
 }
+
+vec3 sampleSectionLightTable(
+    vec3 worldPos,
+    vec3 normal,
+    vec3 diffuseAlbedo,
+    vec3 F0,
+    float roughness,
+    float metallic,
+    vec3 viewDir,
+    float specularIntensity
+) {
+#if SECTION_LIGHT_TABLE_ENABLE == 0
+    return vec3(0.0);
+#else
+    int count = int(min(sectionLightHeader.x, uint(SECTION_LIGHT_SAMPLE_LIMIT)));
+    vec3 total = vec3(0.0);
+
+    for (int i = 0; i < count; i++) {
+        GpuSectionLight light = sectionLightRecords[i];
+        float radius = max(float(light.posRadiusFlags.w & 0xFFFF), 1.0);
+        vec3 lightPos = vec3(light.posRadiusFlags.xyz) + vec3(0.5);
+        vec3 toLight = lightPos - worldPos;
+        float dist2 = dot(toLight, toLight);
+        float maxDistance = radius + 1.0;
+        if (dist2 <= 0.0001 || dist2 > maxDistance * maxDistance) {
+            continue;
+        }
+
+        float distance = sqrt(dist2);
+        vec3 lightDir = toLight / distance;
+        float attenuation = smoothstep(maxDistance, 0.0, distance);
+        attenuation *= attenuation;
+
+        vec3 lightColor = vec3(light.colorEmission.rgb) * (1.0 / 255.0);
+        float emission = clamp(float(light.colorEmission.a) / 15.0, 0.0, 1.0);
+        vec3 radiance = lightColor * emission * attenuation * BLOCKLIGHT_EMISSION_SCALE;
+
+        vec3 diffuseTerm;
+        vec3 specularTerm;
+        evaluatePBRSplit(
+            diffuseAlbedo,
+            normal,
+            viewDir,
+            lightDir,
+            radiance,
+            F0,
+            roughness,
+            metallic,
+            specularIntensity,
+            diffuseTerm,
+            specularTerm);
+        total += diffuseTerm + specularTerm;
+    }
+
+    return max(total, vec3(0.0));
+#endif
+}
+
+vec3 sectionLightProbeFaceDirection(int face) {
+    if (face == 0) {
+        return vec3(1.0, 0.0, 0.0);
+    }
+    if (face == 1) {
+        return vec3(-1.0, 0.0, 0.0);
+    }
+    if (face == 2) {
+        return vec3(0.0, 1.0, 0.0);
+    }
+    if (face == 3) {
+        return vec3(0.0, -1.0, 0.0);
+    }
+    if (face == 4) {
+        return vec3(0.0, 0.0, 1.0);
+    }
+    return vec3(0.0, 0.0, -1.0);
+}
+
+int findSectionLightProbeSlotByOrigin(ivec3 sectionOrigin) {
+    if (sectionLightProbeHeader.x <= 0) {
+        return -1;
+    }
+
+    ivec3 sectionCoord = sectionOrigin / 16;
+    uint hash = uint(sectionCoord.x) * 0x8da6b343u
+        ^ uint(sectionCoord.y) * 0xd8163841u
+        ^ uint(sectionCoord.z) * 0xcb1ab31fu;
+    hash ^= hash >> 16u;
+    hash *= 0x7feb352du;
+    hash ^= hash >> 15u;
+
+    uint directoryMask = uint(SECTION_LIGHT_PROBE_MAX_PAGES - 1);
+    int probeLimit = min(SECTION_LIGHT_PROBE_HASH_PROBES, SECTION_LIGHT_PROBE_MAX_PAGES);
+    for (int probe = 0; probe < probeLimit; probe++) {
+        int directoryIndex = int((hash + uint(probe)) & directoryMask);
+        ivec4 record = sectionLightProbeRecords[directoryIndex];
+        if (record.w == 0) {
+            return -1;
+        }
+        if (record.x == sectionOrigin.x && record.y == sectionOrigin.y && record.z == sectionOrigin.z) {
+            return int(uint(record.w) - 1u);
+        }
+    }
+
+    return -1;
+}
+
+int findSectionLightProbeSlot(vec3 worldPos, out ivec3 sectionOrigin) {
+    sectionOrigin = ivec3(floor(worldPos / 16.0)) * 16;
+    return findSectionLightProbeSlotByOrigin(sectionOrigin);
+}
+
+vec3 unpackSectionLightProbeRgb9E5(uint packed) {
+    if (packed == 0u) {
+        return vec3(0.0);
+    }
+    vec3 mantissa = vec3(
+        float(packed & 511u),
+        float((packed >> 9u) & 511u),
+        float((packed >> 18u) & 511u));
+    float scale = exp2(float((packed >> 27u) & 31u) - 24.0);
+    return mantissa * scale;
+}
+
+float unpackSectionLightProbeRawConfidence(uint packedConfidence) {
+    if (packedConfidence == 0u) {
+        return 0.0;
+    }
+    return float(packedConfidence) * (1.0 / 255.0);
+}
+
+float sectionLightProbeEffectiveConfidence(float rawConfidence) {
+    if (rawConfidence <= 0.0) {
+        return 0.0;
+    }
+    float floorValue = min(clamp(SECTION_LIGHT_PROBE_CONFIDENCE_FLOOR, 0.0, 1.0), 0.02);
+    return max(rawConfidence, floorValue);
+}
+
+float unpackSectionLightProbeConfidence(uint packedConfidence) {
+    return sectionLightProbeEffectiveConfidence(unpackSectionLightProbeRawConfidence(packedConfidence));
+}
+
+ivec4 readPackedSectionLightProbeRecord(int slot, int recordIndex) {
+    int dataRecordIndex = SECTION_LIGHT_PROBE_MAX_PAGES
+        + slot * SECTION_LIGHT_PROBE_RECORDS_PER_PAGE
+        + recordIndex;
+    return sectionLightProbeRecords[dataRecordIndex];
+}
+
+uint readPackedSectionLightProbeRecordComponent(int slot, int recordIndex, int component) {
+    ivec4 packedRecord = readPackedSectionLightProbeRecord(slot, recordIndex);
+
+    if (component == 0) {
+        return uint(packedRecord.x);
+    }
+    if (component == 1) {
+        return uint(packedRecord.y);
+    }
+    if (component == 2) {
+        return uint(packedRecord.z);
+    }
+    return uint(packedRecord.w);
+}
+
+uint readPackedSectionLightProbeFace(int slot, int faceValueIndex) {
+    int recordIndex = faceValueIndex / SECTION_LIGHT_PROBE_PACKED_VALUES_PER_RECORD;
+    int component = faceValueIndex - recordIndex * SECTION_LIGHT_PROBE_PACKED_VALUES_PER_RECORD;
+    return readPackedSectionLightProbeRecordComponent(slot, recordIndex, component);
+}
+
+uint readPackedSectionLightProbeConfidence(int slot, int faceValueIndex) {
+    int confidenceWordIndex = faceValueIndex / SECTION_LIGHT_PROBE_CONFIDENCE_VALUES_PER_WORD;
+    int recordIndex = SECTION_LIGHT_PROBE_CONFIDENCE_RECORD_OFFSET
+        + confidenceWordIndex / SECTION_LIGHT_PROBE_PACKED_VALUES_PER_RECORD;
+    int component = confidenceWordIndex - (confidenceWordIndex / SECTION_LIGHT_PROBE_PACKED_VALUES_PER_RECORD)
+        * SECTION_LIGHT_PROBE_PACKED_VALUES_PER_RECORD;
+    uint packedWord = readPackedSectionLightProbeRecordComponent(slot, recordIndex, component);
+    int byteShift = (faceValueIndex - confidenceWordIndex * SECTION_LIGHT_PROBE_CONFIDENCE_VALUES_PER_WORD) * 8;
+    return (packedWord >> uint(byteShift)) & 255u;
+}
+
+vec3 decodeSectionLightProbeFace(int slot, int faceValueIndex, uint packedRadiance) {
+    return unpackSectionLightProbeRgb9E5(packedRadiance)
+        * unpackSectionLightProbeConfidence(readPackedSectionLightProbeConfidence(slot, faceValueIndex));
+}
+
+float decodeSectionLightProbeRawFaceConfidence(int slot, int faceValueIndex) {
+    return unpackSectionLightProbeRawConfidence(readPackedSectionLightProbeConfidence(slot, faceValueIndex));
+}
+
+void sampleSectionLightProbeFacesAtCoord(
+    int slot,
+    ivec3 probeCoord,
+    out vec3 face0,
+    out vec3 face1,
+    out vec3 face2,
+    out vec3 face3,
+    out vec3 face4,
+    out vec3 face5
+) {
+    probeCoord = clamp(probeCoord, ivec3(0), ivec3(SECTION_LIGHT_PROBE_GRID_SIZE - 1));
+    int probeIndex = (probeCoord.z * SECTION_LIGHT_PROBE_GRID_SIZE + probeCoord.y)
+        * SECTION_LIGHT_PROBE_GRID_SIZE + probeCoord.x;
+    int firstRecordIndex = probeIndex + (probeIndex >> 1);
+    ivec4 record0 = readPackedSectionLightProbeRecord(slot, firstRecordIndex);
+    ivec4 record1 = readPackedSectionLightProbeRecord(slot, firstRecordIndex + 1);
+
+    if ((probeIndex & 1) == 0) {
+        int firstFaceValueIndex = probeIndex * SECTION_LIGHT_PROBE_FACE_COUNT;
+        face0 = decodeSectionLightProbeFace(slot, firstFaceValueIndex, uint(record0.x));
+        face1 = decodeSectionLightProbeFace(slot, firstFaceValueIndex + 1, uint(record0.y));
+        face2 = decodeSectionLightProbeFace(slot, firstFaceValueIndex + 2, uint(record0.z));
+        face3 = decodeSectionLightProbeFace(slot, firstFaceValueIndex + 3, uint(record0.w));
+        face4 = decodeSectionLightProbeFace(slot, firstFaceValueIndex + 4, uint(record1.x));
+        face5 = decodeSectionLightProbeFace(slot, firstFaceValueIndex + 5, uint(record1.y));
+        return;
+    }
+
+    int firstFaceValueIndex = probeIndex * SECTION_LIGHT_PROBE_FACE_COUNT;
+    face0 = decodeSectionLightProbeFace(slot, firstFaceValueIndex, uint(record0.z));
+    face1 = decodeSectionLightProbeFace(slot, firstFaceValueIndex + 1, uint(record0.w));
+    face2 = decodeSectionLightProbeFace(slot, firstFaceValueIndex + 2, uint(record1.x));
+    face3 = decodeSectionLightProbeFace(slot, firstFaceValueIndex + 3, uint(record1.y));
+    face4 = decodeSectionLightProbeFace(slot, firstFaceValueIndex + 4, uint(record1.z));
+    face5 = decodeSectionLightProbeFace(slot, firstFaceValueIndex + 5, uint(record1.w));
+}
+
+void sampleSectionLightProbeFacesNearest(
+    int slot,
+    vec3 probeCoord,
+    out vec3 face0,
+    out vec3 face1,
+    out vec3 face2,
+    out vec3 face3,
+    out vec3 face4,
+    out vec3 face5
+) {
+    sampleSectionLightProbeFacesAtCoord(
+        slot,
+        ivec3(floor(probeCoord + vec3(0.5))),
+        face0,
+        face1,
+        face2,
+        face3,
+        face4,
+        face5);
+}
+
+vec3 sectionLightProbeDiffuseResponse(vec3 diffuseAlbedo, vec3 F0, float metallic) {
+    vec3 dielectricDiffuse = max(vec3(0.0), vec3(1.0) - clamp(F0, vec3(0.0), vec3(1.0)));
+    return diffuseAlbedo * dielectricDiffuse * (1.0 - clamp(metallic, 0.0, 1.0));
+}
+
+void accumulateSectionLightProbeDirection(
+    inout vec3 incidentRadiance,
+    vec3 faceRadiance,
+    vec3 faceDirection,
+    vec3 normal
+) {
+    if (dot(faceRadiance, faceRadiance) <= 0.0000001) {
+        return;
+    }
+
+    float weight = max(dot(normal, faceDirection), 0.0);
+    if (weight <= 0.0001) {
+        return;
+    }
+    incidentRadiance += faceRadiance * weight;
+}
+
+void accumulateSectionLightProbeFace(
+    inout vec3 incidentRadiance,
+    int face,
+    vec3 faceRadiance,
+    vec3 normal
+) {
+    accumulateSectionLightProbeDirection(
+        incidentRadiance,
+        faceRadiance,
+        sectionLightProbeFaceDirection(face),
+        normal);
+}
+
+vec3 sectionLightProbeIncidentFromFaces(
+    vec3 face0,
+    vec3 face1,
+    vec3 face2,
+    vec3 face3,
+    vec3 face4,
+    vec3 face5,
+    vec3 normal
+) {
+    vec3 incidentRadiance = vec3(0.0);
+    accumulateSectionLightProbeDirection(
+        incidentRadiance, face0 * SECTION_LIGHT_PROBE_INTENSITY, vec3(1.0, 0.0, 0.0), normal);
+    accumulateSectionLightProbeDirection(
+        incidentRadiance, face1 * SECTION_LIGHT_PROBE_INTENSITY, vec3(-1.0, 0.0, 0.0), normal);
+    accumulateSectionLightProbeDirection(
+        incidentRadiance, face2 * SECTION_LIGHT_PROBE_INTENSITY, vec3(0.0, 1.0, 0.0), normal);
+    accumulateSectionLightProbeDirection(
+        incidentRadiance, face3 * SECTION_LIGHT_PROBE_INTENSITY, vec3(0.0, -1.0, 0.0), normal);
+    accumulateSectionLightProbeDirection(
+        incidentRadiance, face4 * SECTION_LIGHT_PROBE_INTENSITY, vec3(0.0, 0.0, 1.0), normal);
+    accumulateSectionLightProbeDirection(
+        incidentRadiance, face5 * SECTION_LIGHT_PROBE_INTENSITY, vec3(0.0, 0.0, -1.0), normal);
+    vec3 averageRadiance = (face0 + face1 + face2 + face3 + face4 + face5)
+        * (SECTION_LIGHT_PROBE_INTENSITY * (1.0 / float(SECTION_LIGHT_PROBE_FACE_COUNT)));
+    float isotropicFill = min(clamp(SECTION_LIGHT_PROBE_ISOTROPIC_FILL, 0.0, 1.0), 0.04);
+    incidentRadiance += averageRadiance * isotropicFill;
+    return incidentRadiance;
+}
+
+vec3 sampleSectionLightProbeIncidentAtCoord(int slot, ivec3 probeCoord, vec3 normal) {
+    vec3 face0;
+    vec3 face1;
+    vec3 face2;
+    vec3 face3;
+    vec3 face4;
+    vec3 face5;
+    sampleSectionLightProbeFacesAtCoord(slot, probeCoord, face0, face1, face2, face3, face4, face5);
+    return sectionLightProbeIncidentFromFaces(face0, face1, face2, face3, face4, face5, normal);
+}
+
+ivec3 sectionLightProbeWrappedOrigin(ivec3 sectionOrigin, inout ivec3 probeCoord) {
+    ivec3 sectionDelta = ivec3(0);
+    if (probeCoord.x < 0) {
+        probeCoord.x += SECTION_LIGHT_PROBE_GRID_SIZE;
+        sectionDelta.x = -1;
+    } else if (probeCoord.x >= SECTION_LIGHT_PROBE_GRID_SIZE) {
+        probeCoord.x -= SECTION_LIGHT_PROBE_GRID_SIZE;
+        sectionDelta.x = 1;
+    }
+    if (probeCoord.y < 0) {
+        probeCoord.y += SECTION_LIGHT_PROBE_GRID_SIZE;
+        sectionDelta.y = -1;
+    } else if (probeCoord.y >= SECTION_LIGHT_PROBE_GRID_SIZE) {
+        probeCoord.y -= SECTION_LIGHT_PROBE_GRID_SIZE;
+        sectionDelta.y = 1;
+    }
+    if (probeCoord.z < 0) {
+        probeCoord.z += SECTION_LIGHT_PROBE_GRID_SIZE;
+        sectionDelta.z = -1;
+    } else if (probeCoord.z >= SECTION_LIGHT_PROBE_GRID_SIZE) {
+        probeCoord.z -= SECTION_LIGHT_PROBE_GRID_SIZE;
+        sectionDelta.z = 1;
+    }
+    return sectionOrigin + sectionDelta * 16;
+}
+
+vec3 sampleSectionLightProbeIncidentAtSectionCoord(ivec3 sectionOrigin, ivec3 probeCoord, vec3 normal) {
+    ivec3 sampleCoord = probeCoord;
+    ivec3 sampleSectionOrigin = sectionLightProbeWrappedOrigin(sectionOrigin, sampleCoord);
+    int sampleSlot = findSectionLightProbeSlotByOrigin(sampleSectionOrigin);
+    if (sampleSlot < 0) {
+        return vec3(0.0);
+    }
+    return sampleSectionLightProbeIncidentAtCoord(sampleSlot, sampleCoord, normal);
+}
+
+void accumulateSectionLightProbeConfidenceDirection(
+    inout float confidence,
+    inout float weightSum,
+    float faceConfidence,
+    vec3 faceDirection,
+    vec3 normal
+) {
+    float weight = max(dot(normal, faceDirection), 0.0);
+    if (weight <= 0.0001) {
+        return;
+    }
+    confidence += faceConfidence * weight;
+    weightSum += weight;
+}
+
+float sectionLightProbeConfidenceFromFaces(
+    float face0,
+    float face1,
+    float face2,
+    float face3,
+    float face4,
+    float face5,
+    vec3 normal
+) {
+    float confidence = 0.0;
+    float weightSum = 0.0;
+    accumulateSectionLightProbeConfidenceDirection(
+        confidence, weightSum, face0, vec3(1.0, 0.0, 0.0), normal);
+    accumulateSectionLightProbeConfidenceDirection(
+        confidence, weightSum, face1, vec3(-1.0, 0.0, 0.0), normal);
+    accumulateSectionLightProbeConfidenceDirection(
+        confidence, weightSum, face2, vec3(0.0, 1.0, 0.0), normal);
+    accumulateSectionLightProbeConfidenceDirection(
+        confidence, weightSum, face3, vec3(0.0, -1.0, 0.0), normal);
+    accumulateSectionLightProbeConfidenceDirection(
+        confidence, weightSum, face4, vec3(0.0, 0.0, 1.0), normal);
+    accumulateSectionLightProbeConfidenceDirection(
+        confidence, weightSum, face5, vec3(0.0, 0.0, -1.0), normal);
+
+    float fill = min(clamp(SECTION_LIGHT_PROBE_ISOTROPIC_FILL, 0.0, 1.0), 0.04);
+    float averageConfidence = (face0 + face1 + face2 + face3 + face4 + face5)
+        * (1.0 / float(SECTION_LIGHT_PROBE_FACE_COUNT));
+    return clamp((confidence + averageConfidence * fill) / max(weightSum + fill, 0.0001), 0.0, 1.0);
+}
+
+float sampleSectionLightProbeFaceConfidenceNearest(int slot, ivec3 probeCoord, int face) {
+    probeCoord = clamp(probeCoord, ivec3(0), ivec3(SECTION_LIGHT_PROBE_GRID_SIZE - 1));
+    int probeIndex = (probeCoord.z * SECTION_LIGHT_PROBE_GRID_SIZE + probeCoord.y)
+        * SECTION_LIGHT_PROBE_GRID_SIZE + probeCoord.x;
+    int faceValueIndex = probeIndex * SECTION_LIGHT_PROBE_FACE_COUNT + face;
+    return decodeSectionLightProbeRawFaceConfidence(slot, faceValueIndex);
+}
+
+float sampleSectionLightProbeConfidenceAtCoord(int slot, ivec3 probeCoord, vec3 normal) {
+    probeCoord = clamp(probeCoord, ivec3(0), ivec3(SECTION_LIGHT_PROBE_GRID_SIZE - 1));
+    int probeIndex = (probeCoord.z * SECTION_LIGHT_PROBE_GRID_SIZE + probeCoord.y)
+        * SECTION_LIGHT_PROBE_GRID_SIZE + probeCoord.x;
+    int firstFaceValueIndex = probeIndex * SECTION_LIGHT_PROBE_FACE_COUNT;
+    return sectionLightProbeConfidenceFromFaces(
+        decodeSectionLightProbeRawFaceConfidence(slot, firstFaceValueIndex),
+        decodeSectionLightProbeRawFaceConfidence(slot, firstFaceValueIndex + 1),
+        decodeSectionLightProbeRawFaceConfidence(slot, firstFaceValueIndex + 2),
+        decodeSectionLightProbeRawFaceConfidence(slot, firstFaceValueIndex + 3),
+        decodeSectionLightProbeRawFaceConfidence(slot, firstFaceValueIndex + 4),
+        decodeSectionLightProbeRawFaceConfidence(slot, firstFaceValueIndex + 5),
+        normal);
+}
+
+float sampleSectionLightProbeConfidenceAtSectionCoord(ivec3 sectionOrigin, ivec3 probeCoord, vec3 normal) {
+    ivec3 sampleCoord = probeCoord;
+    ivec3 sampleSectionOrigin = sectionLightProbeWrappedOrigin(sectionOrigin, sampleCoord);
+    int sampleSlot = findSectionLightProbeSlotByOrigin(sampleSectionOrigin);
+    if (sampleSlot < 0) {
+        return 0.0;
+    }
+    return sampleSectionLightProbeConfidenceAtCoord(sampleSlot, sampleCoord, normal);
+}
+
+vec3 sampleSectionLightProbeFaceNearest(int slot, ivec3 probeCoord, int face) {
+    probeCoord = clamp(probeCoord, ivec3(0), ivec3(SECTION_LIGHT_PROBE_GRID_SIZE - 1));
+    int probeIndex = (probeCoord.z * SECTION_LIGHT_PROBE_GRID_SIZE + probeCoord.y)
+        * SECTION_LIGHT_PROBE_GRID_SIZE + probeCoord.x;
+    int faceValueIndex = probeIndex * SECTION_LIGHT_PROBE_FACE_COUNT + face;
+    return decodeSectionLightProbeFace(slot, faceValueIndex, readPackedSectionLightProbeFace(slot, faceValueIndex));
+}
+
+vec3 sampleSectionLightProbeFace(int slot, vec3 probeCoord, int face) {
+#if SECTION_LIGHT_PROBE_TRILINEAR == 0
+    return sampleSectionLightProbeFaceNearest(slot, ivec3(floor(probeCoord + vec3(0.5))), face);
+#else
+    vec3 clampedCoord = clamp(
+        probeCoord,
+        vec3(0.0),
+        vec3(float(SECTION_LIGHT_PROBE_GRID_SIZE - 1)));
+    ivec3 baseCoord = ivec3(floor(clampedCoord));
+    ivec3 nextCoord = min(baseCoord + ivec3(1), ivec3(SECTION_LIGHT_PROBE_GRID_SIZE - 1));
+    vec3 blend = clampedCoord - vec3(baseCoord);
+
+    vec3 c000 = sampleSectionLightProbeFaceNearest(slot, baseCoord, face);
+    vec3 c100 = sampleSectionLightProbeFaceNearest(slot, ivec3(nextCoord.x, baseCoord.y, baseCoord.z), face);
+    vec3 c010 = sampleSectionLightProbeFaceNearest(slot, ivec3(baseCoord.x, nextCoord.y, baseCoord.z), face);
+    vec3 c110 = sampleSectionLightProbeFaceNearest(slot, ivec3(nextCoord.x, nextCoord.y, baseCoord.z), face);
+    vec3 c001 = sampleSectionLightProbeFaceNearest(slot, ivec3(baseCoord.x, baseCoord.y, nextCoord.z), face);
+    vec3 c101 = sampleSectionLightProbeFaceNearest(slot, ivec3(nextCoord.x, baseCoord.y, nextCoord.z), face);
+    vec3 c011 = sampleSectionLightProbeFaceNearest(slot, ivec3(baseCoord.x, nextCoord.y, nextCoord.z), face);
+    vec3 c111 = sampleSectionLightProbeFaceNearest(slot, nextCoord, face);
+
+    vec3 cx00 = mix(c000, c100, blend.x);
+    vec3 cx10 = mix(c010, c110, blend.x);
+    vec3 cx01 = mix(c001, c101, blend.x);
+    vec3 cx11 = mix(c011, c111, blend.x);
+    vec3 cxy0 = mix(cx00, cx10, blend.y);
+    vec3 cxy1 = mix(cx01, cx11, blend.y);
+    return mix(cxy0, cxy1, blend.z);
+#endif
+}
+
+float sampleSectionLightProbeFaceConfidence(int slot, vec3 probeCoord, int face) {
+#if SECTION_LIGHT_PROBE_TRILINEAR == 0
+    return sampleSectionLightProbeFaceConfidenceNearest(slot, ivec3(floor(probeCoord + vec3(0.5))), face);
+#else
+    vec3 clampedCoord = clamp(
+        probeCoord,
+        vec3(0.0),
+        vec3(float(SECTION_LIGHT_PROBE_GRID_SIZE - 1)));
+    ivec3 baseCoord = ivec3(floor(clampedCoord));
+    ivec3 nextCoord = min(baseCoord + ivec3(1), ivec3(SECTION_LIGHT_PROBE_GRID_SIZE - 1));
+    vec3 blend = clampedCoord - vec3(baseCoord);
+
+    float c000 = sampleSectionLightProbeFaceConfidenceNearest(slot, baseCoord, face);
+    float c100 = sampleSectionLightProbeFaceConfidenceNearest(slot, ivec3(nextCoord.x, baseCoord.y, baseCoord.z), face);
+    float c010 = sampleSectionLightProbeFaceConfidenceNearest(slot, ivec3(baseCoord.x, nextCoord.y, baseCoord.z), face);
+    float c110 = sampleSectionLightProbeFaceConfidenceNearest(slot, ivec3(nextCoord.x, nextCoord.y, baseCoord.z), face);
+    float c001 = sampleSectionLightProbeFaceConfidenceNearest(slot, ivec3(baseCoord.x, baseCoord.y, nextCoord.z), face);
+    float c101 = sampleSectionLightProbeFaceConfidenceNearest(slot, ivec3(nextCoord.x, baseCoord.y, nextCoord.z), face);
+    float c011 = sampleSectionLightProbeFaceConfidenceNearest(slot, ivec3(baseCoord.x, nextCoord.y, nextCoord.z), face);
+    float c111 = sampleSectionLightProbeFaceConfidenceNearest(slot, nextCoord, face);
+
+    float cx00 = mix(c000, c100, blend.x);
+    float cx10 = mix(c010, c110, blend.x);
+    float cx01 = mix(c001, c101, blend.x);
+    float cx11 = mix(c011, c111, blend.x);
+    float cxy0 = mix(cx00, cx10, blend.y);
+    float cxy1 = mix(cx01, cx11, blend.y);
+    return mix(cxy0, cxy1, blend.z);
+#endif
+}
+
+float sampleSectionLightProbeConfidenceVolume(
+    vec3 worldPos,
+    vec3 normal
+) {
+#if SECTION_LIGHT_PROBE_VOLUME_ENABLE == 0
+    return 0.0;
+#else
+    ivec3 sectionOrigin = ivec3(floor(worldPos / 16.0)) * 16;
+    vec3 sectionLocal = clamp(worldPos - vec3(sectionOrigin), vec3(0.0), vec3(15.999));
+    vec3 probeCoord = sectionLocal * (float(SECTION_LIGHT_PROBE_GRID_SIZE) / 16.0) - vec3(0.5);
+
+#if SECTION_LIGHT_PROBE_TRILINEAR == 0
+    int slot = findSectionLightProbeSlotByOrigin(sectionOrigin);
+    if (slot < 0) {
+        return 0.0;
+    }
+    return sampleSectionLightProbeConfidenceAtCoord(
+        slot,
+        ivec3(floor(probeCoord + vec3(0.5))),
+        normal);
+#else
+    vec3 unclampedCoord = clamp(
+        probeCoord,
+        vec3(-1.0),
+        vec3(float(SECTION_LIGHT_PROBE_GRID_SIZE)));
+    ivec3 baseCoord = ivec3(floor(unclampedCoord));
+    ivec3 nextCoord = baseCoord + ivec3(1);
+    vec3 blend = unclampedCoord - vec3(baseCoord);
+
+    float c000 = sampleSectionLightProbeConfidenceAtSectionCoord(sectionOrigin, baseCoord, normal);
+    float c100 = sampleSectionLightProbeConfidenceAtSectionCoord(sectionOrigin, ivec3(nextCoord.x, baseCoord.y, baseCoord.z), normal);
+    float c010 = sampleSectionLightProbeConfidenceAtSectionCoord(sectionOrigin, ivec3(baseCoord.x, nextCoord.y, baseCoord.z), normal);
+    float c110 = sampleSectionLightProbeConfidenceAtSectionCoord(sectionOrigin, ivec3(nextCoord.x, nextCoord.y, baseCoord.z), normal);
+    float c001 = sampleSectionLightProbeConfidenceAtSectionCoord(sectionOrigin, ivec3(baseCoord.x, baseCoord.y, nextCoord.z), normal);
+    float c101 = sampleSectionLightProbeConfidenceAtSectionCoord(sectionOrigin, ivec3(nextCoord.x, baseCoord.y, nextCoord.z), normal);
+    float c011 = sampleSectionLightProbeConfidenceAtSectionCoord(sectionOrigin, ivec3(baseCoord.x, nextCoord.y, nextCoord.z), normal);
+    float c111 = sampleSectionLightProbeConfidenceAtSectionCoord(sectionOrigin, nextCoord, normal);
+
+    float cx00 = mix(c000, c100, blend.x);
+    float cx10 = mix(c010, c110, blend.x);
+    float cx01 = mix(c001, c101, blend.x);
+    float cx11 = mix(c011, c111, blend.x);
+    float cxy0 = mix(cx00, cx10, blend.y);
+    float cxy1 = mix(cx01, cx11, blend.y);
+    return clamp(mix(cxy0, cxy1, blend.z), 0.0, 1.0);
+#endif
+#endif
+}
+
+vec3 sampleSectionLightProbeIncidentVolume(
+    vec3 worldPos,
+    vec3 normal
+) {
+#if SECTION_LIGHT_PROBE_VOLUME_ENABLE == 0
+    return vec3(0.0);
+#else
+    ivec3 sectionOrigin = ivec3(floor(worldPos / 16.0)) * 16;
+    vec3 sectionLocal = clamp(worldPos - vec3(sectionOrigin), vec3(0.0), vec3(15.999));
+    vec3 probeCoord = sectionLocal * (float(SECTION_LIGHT_PROBE_GRID_SIZE) / 16.0) - vec3(0.5);
+    vec3 incidentRadiance = vec3(0.0);
+
+#if SECTION_LIGHT_PROBE_TRILINEAR == 0
+    int slot = findSectionLightProbeSlotByOrigin(sectionOrigin);
+    if (slot < 0) {
+        return vec3(0.0);
+    }
+    incidentRadiance = sampleSectionLightProbeIncidentAtCoord(
+        slot,
+        ivec3(floor(probeCoord + vec3(0.5))),
+        normal);
+#else
+    vec3 unclampedCoord = clamp(
+        probeCoord,
+        vec3(-1.0),
+        vec3(float(SECTION_LIGHT_PROBE_GRID_SIZE)));
+    ivec3 baseCoord = ivec3(floor(unclampedCoord));
+    ivec3 nextCoord = baseCoord + ivec3(1);
+    vec3 blend = unclampedCoord - vec3(baseCoord);
+
+    vec3 i000 = sampleSectionLightProbeIncidentAtSectionCoord(sectionOrigin, baseCoord, normal);
+    vec3 i100 = sampleSectionLightProbeIncidentAtSectionCoord(sectionOrigin, ivec3(nextCoord.x, baseCoord.y, baseCoord.z), normal);
+    vec3 i010 = sampleSectionLightProbeIncidentAtSectionCoord(sectionOrigin, ivec3(baseCoord.x, nextCoord.y, baseCoord.z), normal);
+    vec3 i110 = sampleSectionLightProbeIncidentAtSectionCoord(sectionOrigin, ivec3(nextCoord.x, nextCoord.y, baseCoord.z), normal);
+    vec3 i001 = sampleSectionLightProbeIncidentAtSectionCoord(sectionOrigin, ivec3(baseCoord.x, baseCoord.y, nextCoord.z), normal);
+    vec3 i101 = sampleSectionLightProbeIncidentAtSectionCoord(sectionOrigin, ivec3(nextCoord.x, baseCoord.y, nextCoord.z), normal);
+    vec3 i011 = sampleSectionLightProbeIncidentAtSectionCoord(sectionOrigin, ivec3(baseCoord.x, nextCoord.y, nextCoord.z), normal);
+    vec3 i111 = sampleSectionLightProbeIncidentAtSectionCoord(sectionOrigin, nextCoord, normal);
+
+    vec3 ix00 = mix(i000, i100, blend.x);
+    vec3 ix10 = mix(i010, i110, blend.x);
+    vec3 ix01 = mix(i001, i101, blend.x);
+    vec3 ix11 = mix(i011, i111, blend.x);
+    vec3 ixy0 = mix(ix00, ix10, blend.y);
+    vec3 ixy1 = mix(ix01, ix11, blend.y);
+    incidentRadiance = mix(ixy0, ixy1, blend.z);
+#endif
+
+    return max(incidentRadiance, vec3(0.0));
+#endif
+}
+
+vec3 sampleSectionLightProbeVolume(
+    vec3 worldPos,
+    vec3 normal,
+    vec3 diffuseAlbedo,
+    vec3 F0,
+    float metallic
+) {
+    vec3 incidentRadiance = sampleSectionLightProbeIncidentVolume(worldPos, normal);
+    vec3 diffuseResponse = sectionLightProbeDiffuseResponse(diffuseAlbedo, F0, metallic);
+    return max(incidentRadiance * diffuseResponse, vec3(0.0));
+}
+
+#if SECTION_LIGHT_PROBE_DEBUG_MODE != 0
+vec3 sectionLightProbeDebugMissingPage(vec3 worldPos) {
+    float checker = mod(floor(worldPos.x) + floor(worldPos.y) + floor(worldPos.z), 2.0);
+    return mix(vec3(0.08, 0.0, 0.12), vec3(1.0, 0.0, 0.85), checker);
+}
+
+vec3 sectionLightProbeDebugPageColor(ivec3 sectionOrigin, int slot) {
+    uint h = hashUint(
+        hashUint(uint(sectionOrigin.x) ^ 0x9e3779b9u, uint(sectionOrigin.y) ^ 0x85ebca6bu),
+        uint(sectionOrigin.z) ^ 0xc2b2ae35u);
+    vec3 color = vec3(
+        float(h & 255u),
+        float((h >> 8u) & 255u),
+        float((h >> 16u) & 255u)) * (1.0 / 255.0);
+    float slotShade = 0.68 + 0.32 * fract(float(slot) * 0.61803398875);
+    return mix(vec3(0.08, 0.18, 0.12), color, 0.78) * slotShade + vec3(0.04);
+}
+
+float sectionLightProbeDebugLattice(vec3 sectionLocal) {
+    vec3 probeCell = sectionLocal * (float(SECTION_LIGHT_PROBE_GRID_SIZE) / 16.0);
+    vec3 cellFrac = fract(probeCell);
+    vec3 edgeDist = min(cellFrac, vec3(1.0) - cellFrac);
+    float nearestEdge = min(edgeDist.x, min(edgeDist.y, edgeDist.z));
+    return 1.0 - smoothstep(0.025, 0.075, nearestEdge);
+}
+
+vec3 sectionLightProbeDebugFaceColor(int face) {
+    if (face == 0) {
+        return vec3(1.0, 0.08, 0.02);
+    }
+    if (face == 1) {
+        return vec3(0.0, 0.95, 1.0);
+    }
+    if (face == 2) {
+        return vec3(0.15, 1.0, 0.05);
+    }
+    if (face == 3) {
+        return vec3(1.0, 0.0, 0.9);
+    }
+    if (face == 4) {
+        return vec3(0.12, 0.25, 1.0);
+    }
+    return vec3(1.0, 0.82, 0.0);
+}
+
+vec3 sectionLightProbeDebugToneMap(vec3 radiance) {
+    return vec3(1.0) - exp(-max(radiance, vec3(0.0)) * 0.08);
+}
+
+float sectionLightProbeDebugLuma(vec3 radiance) {
+    return dot(max(radiance, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+}
+
+float sectionLightProbeDebugPeak(vec3 radiance) {
+    vec3 safeRadiance = max(radiance, vec3(0.0));
+    return max(max(safeRadiance.r, safeRadiance.g), safeRadiance.b);
+}
+
+vec3 sectionLightProbeDebugChroma(vec3 radiance, vec3 fallbackColor) {
+    vec3 safeRadiance = max(radiance, vec3(0.0));
+    float peak = sectionLightProbeDebugPeak(safeRadiance);
+    if (peak <= 0.0001) {
+        return fallbackColor;
+    }
+
+    return mix(fallbackColor, safeRadiance / peak, 0.94);
+}
+
+vec3 sectionLightProbeDebugRadianceColor(vec3 radiance, vec3 dominantRadiance) {
+    vec3 safeRadiance = max(radiance, vec3(0.0));
+    float peak = sectionLightProbeDebugPeak(safeRadiance);
+    if (peak < 0.003) {
+        return vec3(0.018, 0.022, 0.03);
+    }
+
+    // Use the strongest normal-facing face's source color for hue while
+    // compressing the summed weighted brightness enough to keep
+    // blue/red/green/yellow emitters readable instead of washing out toward
+    // white.
+    vec3 chroma = sectionLightProbeDebugChroma(
+        dominantRadiance,
+        sectionLightProbeDebugChroma(safeRadiance, vec3(1.0, 0.82, 0.52)));
+    float brightness = clamp((1.0 - exp(-peak * 0.16)) * 0.72 + 0.028, 0.04, 0.76);
+    return chroma * brightness;
+}
+
+vec3 sectionLightProbeDebugCategoryColor(vec3 categoryColor, float lattice) {
+    return clamp(
+        mix(categoryColor, vec3(0.92), clamp(lattice * 0.12, 0.0, 0.12)),
+        vec3(0.0),
+        vec3(1.0));
+}
+
+vec3 sectionLightDebugSourceMarker(vec3 worldPos, float lattice) {
+#if SECTION_LIGHT_TABLE_ENABLE == 0
+    return sectionLightProbeDebugCategoryColor(vec3(0.015, 0.018, 0.024), lattice);
+#else
+    int count = int(min(sectionLightHeader.x, uint(SECTION_LIGHT_SAMPLE_LIMIT)));
+    vec3 markerColor = vec3(0.012, 0.014, 0.02);
+    float markerStrength = 0.0;
+
+    for (int i = 0; i < count; i++) {
+        GpuSectionLight light = sectionLightRecords[i];
+        vec3 lightPos = vec3(light.posRadiusFlags.xyz) + vec3(0.5);
+        float distanceToLight = length(worldPos - lightPos);
+        float core = 1.0 - smoothstep(0.15, 0.85, distanceToLight);
+        float halo = (1.0 - smoothstep(0.85, 2.2, distanceToLight)) * 0.35;
+        float marker = max(core, halo);
+        if (marker <= 0.0) {
+            continue;
+        }
+
+        vec3 lightColor = vec3(light.colorEmission.rgb) * (1.0 / 255.0);
+        float emission = clamp(float(light.colorEmission.a) / 15.0, 0.0, 1.0);
+        markerColor = max(markerColor, lightColor * marker * (0.3 + 0.9 * emission));
+        markerStrength = max(markerStrength, marker);
+    }
+
+    vec3 crossAxis = abs(fract(worldPos + vec3(0.5)) - vec3(0.5));
+    float blockGrid = 1.0 - smoothstep(0.015, 0.055, min(crossAxis.x, min(crossAxis.y, crossAxis.z)));
+    vec3 sourceColor = mix(vec3(0.02, 0.025, 0.035), markerColor, clamp(markerStrength, 0.0, 1.0));
+    sourceColor += vec3(0.15, 0.18, 0.22) * blockGrid * 0.12;
+    return sectionLightProbeDebugCategoryColor(sourceColor, lattice);
+#endif
+}
+
+vec3 sectionLightProbeDebugCompare(
+    vec3 probeLighting,
+    vec3 tableLighting,
+    float lattice,
+    float blocklightRaw
+) {
+    float probeLuma = sectionLightProbeDebugLuma(probeLighting);
+    float tableLuma = sectionLightProbeDebugLuma(tableLighting);
+    float darkThreshold = 0.004;
+    float weakReferenceThreshold = 0.025;
+    float strongestLocal = max(probeLuma, tableLuma);
+    vec3 darkColor = vec3(0.018, 0.022, 0.03);
+    vec3 probeOnlyColor = vec3(1.0, 0.72, 0.0);
+    vec3 underLitColor = vec3(0.0, 0.78, 1.0);
+    vec3 overBrightColor = vec3(1.0, 0.04, 0.0);
+    vec3 matchedColor = vec3(0.08, 0.9, 0.22);
+
+    if (strongestLocal < darkThreshold) {
+        return mix(darkColor, vec3(0.11, 0.12, 0.13), lattice * 0.4);
+    }
+
+    float lightmapDark = 1.0 - smoothstep(0.035, 0.16, clamp(blocklightRaw, 0.0, 1.0));
+    float leakSuspicion = smoothstep(0.008, 0.05, probeLuma) * lightmapDark;
+    if (leakSuspicion > 0.06) {
+        vec3 leakColor = mix(vec3(0.55, 0.0, 0.0), overBrightColor, clamp(leakSuspicion * 1.35, 0.0, 1.0));
+        return sectionLightProbeDebugCategoryColor(leakColor, lattice);
+    }
+
+    float probeOnly = smoothstep(weakReferenceThreshold, weakReferenceThreshold * 10.0, probeLuma);
+    if (tableLuma < weakReferenceThreshold) {
+        return sectionLightProbeDebugCategoryColor(
+            mix(vec3(0.32, 0.22, 0.0), probeOnlyColor, probeOnly),
+            lattice);
+    }
+
+    float tableOnly = smoothstep(weakReferenceThreshold, weakReferenceThreshold * 10.0, tableLuma);
+    if (probeLuma < weakReferenceThreshold) {
+        return sectionLightProbeDebugCategoryColor(
+            mix(vec3(0.015, 0.07, 0.24), underLitColor, tableOnly),
+            lattice);
+    }
+
+    float signedLogRatio = log2((probeLuma + 0.0001) / (tableLuma + 0.0001));
+    float mismatch = smoothstep(0.22, 0.9, abs(signedLogRatio));
+    float relativeError = clamp(length(probeLighting - tableLighting)
+        / max(length(probeLighting) + length(tableLighting), 0.02), 0.0, 1.0);
+
+    vec3 matched = mix(vec3(0.025, 0.12, 0.045), matchedColor,
+        clamp(strongestLocal * 1.6, 0.0, 1.0));
+    vec3 underLit = mix(vec3(0.015, 0.07, 0.24), underLitColor,
+        relativeError);
+    vec3 overBright = mix(vec3(0.36, 0.0, 0.0), overBrightColor,
+        relativeError);
+    vec3 errorColor = signedLogRatio < 0.0 ? underLit : overBright;
+    vec3 compareColor = mix(matched, errorColor, mismatch);
+
+    return sectionLightProbeDebugCategoryColor(compareColor, lattice);
+}
+
+vec3 debugSectionLightProbeVolume(
+    vec3 worldPos,
+    vec3 normal,
+    vec3 diffuseAlbedo,
+    vec3 F0,
+    float roughness,
+    float metallic,
+    vec3 viewDir,
+    float specularIntensity,
+    float blocklightRaw
+) {
+    ivec3 sectionOrigin;
+    int slot = findSectionLightProbeSlot(worldPos, sectionOrigin);
+    if (slot < 0) {
+#if SECTION_LIGHT_PROBE_DEBUG_MODE == 7
+        return sectionLightDebugSourceMarker(worldPos, 0.0);
+#else
+        return sectionLightProbeDebugMissingPage(worldPos);
+#endif
+    }
+
+    vec3 sectionLocal = clamp(worldPos - vec3(sectionOrigin), vec3(0.0), vec3(15.999));
+    vec3 probeCoord = sectionLocal * (float(SECTION_LIGHT_PROBE_GRID_SIZE) / 16.0) - vec3(0.5);
+    float lattice = sectionLightProbeDebugLattice(sectionLocal);
+
+#if SECTION_LIGHT_PROBE_DEBUG_MODE == 1
+    vec3 pageColor = sectionLightProbeDebugPageColor(sectionOrigin, slot);
+    return mix(pageColor, vec3(0.88), lattice * 0.18);
+#elif SECTION_LIGHT_PROBE_DEBUG_MODE == 2
+    vec3 radiance = vec3(0.0);
+    vec3 dominantRadiance = vec3(0.0);
+    float dominantWeight = -1.0;
+    for (int face = 0; face < SECTION_LIGHT_PROBE_FACE_COUNT; face++) {
+        vec3 faceDir = sectionLightProbeFaceDirection(face);
+        float weight = max(dot(normal, faceDir), 0.0);
+        vec3 faceRadiance = sampleSectionLightProbeFace(slot, probeCoord, face)
+            * SECTION_LIGHT_PROBE_INTENSITY;
+        vec3 weightedFaceRadiance = faceRadiance * weight;
+        radiance += weightedFaceRadiance;
+        float faceWeight = sectionLightProbeDebugPeak(weightedFaceRadiance);
+        if (faceWeight > dominantWeight) {
+            dominantWeight = faceWeight;
+            dominantRadiance = faceRadiance;
+        }
+    }
+    return mix(sectionLightProbeDebugRadianceColor(radiance, dominantRadiance), vec3(0.9), lattice * 0.12);
+#elif SECTION_LIGHT_PROBE_DEBUG_MODE == 3
+    vec3 weightColor = vec3(0.0);
+    vec3 contributionColor = vec3(0.0);
+    float weightSum = 0.0;
+    float contributionSum = 0.0;
+
+    for (int face = 0; face < SECTION_LIGHT_PROBE_FACE_COUNT; face++) {
+        vec3 faceDir = sectionLightProbeFaceDirection(face);
+        float weight = max(dot(normal, faceDir), 0.0);
+        vec3 faceColor = sectionLightProbeDebugFaceColor(face);
+        vec3 radiance = sampleSectionLightProbeFace(slot, probeCoord, face)
+            * SECTION_LIGHT_PROBE_INTENSITY;
+        float luma = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
+
+        weightColor += faceColor * weight;
+        contributionColor += faceColor * weight * luma;
+        weightSum += weight;
+        contributionSum += weight * luma;
+    }
+
+    vec3 normalWeightColor = weightSum > 0.0001
+        ? weightColor / weightSum
+        : vec3(0.08);
+    vec3 contributionVis = contributionSum > 0.0001
+        ? sectionLightProbeDebugToneMap(contributionColor)
+        : normalWeightColor * 0.35;
+    return mix(normalWeightColor * 0.32, contributionVis, 0.78);
+#elif SECTION_LIGHT_PROBE_DEBUG_MODE == 4
+    // Binding 22 is an unoccluded, globally limited emitter reference, not
+    // ground truth. This view is a leak/under-lighting heuristic that helps
+    // find candidates for sparse RT validation.
+    vec3 debugDiffuseAlbedo = vec3(1.0);
+    vec3 debugF0 = vec3(0.0);
+    float debugRoughness = 1.0;
+    float debugMetallic = 0.0;
+    float debugSpecularIntensity = 0.0;
+    vec3 probeLighting = sampleSectionLightProbeVolume(
+        worldPos,
+        normal,
+        debugDiffuseAlbedo,
+        debugF0,
+        debugMetallic);
+    vec3 tableLighting = sampleSectionLightTable(
+        worldPos,
+        normal,
+        debugDiffuseAlbedo,
+        debugF0,
+        debugRoughness,
+        debugMetallic,
+        viewDir,
+        debugSpecularIntensity);
+    return sectionLightProbeDebugCompare(probeLighting, tableLighting, lattice, blocklightRaw);
+#elif SECTION_LIGHT_PROBE_DEBUG_MODE == 5
+    vec3 dominantRadiance = vec3(0.0);
+    int dominantFace = 0;
+    float dominantLuma = -1.0;
+    float normalAgreement = 0.0;
+
+    for (int face = 0; face < SECTION_LIGHT_PROBE_FACE_COUNT; face++) {
+        vec3 radiance = sampleSectionLightProbeFace(slot, probeCoord, face)
+            * SECTION_LIGHT_PROBE_INTENSITY;
+        float luma = sectionLightProbeDebugLuma(radiance);
+        if (luma > dominantLuma) {
+            dominantLuma = luma;
+            dominantRadiance = radiance;
+            dominantFace = face;
+            normalAgreement = max(dot(normal, sectionLightProbeFaceDirection(face)), 0.0);
+        }
+    }
+
+    vec3 faceColor = sectionLightProbeDebugFaceColor(dominantFace);
+    vec3 chroma = sectionLightProbeDebugChroma(dominantRadiance, faceColor);
+    float brightness = clamp((1.0 - exp(-max(dominantLuma, 0.0) * 0.24)) * 0.85 + 0.045, 0.045, 0.88);
+    vec3 storedFaceColor = chroma * brightness;
+    vec3 normalHint = mix(vec3(0.025, 0.03, 0.04), faceColor, 0.32 + 0.48 * normalAgreement);
+    return mix(normalHint, storedFaceColor, 0.72) + vec3(lattice * 0.035);
+#elif SECTION_LIGHT_PROBE_DEBUG_MODE == 6
+    float normalConfidence = sampleSectionLightProbeConfidenceVolume(worldPos, normal);
+    float strongestFaceConfidence = 0.0;
+    int strongestFace = 0;
+    for (int face = 0; face < SECTION_LIGHT_PROBE_FACE_COUNT; face++) {
+        float faceConfidence = sampleSectionLightProbeFaceConfidence(slot, probeCoord, face);
+        if (faceConfidence > strongestFaceConfidence) {
+            strongestFaceConfidence = faceConfidence;
+            strongestFace = face;
+        }
+    }
+
+    vec3 lowConfidence = vec3(0.55, 0.02, 0.0);
+    vec3 midConfidence = vec3(1.0, 0.62, 0.08);
+    vec3 highConfidence = vec3(0.04, 0.88, 0.26);
+    vec3 confidenceColor = normalConfidence < 0.5
+        ? mix(lowConfidence, midConfidence, smoothstep(0.0, 0.5, normalConfidence))
+        : mix(midConfidence, highConfidence, smoothstep(0.5, 1.0, normalConfidence));
+    vec3 faceHint = sectionLightProbeDebugFaceColor(strongestFace)
+        * (0.12 + 0.28 * strongestFaceConfidence);
+    return sectionLightProbeDebugCategoryColor(confidenceColor + faceHint, lattice);
+#elif SECTION_LIGHT_PROBE_DEBUG_MODE == 7
+    return sectionLightDebugSourceMarker(worldPos, lattice);
+#else
+    return vec3(1.0, 0.0, 1.0);
+#endif
+}
+#endif
 
 vec3 traceSimpleRadiance(
     vec3 rayOrigin,
@@ -716,10 +1753,10 @@ if (pc.debugMode == 1) {
   // So we always use the original UV for ray tracing
  vec2 rayP = originalP;
 
- // Corners from the UBO are unjittered; apply the current subpixel jitter at
- // ray generation, matching Radiance's pixelCenter += cameraJitter path.
- // Motion vectors remain unjittered below because NGX receives jitter separately.
- vec2 rayUv = rayP + (cam.jitterData.xy / launchSize);
+ // Corners from the UBO are unjittered; apply the current subpixel jitter once,
+ // matching Radiance's pixelCenter += cameraJitter path.
+ vec2 jitteredPixelCenter = vec2(originalPixelCoord) + vec2(0.5) + cam.jitterData.xy;
+ vec2 rayUv = jitteredPixelCenter / launchSize;
   
   vec3 target = mix(mix(corner0, corner2, rayUv.y), mix(corner1, corner3, rayUv.y), rayUv.x);
   vec3 direction = normalize((cam.viewInverse * vec4(target, 0.0)).xyz);
@@ -846,6 +1883,10 @@ if (pc.debugMode == 1) {
 
   vec4 color;
   vec2 motionVec = vec2(0.0);
+#if SECTION_LIGHT_PROBE_DEBUG_MODE != 0
+  vec3 sectionLightProbeDebugOutput = vec3(0.015, 0.02, 0.035);
+  bool sectionLightProbeDebugHasSurface = false;
+#endif
   if (!hit) {
 #if RESTIR_SUN_SHADOWS == 1
     clearSunShadowHistory(originalPixelCoord);
@@ -904,15 +1945,13 @@ if (pc.debugMode == 1) {
     vec3 diffuseAlbedo = albedo * diffuseOpacity;
 
     // --- Calculate motion vectors FIRST for ReSTIR temporal reuse ---
-    vec2 shadowHistoryPrevPixel = vec2(originalPixelCoord) + vec2(0.5);
+    vec2 shadowHistoryPrevPixel = jitteredPixelCenter;
     bool shadowHistoryHasPrev = false;
 
 #if ENABLE_DLSS_RR
-    // Motion vectors are declared non-jittered at NGX feature creation. Keep
-    // them purely geometric because current jitter is passed to NGX separately.
-    // Including it here makes stationary pixels report false motion every frame,
-    // which causes RR to smear bright local-light history into dark surfaces.
-    vec2 currentPixel = vec2(originalPixelCoord) + vec2(0.5);
+    // Match the jittered primary sample used for ray generation. NGX receives
+    // the same jitter at the evaluate boundary, with the sign converted there.
+    vec2 currentPixel = jitteredPixelCenter;
     vec2 currentUV = currentPixel / launchSize;
 
     // 2. Previous frame position via world-space reprojection.
@@ -984,6 +2023,7 @@ if (pc.debugMode == 1) {
     float stableLightRotation = float(cam.frameId & 3u) * 0.25;
 
     vec3 baseLightDir = lightDir;
+    float baseNdotL = max(dot(normal, baseLightDir), 0.0);
 
     // Build tangent/bitangent for sun disk jittering
     vec3 tangent, bitangent;
@@ -1068,30 +2108,55 @@ if (pc.debugMode == 1) {
     } else
 #endif
     {
-        // Non-ReSTIR fallback: multi-sample soft shadows with proper penumbra
-        // Use stratified sampling across the sun disk for smooth penumbra
         float sunRadius = PENUMBRA_RADIUS;
+#if SUN_SHADOW_MODE == 0
+        // Off/lightmap mode keeps direct sun unshadowed and avoids RT visibility.
+        finalShadow = baseNdotL > 0.0 ? 1.0 : 0.0;
+#elif SUN_SHADOW_MODE == 1
+        // Single deterministic sun-disk sample. DLSS/RR or later history passes
+        // can accumulate the frame-indexed sequence without stochastic shimmer.
+        if (baseNdotL > 0.0) {
+            uint pixelSeed = uint(originalPixelCoord.x + originalPixelCoord.y * int(launchSize.x));
+            vec2 diskOffset = deterministicSunDiskOffset(pixelSeed, cam.frameId, sunRadius);
+            vec3 jitteredLightDir = normalize(baseLightDir + tangent * diskOffset.x + bitangent * diskOffset.y);
+            finalShadow = alphaAwareVisibility(rayOrigin, jitteredLightDir, 10000.0);
+        }
+#elif SUN_SHADOW_MODE == 2
+        // Placeholder checkerboard mode: trace half the pixels each frame. A
+        // dedicated sun history/resolve pass should replace the untraced fallback.
+        bool tracePixel = ((originalPixelCoord.x + originalPixelCoord.y + int(cam.frameId & 1u)) & 1) == 0;
+        if (baseNdotL > 0.0) {
+            if (tracePixel) {
+                uint pixelSeed = uint(originalPixelCoord.x + originalPixelCoord.y * int(launchSize.x));
+                vec2 diskOffset = deterministicSunDiskOffset(pixelSeed, cam.frameId, sunRadius);
+                vec3 jitteredLightDir = normalize(baseLightDir + tangent * diskOffset.x + bitangent * diskOffset.y);
+                finalShadow = alphaAwareVisibility(rayOrigin, jitteredLightDir, 10000.0);
+            } else {
+                finalShadow = 1.0;
+            }
+        }
+#else
+        // High-quality fallback: multi-sample soft shadows with proper penumbra.
+        // Use stratified sampling across the sun disk for smooth penumbra.
         const int SHADOW_SAMPLES = PENUMBRA_SAMPLES;
         const int SHADOW_SAMPLE_PAIRS = (SHADOW_SAMPLES + 1) / 2;
         
         float shadowAccum = 0.0;
-        for (int s = 0; s < SHADOW_SAMPLES; s++) {
-            int pairIndex = s / 2;
-            float pairSide = (s & 1) == 0 ? 1.0 : -1.0;
-            float theta = float(pairIndex) * 2.39996323;
-            float r = sunRadius * sqrt((float(pairIndex) + 0.5) / float(SHADOW_SAMPLE_PAIRS));
-            vec2 diskOffset = pairSide * r * vec2(cos(theta), sin(theta));
-            
-            vec3 jitteredLightDir = normalize(baseLightDir + tangent * diskOffset.x + bitangent * diskOffset.y);
-            
-            float NdotL = max(dot(normal, jitteredLightDir), 0.0);
-            if (NdotL > 0.0) {
+        if (baseNdotL > 0.0) {
+            for (int s = 0; s < SHADOW_SAMPLES; s++) {
+                int pairIndex = s / 2;
+                float pairSide = (s & 1) == 0 ? 1.0 : -1.0;
+                float theta = float(pairIndex) * 2.39996323;
+                float r = sunRadius * sqrt((float(pairIndex) + 0.5) / float(SHADOW_SAMPLE_PAIRS));
+                vec2 diskOffset = pairSide * r * vec2(cos(theta), sin(theta));
+
+                vec3 jitteredLightDir = normalize(baseLightDir + tangent * diskOffset.x + bitangent * diskOffset.y);
                 shadowAccum += alphaAwareVisibility(rayOrigin, jitteredLightDir, 10000.0);
             }
-            
+
+            finalShadow = shadowAccum / float(SHADOW_SAMPLES);
         }
-        
-        finalShadow = shadowAccum / float(SHADOW_SAMPLES);
+#endif
 #if RESTIR_SUN_SHADOWS == 1
         finalShadow = resolveSunShadowHistory(
             originalPixelCoord,
@@ -1107,12 +2172,7 @@ if (pc.debugMode == 1) {
         lightDir = baseLightDir;
     }
 
-    float hardShadow = 0.0;
-    float baseNdotL = max(dot(normal, baseLightDir), 0.0);
-    if (baseNdotL > 0.0) {
-      hardShadow = alphaAwareVisibility(rayOrigin, baseLightDir, 10000.0);
-    }
-
+    float hardShadow = finalShadow;
     float diffuseShadow = mix(hardShadow, finalShadow, PENUMBRA_DIFFUSE_BLEND);
     float specularShadow = finalShadow;
 
@@ -1398,31 +2458,19 @@ if (refractiveSurface) {
     // Stronger ambient for more natural fill light (shadows shouldn't be pitch black)
     vec3 ambient = diffuseAlbedo * ambientColor * AMBIENT_FACTOR * (0.3 + 0.7 * ao);
 
-     // --- Blocklight ---
-// gExtraRaw.r = blocklight UV coordinate [0,1] from the Minecraft lightmap
-// Treat it as the authoritative local-light signal. Random hemisphere rays only
-// find an emitter when it happens to be the first surface hit, which made equal
-// light levels alternate between illuminated and dark pixels.
+    // --- Local block lighting ---
+// gExtraRaw.r remains the Minecraft blocklight value as a guide/debug signal,
+// but it is no longer a lighting source. Local lighting should come from the
+// explicit section-light table/probe cache, not from OpenGL's scalar lightmap.
 float blocklightRaw = clamp(gExtraRaw.r, 0.0, 1.0);
 
-// Preserve low Minecraft light levels instead of crushing them below visibility.
-float blocklightExtended = clamp(pow(blocklightRaw, 0.72) * BLOCKLIGHT_VISUAL_RANGE, 0.0, 1.0);
-float blocklightIntensity = blocklightRaw > 0.003
-    ? max(pow(blocklightExtended, 1.05), BLOCKLIGHT_LOW_FLOOR)
-    : 0.0;
-vec3 blocklightColor = vec3(BLOCKLIGHT_COLOR_R, BLOCKLIGHT_COLOR_G, BLOCKLIGHT_COLOR_B)
-    * blocklightIntensity * BLOCKLIGHT_VISUAL_INTENSITY;
-
-vec3 blocklightDiffuse = vec3(0.0);
-vec3 blocklightSpecular = vec3(0.0);
 vec3 blocklightRt = vec3(0.0);
-
-if (blocklightRaw > 0.003) {
-    // Approximate directional blocklight from G-buffer lightmap
-    // We don't know the exact light position, so use a stable normal/up estimate.
-    vec3 blocklightDir = normalize(normal * 0.8 + vec3(0.0, 0.4, 0.0));
-    evaluatePBRSplit(diffuseAlbedo, normal, viewDir, blocklightDir, blocklightColor, F0, roughness, metallic, SPECULAR_INTENSITY, blocklightDiffuse, blocklightSpecular);
-}
+vec3 sectionLightProbeIncident = vec3(0.0);
+vec3 sectionLightProbe = vec3(0.0);
+float sectionLightProbeConfidence = 0.0;
+vec3 sectionLightTable = vec3(0.0);
+vec3 sectionLightSparseRt = vec3(0.0);
+vec3 sectionLightDirectional = vec3(0.0);
 
 #if RT_BLOCKLIGHT_PROBES != 0 && BLOCKLIGHT_SAMPLES > 0
 uint blocklightRtSeed = hashUint(worldLightingSeed, 0x51ed270bu);
@@ -1435,13 +2483,77 @@ blocklightRt = sampleBlockLightRT(
     metallic,
     viewDir,
     SPECULAR_INTENSITY,
+    BLOCKLIGHT_SAMPLES,
     blocklightRtSeed);
 #endif
 
+float probeSurfaceOffset = min(max(SECTION_LIGHT_PROBE_SURFACE_OFFSET, 0.0), 0.08);
+vec3 sectionLightProbeSamplePos = shadingWorldPos + normal * probeSurfaceOffset;
+sectionLightProbeIncident = sampleSectionLightProbeIncidentVolume(sectionLightProbeSamplePos, normal);
+sectionLightProbe = max(sectionLightProbeIncident
+    * sectionLightProbeDiffuseResponse(diffuseAlbedo, F0, metallic), vec3(0.0));
+sectionLightProbeConfidence = sampleSectionLightProbeConfidenceVolume(sectionLightProbeSamplePos, normal);
+
+#if SECTION_LIGHT_SPARSE_RT_CORRECTION != 0 && SECTION_LIGHT_SPARSE_RT_SAMPLES > 0
+float sectionLightProbeLuma = dot(sectionLightProbe, vec3(0.2126, 0.7152, 0.0722));
+float probeConfidenceThreshold = clamp(SECTION_LIGHT_SPARSE_RT_CONFIDENCE_THRESHOLD, 0.0, 1.0);
+float probeConfidenceDeficit = 1.0 - smoothstep(
+    probeConfidenceThreshold * 0.55,
+    max(probeConfidenceThreshold, 0.0001),
+    sectionLightProbeConfidence);
+float darkBlocklightGuide = 1.0 - smoothstep(0.035, 0.16, blocklightRaw);
+bool sparseRtCorrectionCandidate =
+    sectionLightProbeLuma > SECTION_LIGHT_SPARSE_RT_LEAK_LUMA
+    && probeConfidenceDeficit > 0.0
+    && (darkBlocklightGuide > 0.45 || refractiveSurface || surfaceFresnelLuma > 0.12);
+
+if (sparseRtCorrectionCandidate) {
+    uint sparseBlocklightSeed = hashUint(worldLightingSeed, 0x8f4c2d31u);
+    sectionLightSparseRt = sampleBlockLightRT(
+        shadingWorldPos,
+        normal,
+        diffuseAlbedo,
+        F0,
+        roughness,
+        metallic,
+        viewDir,
+        SPECULAR_INTENSITY,
+        SECTION_LIGHT_SPARSE_RT_SAMPLES,
+        sparseBlocklightSeed);
+
+    float sparseRtLuma = dot(sectionLightSparseRt, vec3(0.2126, 0.7152, 0.0722));
+    float correctionBlend = clamp(
+        probeConfidenceDeficit * (0.35 + 0.65 * darkBlocklightGuide),
+        0.0,
+        0.82);
+    if (sparseRtLuma < sectionLightProbeLuma) {
+        float validatedRatio = clamp(sparseRtLuma / max(sectionLightProbeLuma, 0.0001), 0.0, 1.0);
+        sectionLightProbe *= mix(1.0, validatedRatio, correctionBlend);
+    }
+}
+#endif
+
+#if SECTION_LIGHT_TABLE_FALLBACK_ENABLE != 0
+if (dot(abs(sectionLightProbeIncident), vec3(1.0)) <= 0.0001) {
+    sectionLightTable = sampleSectionLightTable(
+        shadingWorldPos,
+        normal,
+        diffuseAlbedo,
+        F0,
+        roughness,
+        metallic,
+        viewDir,
+        SPECULAR_INTENSITY);
+}
+#endif
+
+sectionLightDirectional = sectionLightProbe + sectionLightTable;
+
 imageStore(blocklightDetailImage, screenCoord,
     vec4(
-        blocklightDiffuse + blocklightSpecular + blocklightRt + directEmission,
-        max(max(blocklightRaw, clamp(length(blocklightRt) / EMISSIVE_SURFACE_INTENSITY, 0.0, 1.0)),
+        blocklightRt + sectionLightDirectional + directEmission,
+        max(max(clamp(length(sectionLightDirectional) / max(SECTION_LIGHT_PROBE_INTENSITY, 0.001), 0.0, 1.0),
+                clamp(length(blocklightRt) / EMISSIVE_SURFACE_INTENSITY, 0.0, 1.0)),
             clamp(length(directEmission) / EMISSIVE_SURFACE_INTENSITY, 0.0, 1.0))));
 
     // --- Minimum lighting floor (prevents pitch black shadows) ---
@@ -1449,12 +2561,12 @@ imageStore(blocklightDetailImage, screenCoord,
    
     // --- Final Compositing ---
     vec3 finalLighting = directEmission
-    	+ directSunLighting
-    	+ indirectContrib * diffuseAlbedo
-    	+ ambient
-    	+ blocklightDiffuse + blocklightSpecular + blocklightRt
-    	+ specularEnvContrib // Environment reflections for metals
-    	+ minLight;
+        + directSunLighting
+        + indirectContrib * diffuseAlbedo
+        + ambient
+        + blocklightRt + sectionLightDirectional
+        + specularEnvContrib // Environment reflections for metals
+        + minLight;
 
     vec4 volume = integrateVolumetrics(
         origin,
@@ -1475,6 +2587,19 @@ imageStore(blocklightDetailImage, screenCoord,
 #endif
 
     color = vec4(finalLighting, 1.0);
+#if SECTION_LIGHT_PROBE_DEBUG_MODE != 0
+    sectionLightProbeDebugOutput = debugSectionLightProbeVolume(
+        sectionLightProbeSamplePos,
+        normal,
+        diffuseAlbedo,
+        F0,
+        roughness,
+        metallic,
+        viewDir,
+        SPECULAR_INTENSITY,
+        blocklightRaw);
+    sectionLightProbeDebugHasSurface = true;
+#endif
   }
 
   if (pc.debugMode == 1) {
@@ -1608,6 +2733,12 @@ imageStore(blocklightDetailImage, screenCoord,
 	}
 }
   // When debug mode is off, we just output the computed color
-  
+
+#if SECTION_LIGHT_PROBE_DEBUG_MODE != 0
+  color = vec4(sectionLightProbeDebugHasSurface
+      ? sectionLightProbeDebugOutput
+      : vec3(0.015, 0.02, 0.035), 1.0);
+#endif
+
   imageStore(outputImage, screenCoord, color);
   }

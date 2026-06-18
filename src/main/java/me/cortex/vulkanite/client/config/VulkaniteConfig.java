@@ -14,16 +14,28 @@ import java.util.Properties;
  */
 public class VulkaniteConfig {
     private static final String CONFIG_FILE_NAME = "vulkanite.properties";
+    private static final boolean DEFAULT_RTX_ENTITY_CAPTURE_ENABLED = true;
+    private static final boolean DEFAULT_RTX_PARTICLE_CAPTURE_ENABLED = false;
+    private static final int DEFAULT_RTX_ENTITY_CAPTURE_INTERVAL = 6;
+    private static final int DEFAULT_RTX_MAX_CAPTURED_ENTITIES = 32;
+    private static final int DEFAULT_RTX_MAX_CAPTURED_PARTICLES = 128;
+    private static final int DEFAULT_RTX_ENTITY_CAPTURE_RADIUS = 48;
+    private static final int DEFAULT_RTX_ENTITY_BLAS_CACHE_SIZE = 128;
+    private static final int MIN_RTX_ENTITY_CAPTURE_INTERVAL = 1;
+    private static final int MAX_RTX_ENTITY_CAPTURE_INTERVAL = 20;
+    private static final int MIN_RTX_MAX_CAPTURED_ENTITIES = 1;
+    private static final int MAX_RTX_MAX_CAPTURED_ENTITIES = 512;
+    private static final int MIN_RTX_MAX_CAPTURED_PARTICLES = 1;
+    private static final int MAX_RTX_MAX_CAPTURED_PARTICLES = 4096;
+    private static final int MIN_RTX_ENTITY_CAPTURE_RADIUS = 8;
+    private static final int MAX_RTX_ENTITY_CAPTURE_RADIUS = 256;
+    private static final int MIN_RTX_ENTITY_BLAS_CACHE_SIZE = 32;
+    private static final int MAX_RTX_ENTITY_BLAS_CACHE_SIZE = 2048;
 
     // ReSTIR/DIRT RT settings
     public boolean enableDirtRt = false;
     public int restirReservoirWidth = 1280;
     public int restirReservoirHeight = 720;
-
-    // Legacy deferred rendering preference.
-    // Kept for config compatibility, but the active shaderpack/override now decides
-    // whether the deferred baseline is selected.
-    public boolean deferredRenderingEnabled = false;
 
     // Optional Vulkan compute enhancement for the deferred baseline.
     // The first-party VulkaniteDeferred shaderpack must still render correctly when
@@ -40,13 +52,14 @@ public class VulkaniteConfig {
     // If false, forces ray tracing even if VulkaniteDeferred is detected
     public Boolean deferredRenderingOverride = null;
 
-    // Other settings can be added here
-    public boolean rtxEntityCaptureEnabled = true;
-    public boolean rtxParticleCaptureEnabled = true;
-    public int rtxEntityCaptureInterval = 2;
-    public int rtxMaxCapturedEntities = 96;
-    public int rtxMaxCapturedParticles = 384;
-    public int rtxEntityBlasCacheSize = 384;
+    // RTX transient capture settings.
+    public boolean rtxEntityCaptureEnabled = DEFAULT_RTX_ENTITY_CAPTURE_ENABLED;
+    public boolean rtxParticleCaptureEnabled = DEFAULT_RTX_PARTICLE_CAPTURE_ENABLED;
+    public int rtxEntityCaptureInterval = DEFAULT_RTX_ENTITY_CAPTURE_INTERVAL;
+    public int rtxMaxCapturedEntities = DEFAULT_RTX_MAX_CAPTURED_ENTITIES;
+    public int rtxMaxCapturedParticles = DEFAULT_RTX_MAX_CAPTURED_PARTICLES;
+    public int rtxEntityCaptureRadius = DEFAULT_RTX_ENTITY_CAPTURE_RADIUS;
+    public int rtxEntityBlasCacheSize = DEFAULT_RTX_ENTITY_BLAS_CACHE_SIZE;
 
     private static VulkaniteConfig INSTANCE;
 
@@ -74,24 +87,31 @@ public class VulkaniteConfig {
             restirReservoirWidth = Integer.parseInt(props.getProperty("restirReservoirWidth", "1920"));
             restirReservoirHeight = Integer.parseInt(props.getProperty("restirReservoirHeight", "1080"));
             
-            // Deferred rendering settings
-            deferredRenderingEnabled = Boolean.parseBoolean(props.getProperty("deferredRenderingEnabled", "false"));
             deferredComputeEnabled = Boolean.parseBoolean(props.getProperty("deferredComputeEnabled", "false"));
             deferredComputeExperimental = Boolean.parseBoolean(props.getProperty("deferredComputeExperimental", "false"));
             String overrideValue = props.getProperty("deferredRenderingOverride");
             if (overrideValue != null && !overrideValue.isEmpty()) {
                 deferredRenderingOverride = Boolean.parseBoolean(overrideValue);
             }
-            rtxEntityCaptureEnabled = Boolean.parseBoolean(props.getProperty("rtxEntityCaptureEnabled", "true"));
-            rtxParticleCaptureEnabled = Boolean.parseBoolean(props.getProperty("rtxParticleCaptureEnabled", "true"));
-            rtxEntityCaptureInterval = parsePositiveInt(
-                    props.getProperty("rtxEntityCaptureInterval", "2"), 2, 1, 20);
-            rtxMaxCapturedEntities = parsePositiveInt(
-                    props.getProperty("rtxMaxCapturedEntities", "96"), 96, 1, 512);
-            rtxMaxCapturedParticles = parsePositiveInt(
-                    props.getProperty("rtxMaxCapturedParticles", "384"), 384, 1, 4096);
-            rtxEntityBlasCacheSize = parsePositiveInt(
-                    props.getProperty("rtxEntityBlasCacheSize", "384"), 384, 32, 2048);
+            rtxEntityCaptureEnabled = Boolean.parseBoolean(props.getProperty("rtxEntityCaptureEnabled",
+                    String.valueOf(DEFAULT_RTX_ENTITY_CAPTURE_ENABLED)));
+            rtxParticleCaptureEnabled = Boolean.parseBoolean(props.getProperty("rtxParticleCaptureEnabled",
+                    String.valueOf(DEFAULT_RTX_PARTICLE_CAPTURE_ENABLED)));
+            rtxEntityCaptureInterval = parseBoundedInt(props.getProperty("rtxEntityCaptureInterval",
+                    String.valueOf(DEFAULT_RTX_ENTITY_CAPTURE_INTERVAL)), DEFAULT_RTX_ENTITY_CAPTURE_INTERVAL,
+                    MIN_RTX_ENTITY_CAPTURE_INTERVAL, MAX_RTX_ENTITY_CAPTURE_INTERVAL);
+            rtxMaxCapturedEntities = parseBoundedInt(props.getProperty("rtxMaxCapturedEntities",
+                    String.valueOf(DEFAULT_RTX_MAX_CAPTURED_ENTITIES)), DEFAULT_RTX_MAX_CAPTURED_ENTITIES,
+                    MIN_RTX_MAX_CAPTURED_ENTITIES, MAX_RTX_MAX_CAPTURED_ENTITIES);
+            rtxMaxCapturedParticles = parseBoundedInt(props.getProperty("rtxMaxCapturedParticles",
+                    String.valueOf(DEFAULT_RTX_MAX_CAPTURED_PARTICLES)), DEFAULT_RTX_MAX_CAPTURED_PARTICLES,
+                    MIN_RTX_MAX_CAPTURED_PARTICLES, MAX_RTX_MAX_CAPTURED_PARTICLES);
+            rtxEntityCaptureRadius = parseBoundedInt(props.getProperty("rtxEntityCaptureRadius",
+                    String.valueOf(DEFAULT_RTX_ENTITY_CAPTURE_RADIUS)), DEFAULT_RTX_ENTITY_CAPTURE_RADIUS,
+                    MIN_RTX_ENTITY_CAPTURE_RADIUS, MAX_RTX_ENTITY_CAPTURE_RADIUS);
+            rtxEntityBlasCacheSize = parseBoundedInt(props.getProperty("rtxEntityBlasCacheSize",
+                    String.valueOf(DEFAULT_RTX_ENTITY_BLAS_CACHE_SIZE)), DEFAULT_RTX_ENTITY_BLAS_CACHE_SIZE,
+                    MIN_RTX_ENTITY_BLAS_CACHE_SIZE, MAX_RTX_ENTITY_BLAS_CACHE_SIZE);
 
         } catch (IOException e) {
             System.err.println("[Vulkanite] Failed to load config: " + e.getMessage());
@@ -99,7 +119,7 @@ public class VulkaniteConfig {
         }
     }
 
-    private static int parsePositiveInt(String value, int fallback, int min, int max) {
+    private static int parseBoundedInt(String value, int fallback, int min, int max) {
         try {
             return Math.max(min, Math.min(max, Integer.parseInt(value)));
         } catch (NumberFormatException e) {
@@ -114,7 +134,6 @@ public class VulkaniteConfig {
         props.setProperty("enableDirtRt", String.valueOf(enableDirtRt));
         props.setProperty("restirReservoirWidth", String.valueOf(restirReservoirWidth));
         props.setProperty("restirReservoirHeight", String.valueOf(restirReservoirHeight));
-        props.setProperty("deferredRenderingEnabled", String.valueOf(deferredRenderingEnabled));
         props.setProperty("deferredComputeEnabled", String.valueOf(deferredComputeEnabled));
         props.setProperty("deferredComputeExperimental", String.valueOf(deferredComputeExperimental));
         if (deferredRenderingOverride != null) {
@@ -125,6 +144,7 @@ public class VulkaniteConfig {
         props.setProperty("rtxEntityCaptureInterval", String.valueOf(rtxEntityCaptureInterval));
         props.setProperty("rtxMaxCapturedEntities", String.valueOf(rtxMaxCapturedEntities));
         props.setProperty("rtxMaxCapturedParticles", String.valueOf(rtxMaxCapturedParticles));
+        props.setProperty("rtxEntityCaptureRadius", String.valueOf(rtxEntityCaptureRadius));
         props.setProperty("rtxEntityBlasCacheSize", String.valueOf(rtxEntityBlasCacheSize));
 
         try (FileWriter writer = new FileWriter(configFile)) {
@@ -167,15 +187,6 @@ public class VulkaniteConfig {
                 && deferredComputeExperimental;
     }
     
-    /**
-     * Sets the deferred rendering mode and saves the config.
-     * @param enabled Whether deferred rendering should be enabled
-     */
-    public void setDeferredRenderingEnabled(boolean enabled) {
-        this.deferredRenderingEnabled = enabled;
-        saveConfig();
-    }
-
     /**
      * Enables or disables the optional Vulkan compute lighting pass.
      *

@@ -28,7 +28,7 @@ import net.irisshaders.iris.uniforms.SystemTimeUniforms;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.Camera;
 import net.minecraft.client.texture.AbstractTexture;
-import net.minecraft.util.Identifier;
+import net.minecraft.client.texture.SpriteAtlasTexture;
 import org.lwjgl.system.MemoryUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,7 +36,10 @@ import org.slf4j.LoggerFactory;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 
 import static org.lwjgl.util.vma.Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
 import static org.lwjgl.vulkan.VK10.*;
@@ -51,14 +54,19 @@ import static org.lwjgl.vulkan.VK10.*;
  */
 public class VulkanPipeline {
     private static final Logger LOGGER = LoggerFactory.getLogger(VulkanPipeline.class);
+    private static final Set<VulkanPipeline> ACTIVE_PIPELINES =
+            Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
     private static final int MAX_IRIS_RENDER_TARGETS = 16;
     private static final int UBO_SIZE = 1024;
+    private static final int RUNTIME_ENTITY_CAPTURE_CAP = 48;
+    private static final int RUNTIME_PARTICLE_CAPTURE_CAP = 128;
+    private static final long TRANSIENT_CAPTURE_BUDGET_NS = 4_000_000L;
+    private static final long TRANSIENT_CAPTURE_PARTICLE_BUDGET_NS = 8_000_000L;
+    private static final int MAX_TRANSIENT_CAPTURE_THROTTLE = 8;
+    private static final int MIN_ENTITY_CAPTURE_RADIUS = 8;
+    private static final int PARTICLE_CAPTURE_SUSPEND_FRAMES = 240;
 
     public record CustomTexture(String name, VRef<VGImage> image) {
-    }
-
-    public enum RenderingMode {
-        RTX
     }
 
     private final VContext ctx;
@@ -79,7 +87,6 @@ public class VulkanPipeline {
     private final VRef<VImageView> placeholderNormalsView;
     private final PoolLinearAllocator uboAllocator;
     private final RenderPassExecutor renderPassExecutor;
-    private final StableBlocklightPass stableBlocklightPass;
     private final RtxFrameImages frameImages = new RtxFrameImages();
     private final DLSSDProcessor dlssdProcessor;
     private final PipelineRequirements pipelineRequirements;
@@ -92,8 +99,10 @@ public class VulkanPipeline {
     private net.minecraft.util.math.Vec3d lastCameraPos;
     private boolean dlssTemporalPathActive;
     private long lastDlssFrameTimeNs = -1L;
-    private boolean dlssDepthUsableThisFrame;
     private int entityCaptureFrame;
+    private int transientCaptureThrottle = 1;
+    private int transientParticleSuspendFrames;
+    private boolean destroyed;
 
     public VulkanPipeline(VContext ctx, AccelerationManager accelerationManager, RaytracingShaderSet[] passes,
             int[] ssboIds, List<CustomTexture> customTextures) {
@@ -115,21 +124,16 @@ public class VulkanPipeline {
         }
 
         blockAtlasView = new SharedImageViewTracker(ctx, () -> {
-            AbstractTexture blockAtlas = MinecraftClient.getInstance().getTextureManager()
-                    .getTexture(new Identifier("minecraft", "textures/atlas/blocks.png"));
+            AbstractTexture blockAtlas = getBlockAtlasTexture();
             return ((IVGImage) blockAtlas).getVGImage();
         });
         blockAtlasNormalView = new SharedImageViewTracker(ctx, () -> {
-            AbstractTexture blockAtlas = MinecraftClient.getInstance().getTextureManager()
-                    .getTexture(new Identifier("minecraft", "textures/atlas/blocks.png"));
-            PBRTextureHolder holder = PBRTextureManager.INSTANCE.getOrLoadHolder(blockAtlas.getGlId());
+            PBRTextureHolder holder = getBlockAtlasPbrHolder();
             var normalTexture = holder.normalTexture();
             return normalTexture == null ? null : ((IVGImage) normalTexture).getVGImage();
         });
         blockAtlasSpecularView = new SharedImageViewTracker(ctx, () -> {
-            AbstractTexture blockAtlas = MinecraftClient.getInstance().getTextureManager()
-                    .getTexture(new Identifier("minecraft", "textures/atlas/blocks.png"));
-            PBRTextureHolder holder = PBRTextureManager.INSTANCE.getOrLoadHolder(blockAtlas.getGlId());
+            PBRTextureHolder holder = getBlockAtlasPbrHolder();
             var specularTexture = holder.specularTexture();
             return specularTexture == null ? null : ((IVGImage) specularTexture).getVGImage();
         });
@@ -169,7 +173,6 @@ public class VulkanPipeline {
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                 VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
         renderPassExecutor = new RenderPassExecutor(ctx, accelerationManager, sampler, customTextureSampler);
-        stableBlocklightPass = new StableBlocklightPass(ctx, sampler);
         dlssdProcessor = new DLSSDProcessor(ctx);
 
         if (passes != null) {
@@ -182,6 +185,7 @@ public class VulkanPipeline {
 
         boolean hasRt = !raytracePipelines.isEmpty();
         pipelineRequirements = new PipelineRequirements(hasRt, hasRt, hasRt, hasRt, hasRt, hasRt);
+        ACTIVE_PIPELINES.add(this);
         LOGGER.info("Hybrid RTX pipeline created: passes={}, entities={}", raytracePipelines.size(), supportsEntities);
     }
 
@@ -355,27 +359,48 @@ public class VulkanPipeline {
         ctx.cmd.newFrame();
         VulkaniteConfig config = VulkaniteConfig.getInstance();
         boolean captureTransientGeometry = config.rtxEntityCaptureEnabled || config.rtxParticleCaptureEnabled;
+        if (transientParticleSuspendFrames > 0) {
+            transientParticleSuspendFrames--;
+        }
         if (captureEntityGeometry && supportsEntities && captureTransientGeometry) {
-            int interval = Math.max(1, config.rtxEntityCaptureInterval);
+            int interval = Math.max(1, config.rtxEntityCaptureInterval) * transientCaptureThrottle;
             if ((entityCaptureFrame++ % interval) == 0) {
+                boolean captureParticles = config.rtxParticleCaptureEnabled && transientParticleSuspendFrames == 0;
+                long start = System.nanoTime();
                 accelerationManager.setEntityData(capture.capture(
                         CapturedRenderingState.INSTANCE.getTickDelta(),
                         MinecraftClient.getInstance().world,
                         camera,
-                        config.rtxEntityCaptureEnabled ? Math.max(1, config.rtxMaxCapturedEntities) : 0,
-                        config.rtxParticleCaptureEnabled ? Math.max(1, config.rtxMaxCapturedParticles) : 0,
-                        config.rtxParticleCaptureEnabled));
+                        config.rtxEntityCaptureEnabled ? captureLimit(config.rtxMaxCapturedEntities,
+                                RUNTIME_ENTITY_CAPTURE_CAP) : 0,
+                        captureParticles
+                                ? captureLimit(config.rtxMaxCapturedParticles, RUNTIME_PARTICLE_CAPTURE_CAP)
+                                : 0,
+                        captureParticles,
+                        Math.max(MIN_ENTITY_CAPTURE_RADIUS, config.rtxEntityCaptureRadius)));
+                long duration = System.nanoTime() - start;
+                if (duration > TRANSIENT_CAPTURE_BUDGET_NS) {
+                    transientCaptureThrottle = Math.min(MAX_TRANSIENT_CAPTURE_THROTTLE, transientCaptureThrottle + 1);
+                } else if (duration < TRANSIENT_CAPTURE_BUDGET_NS / 2 && transientCaptureThrottle > 1) {
+                    transientCaptureThrottle--;
+                }
+                if (captureParticles && duration > TRANSIENT_CAPTURE_PARTICLE_BUDGET_NS) {
+                    transientParticleSuspendFrames = PARTICLE_CAPTURE_SUSPEND_FRAMES;
+                }
             }
         } else {
             entityCaptureFrame = 0;
+            transientCaptureThrottle = 1;
+            transientParticleSuspendFrames = 0;
             accelerationManager.setEntityData(null);
         }
-        PBRTextureManager.notifyPBRTexturesChanged();
     }
 
     private int[] chooseRtxRenderSize(VRef<VImageView>[] gbufferViews, int outputWidth, int outputHeight,
             ResolutionScaleManager scaleManager, DLSSConfig config, MinecraftClient mc) {
-        if (isRadianceDlssCandidate(mc, config) && scaleManager.getRenderWidth() > 0 && scaleManager.getRenderHeight() > 0) {
+        if (dlssdProcessor.canUseConfiguredRenderScale(mc, config)
+                && scaleManager.getRenderWidth() > 0
+                && scaleManager.getRenderHeight() > 0) {
             return new int[] { scaleManager.getRenderWidth(), scaleManager.getRenderHeight() };
         }
 
@@ -394,17 +419,6 @@ public class VulkanPipeline {
         return new int[] { aligned[0], aligned[1] };
     }
 
-    private boolean isRadianceDlssCandidate(MinecraftClient mc, DLSSConfig config) {
-        return mc != null
-                && mc.world != null
-                && mc.currentScreen == null
-                && config != null
-                && config.isEnabled()
-                && !config.isDebugEnabled()
-                && dlssdProcessor != null
-                && dlssdProcessor.isSupported();
-    }
-
     private void encodeRtxFrame(
             me.cortex.vulkanite.lib.cmd.VCmdBuff cmd,
             VRef<VAccelerationStructure> tlas,
@@ -416,6 +430,11 @@ public class VulkanPipeline {
             VRef<VImageView>[] gbufferViews,
             int renderWidth,
             int renderHeight) {
+        DLSSConfig dlssConfig = DLSSConfig.load();
+        boolean dlssFrameActive = dlssdProcessor.prepareForFrame(
+                MinecraftClient.getInstance(), dlssConfig, frameImages, outImgs);
+        updateTemporalPathState(dlssFrameActive);
+
         PoolLinearAllocator.BufferRegion ubo = uboAllocator.allocate(UBO_SIZE);
         long ptr = ubo.buffer().get().map();
         try {
@@ -436,67 +455,79 @@ public class VulkanPipeline {
 
         var sunPos = celestialUniforms.invokeGetSunPosition();
         int frameIndex = SystemTimeUniforms.COUNTER.getAsInt();
-        DLSSConfig dlssConfig = DLSSConfig.load();
         int debugMode = mapDebugMode(dlssConfig.getDebugType());
-        prepareRadianceDlssModule(renderWidth, renderHeight, frameImages.outputWidth(), frameImages.outputHeight(),
-                dlssConfig);
-        // The legacy restoration pass reconstructs lighting from albedo detail and
-        // adds it over blocklight that is already present in the ray-traced image.
-        // That projects block textures onto nearby geometry and produces long,
-        // pixelated streaks around bright emitters. Keep blocklight in the normal
-        // radiance path until explicit geometric emitter lights are available.
-        boolean separateStableBlocklight = false;
-
-        passGraph.execute(new RtxPassGraph.Frame(
-                cmd,
-                ubo.buffer(),
-                ubo.offset(),
-                ubo.size(),
-                tlas,
-                blockAtlasView,
-                blockAtlasNormalView,
-                blockAtlasSpecularView,
-                placeholderNormalsView,
-                placeholderSpecularView,
-                irisRenderTargetViews,
-                vgOutImgs,
-                outImgs,
-                customTextureViews,
-                ssbos,
-                gbufferViews,
-                frameIndex,
-                0,
-                sunPos.x,
-                sunPos.y,
-                sunPos.z,
-                1.0f,
-                0.95f,
-                0.8f,
-                dlssConfig.isReSTIREnabled() ? 1 : 0,
-                debugMode,
-                dlssConfig.getDebugCellIndex(),
-                separateStableBlocklight ? 1 : 0,
-                frameImages.currentReservoir(frameIndex),
-                frameImages.previousReservoir(frameIndex),
-                frameImages.diffuseAlbedoMetallic(),
-                frameImages.specularAlbedo(),
-                frameImages.normalRoughness(),
-                frameImages.motionVector(),
-                frameImages.linearDepth(),
-                frameImages.specularHitDepth(),
-                frameImages.firstHitDepth(),
-                frameImages.blocklightDetail(),
-                frameImages.radiance(),
-                renderWidth,
-                renderHeight));
+        VRef<VBuffer> sectionLightBuffer = null;
+        VRef<VBuffer> sectionLightProbeBuffer = null;
+        try {
+            sectionLightBuffer = Vulkanite.INSTANCE.getSectionLightManager().ensureGpuBuffer(ctx, cmd);
+            sectionLightProbeBuffer = Vulkanite.INSTANCE.getSectionLightManager().ensureProbeGpuBuffer(ctx, cmd);
+            passGraph.execute(new RtxPassGraph.Frame(
+                    cmd,
+                    ubo.buffer(),
+                    ubo.offset(),
+                    ubo.size(),
+                    tlas,
+                    blockAtlasView,
+                    blockAtlasNormalView,
+                    blockAtlasSpecularView,
+                    placeholderNormalsView,
+                    placeholderSpecularView,
+                    irisRenderTargetViews,
+                    vgOutImgs,
+                    outImgs,
+                    customTextureViews,
+                    ssbos,
+                    gbufferViews,
+                    frameIndex,
+                    0,
+                    sunPos.x,
+                    sunPos.y,
+                    sunPos.z,
+                    1.0f,
+                    0.95f,
+                    0.8f,
+                    dlssConfig.isReSTIREnabled() ? 1 : 0,
+                    debugMode,
+                    dlssConfig.getDebugCellIndex(),
+                    frameImages.currentReservoir(frameIndex),
+                    frameImages.previousReservoir(frameIndex),
+                    frameImages.diffuseAlbedoMetallic(),
+                    frameImages.specularAlbedo(),
+                    frameImages.normalRoughness(),
+                    frameImages.motionVector(),
+                    frameImages.linearDepth(),
+                    frameImages.specularHitDepth(),
+                    frameImages.firstHitDepth(),
+                    frameImages.blocklightDetail(),
+                    sectionLightBuffer,
+                    sectionLightProbeBuffer,
+                    frameImages.radiance(),
+                    renderWidth,
+                    renderHeight));
+        } finally {
+            if (sectionLightProbeBuffer != null) {
+                sectionLightProbeBuffer.close();
+            }
+            if (sectionLightBuffer != null) {
+                sectionLightBuffer.close();
+            }
+        }
 
         transitionImages(cmd, sampledImages, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
 
-        compositeToIrisTarget(cmd, outImgs, dlssConfig, gbufferViews, separateStableBlocklight);
+        compositeToIrisTarget(cmd, outImgs, dlssFrameActive);
 
         transitionImages(cmd, gbufferImages, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
         closeAll(sampledImages);
         closeAll(gbufferImages);
+    }
+
+    private static AbstractTexture getBlockAtlasTexture() {
+        return MinecraftClient.getInstance().getTextureManager().getTexture(SpriteAtlasTexture.BLOCK_ATLAS_TEXTURE);
+    }
+
+    private static PBRTextureHolder getBlockAtlasPbrHolder() {
+        return PBRTextureManager.INSTANCE.getOrLoadHolder(getBlockAtlasTexture().getGlId());
     }
 
     private List<VRef<VImage>> collectSampledImages() {
@@ -529,22 +560,14 @@ public class VulkanPipeline {
         return images;
     }
 
-    private static boolean hasCompleteGbuffer(VRef<VImageView>[] gbufferViews) {
-        if (gbufferViews == null || gbufferViews.length < 5) {
-            return false;
-        }
-        for (int i = 0; i < 5; i++) {
-            if (gbufferViews[i] == null || gbufferViews[i].get() == null) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     private static void addIfPresent(List<VRef<VImage>> images, VRef<VImage> image) {
         if (image != null) {
             images.add(image);
         }
+    }
+
+    private static int captureLimit(int configuredLimit, int runtimeCap) {
+        return Math.max(1, Math.min(configuredLimit, runtimeCap));
     }
 
     private static void closeAll(List<? extends VRef<?>> refs) {
@@ -584,38 +607,14 @@ public class VulkanPipeline {
         }
     }
 
-    private void prepareRadianceDlssModule(int renderWidth, int renderHeight,
-            int outputWidth, int outputHeight, DLSSConfig config) {
-        MinecraftClient mc = MinecraftClient.getInstance();
-        dlssDepthUsableThisFrame = false;
-
-        if (!isRadianceDlssCandidate(mc, config)) {
-            return;
-        }
-
-        if (!dlssdProcessor.isInitialized()
-                || !dlssdProcessor.matchesDimensions(renderWidth, renderHeight, outputWidth, outputHeight)) {
-            dlssdProcessor.initialize(renderWidth, renderHeight, outputWidth, outputHeight);
-        }
-
-        dlssDepthUsableThisFrame = dlssdProcessor.isInitialized()
-                && dlssdProcessor.matchesDimensions(renderWidth, renderHeight, outputWidth, outputHeight);
-    }
-
     private void compositeToIrisTarget(me.cortex.vulkanite.lib.cmd.VCmdBuff cmd, List<VRef<VImage>> outImgs,
-            DLSSConfig config, VRef<VImageView>[] gbufferViews, boolean separateStableBlocklight) {
+            boolean dlssFrameActive) {
         if (outImgs.isEmpty() || frameImages.radiance() == null) {
             updateTemporalPathState(false);
             return;
         }
 
-        MinecraftClient mc = MinecraftClient.getInstance();
-        boolean dlssFrameActive = dlssDepthUsableThisFrame
-                && shouldProcessDlssFrame(mc, config.isEnabled(), config.isDebugEnabled(), outImgs);
-        updateTemporalPathState(dlssFrameActive);
-
         VRef<VImage> source = frameImages.radiance();
-        boolean blocklightDetailReferenceReady = false;
         if (dlssFrameActive) {
             try {
                 VRef<VImage> denoised = dlssdProcessor.processFrame(
@@ -624,8 +623,6 @@ public class VulkanPipeline {
                         computeDLSSDeltaTimeSeconds());
                 if (denoised != null) {
                     source = denoised;
-                    frameImages.upscaleSidecars(cmd);
-                    blocklightDetailReferenceReady = true;
                 }
             } catch (Exception e) {
                 LOGGER.warn("DLSS/RR processing failed; using noisy RTX output", e);
@@ -633,14 +630,6 @@ public class VulkanPipeline {
             }
         }
 
-        if (separateStableBlocklight && blocklightDetailReferenceReady && !stableBlocklightPass.execute(
-                cmd,
-                source,
-                gbufferViews,
-                frameImages.upscaledBlocklightDetail(),
-                frameImages.upscaledDiffuseAlbedoMetallic())) {
-            LOGGER.warn("DLSS blocklight detail restoration was requested without complete inputs");
-        }
         blitToTarget(cmd, source, outImgs.get(0));
     }
 
@@ -657,21 +646,6 @@ public class VulkanPipeline {
                 VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
         cmd.encodeImageTransition(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-    }
-
-    private boolean shouldProcessDlssFrame(MinecraftClient mc, boolean dlssEnabled, boolean debugModeEnabled,
-            List<?> outImgs) {
-        return mc != null
-                && mc.world != null
-                && mc.currentScreen == null
-                && !mc.isPaused()
-                && outImgs != null
-                && !outImgs.isEmpty()
-                && dlssEnabled
-                && !debugModeEnabled
-                && dlssdProcessor != null
-                && dlssdProcessor.isSupported()
-                && dlssdProcessor.isInitialized();
     }
 
     private void checkWorldChange() {
@@ -753,62 +727,16 @@ public class VulkanPipeline {
         currentShaderpackName = shaderpackName;
     }
 
-    public boolean isDeferredModeActive() {
-        return false;
-    }
-
-    public boolean isDeferredComputeActive() {
-        return false;
-    }
-
-    public RenderingMode getRenderingMode() {
-        return RenderingMode.RTX;
-    }
-
-    public DeferredLightingPass getDeferredLightingPass() {
-        return null;
-    }
-
-    public DeferredGBufferManager getDeferredGBufferManager() {
-        return null;
-    }
-
-    public VRef<VImage> getBlockLightImage() {
-        return null;
-    }
-
-    public VRef<VImage> getSunLightImage() {
-        return null;
-    }
-
-    public VRef<VImage> getLabpbrImage() {
-        return null;
-    }
-
-    public VRef<VImage>[] getReservoirImages() {
-        return frameImages.reservoirs();
-    }
-
-    public VRef<VImage> getMotionVectorImage() {
-        return frameImages.motionVectors();
-    }
-
-    public DLSSDProcessor getDLSSDProcessor() {
-        return dlssdProcessor;
-    }
-
-    public VRef<VImage> processDLSSD(me.cortex.vulkanite.lib.cmd.VCmdBuff cmd, VRef<VImage> noisyOutput,
-            VRef<VImage> motionVectors, VRef<VImage> depth, VRef<VImageView>[] gbufferViews, float deltaTime) {
-        if (!dlssdProcessor.isInitialized()) {
-            MinecraftClient mc = MinecraftClient.getInstance();
-            dlssdProcessor.initialize(mc.getWindow().getFramebufferWidth(), mc.getWindow().getFramebufferHeight());
-        }
-        return dlssdProcessor.processFrame(cmd, noisyOutput, motionVectors, depth, gbufferViews, deltaTime);
-    }
-
     public void destroy() {
+        if (destroyed) {
+            return;
+        }
+        destroyed = true;
+        ACTIVE_PIPELINES.remove(this);
+
         ctx.cmd.waitQueueIdle(0);
 
+        dlssdProcessor.cleanup();
         renderPassExecutor.destroy();
         for (RtPipeline pipeline : raytracePipelines) {
             pipeline.pipeline().close();
@@ -829,8 +757,6 @@ public class VulkanPipeline {
         blockAtlasSpecularView.destroy();
 
         frameImages.destroy();
-        stableBlocklightPass.destroy();
-        dlssdProcessor.cleanup();
         capture.close();
         uboAllocator.reset();
         uboAllocator.clearPool();
@@ -843,5 +769,20 @@ public class VulkanPipeline {
         customTextureSampler.close();
 
         ctx.cmd.newFrame();
+    }
+
+    public static void destroyActivePipelines() {
+        VulkanPipeline[] pipelines;
+        synchronized (ACTIVE_PIPELINES) {
+            pipelines = ACTIVE_PIPELINES.toArray(VulkanPipeline[]::new);
+        }
+
+        for (VulkanPipeline pipeline : pipelines) {
+            try {
+                pipeline.destroy();
+            } catch (Exception e) {
+                LOGGER.warn("Failed to destroy active Vulkan pipeline during shutdown", e);
+            }
+        }
     }
 }

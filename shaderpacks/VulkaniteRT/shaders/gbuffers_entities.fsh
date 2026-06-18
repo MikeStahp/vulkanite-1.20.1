@@ -1,5 +1,7 @@
 #version 460
 
+#include "/lib/rt/settings.glsl"
+
 uniform sampler2D gtexture;
 
 in vec2 texCoord;
@@ -15,7 +17,15 @@ layout(location = 3) out vec4 colortex4;
 layout(location = 4) out vec4 colortex5;
 
 void main() {
-    vec4 albedo = texture(gtexture, texCoord) * vertexColor;
+    vec4 textureAlbedo = texture(gtexture, texCoord);
+#if BAREBONES_GBUFFER_ALBEDO != 0
+    vec3 vertexTint = max(vertexColor.rgb, vec3(0.0));
+    float tintPeak = max(max(vertexTint.r, vertexTint.g), vertexTint.b);
+    vec3 tintChroma = tintPeak > 0.0001 ? vertexTint / tintPeak : vec3(1.0);
+    vec4 albedo = vec4(textureAlbedo.rgb * tintChroma, textureAlbedo.a * vertexColor.a);
+#else
+    vec4 albedo = textureAlbedo * vertexColor;
+#endif
     if (albedo.a < 0.1) discard;
 
     colortex1 = albedo;

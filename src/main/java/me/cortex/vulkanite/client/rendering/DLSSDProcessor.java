@@ -7,11 +7,11 @@ import me.cortex.vulkanite.lib.cmd.VCmdBuff;
 import me.cortex.vulkanite.lib.memory.VImage;
 import me.cortex.vulkanite.lib.other.VImageView;
 import net.irisshaders.iris.uniforms.CapturedRenderingState;
+import net.minecraft.client.MinecraftClient;
 import org.joml.Matrix4f;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
 import java.util.List;
 
 import static org.lwjgl.vulkan.VK10.*;
@@ -51,6 +51,20 @@ public class DLSSDProcessor {
     private int outputHeight;
     private int initFailures;
     private int consecutiveEvaluationFailures;
+
+    private record ImageBinding(VRef<VImage> image, VRef<VImageView> view) {
+        long imageHandle() {
+            return image.get().image();
+        }
+
+        long viewHandle() {
+            return view.get().view;
+        }
+
+        int format() {
+            return image.get().format;
+        }
+    }
 
     public DLSSDProcessor(VContext context) {
         this.context = context;
@@ -169,6 +183,36 @@ public class DLSSDProcessor {
                 && this.outputHeight == outputHeight;
     }
 
+    public boolean canUseConfiguredRenderScale(MinecraftClient mc, DLSSConfig config) {
+        return isRuntimeEligible(mc, config);
+    }
+
+    public boolean prepareForFrame(MinecraftClient mc, DLSSConfig config, RtxFrameImages images, List<?> outImgs) {
+        if (!isRuntimeEligible(mc, config) || images == null || outImgs == null || outImgs.isEmpty()) {
+            return false;
+        }
+
+        if (!initialized || !matchesDimensions(images.renderWidth(), images.renderHeight(),
+                images.outputWidth(), images.outputHeight())) {
+            initialize(images.renderWidth(), images.renderHeight(), images.outputWidth(), images.outputHeight());
+        }
+
+        return initialized
+                && matchesDimensions(images.renderWidth(), images.renderHeight(),
+                        images.outputWidth(), images.outputHeight());
+    }
+
+    private boolean isRuntimeEligible(MinecraftClient mc, DLSSConfig config) {
+        return mc != null
+                && mc.world != null
+                && mc.currentScreen == null
+                && !mc.isPaused()
+                && config != null
+                && config.isEnabled()
+                && !config.isDebugEnabled()
+                && supported;
+    }
+
     public VRef<VImage> processFrame(VCmdBuff cmd, RtxFrameImages images, float deltaTime) {
         if (!initialized || !supported || images == null) {
             return null;
@@ -183,49 +227,48 @@ public class DLSSDProcessor {
             return processStandardDLSS(cmd, images);
         }
 
-        List<VRef<?>> views = new ArrayList<>();
         try {
-            VRef<VImageView> radianceView = createView(views, images.radiance());
-            VRef<VImageView> depthView = createView(views, images.linearDepth());
-            VRef<VImageView> motionView = createView(views, images.motionVector());
-            VRef<VImageView> outputView = createView(views, images.processed());
-            VRef<VImageView> diffuseView = createView(views, images.diffuseAlbedoMetallic());
-            VRef<VImageView> specularView = createView(views, images.specularAlbedo());
-            VRef<VImageView> normalRoughnessView = createView(views, images.normalRoughness());
-            VRef<VImageView> specularHitDepthView = createView(views, images.specularHitDepth());
+            ImageBinding radiance = bind(images.radiance(), images.radianceView());
+            ImageBinding depth = bind(images.linearDepth(), images.linearDepthView());
+            ImageBinding motion = bind(images.motionVector(), images.motionVectorView());
+            ImageBinding output = bind(images.processed(), images.processedView());
+            ImageBinding diffuse = bind(images.diffuseAlbedoMetallic(), images.diffuseAlbedoMetallicView());
+            ImageBinding specular = bind(images.specularAlbedo(), images.specularAlbedoView());
+            ImageBinding normalRoughness = bind(images.normalRoughness(), images.normalRoughnessView());
+            ImageBinding specularHitDepth = bind(images.specularHitDepth(), images.specularHitDepthView());
 
             updateMatrices();
 
             boolean success = DLSSBridge.evaluateDLSSD(
                     cmd.buffer().address(),
                     featureHandle,
-                    radianceView.get().view,
-                    images.radiance().get().image(),
-                    images.radiance().get().format,
-                    depthView.get().view,
-                    images.linearDepth().get().image(),
-                    images.linearDepth().get().format,
-                    motionView.get().view,
-                    images.motionVector().get().image(),
-                    images.motionVector().get().format,
-                    outputView.get().view,
-                    images.processed().get().image(),
-                    images.processed().get().format,
-                    diffuseView.get().view,
-                    images.diffuseAlbedoMetallic().get().image(),
-                    images.diffuseAlbedoMetallic().get().format,
-                    specularView.get().view,
-                    images.specularAlbedo().get().image(),
-                    images.specularAlbedo().get().format,
-                    normalRoughnessView.get().view,
-                    images.normalRoughness().get().image(),
-                    images.normalRoughness().get().format,
+                    radiance.viewHandle(),
+                    radiance.imageHandle(),
+                    radiance.format(),
+                    depth.viewHandle(),
+                    depth.imageHandle(),
+                    depth.format(),
+                    motion.viewHandle(),
+                    motion.imageHandle(),
+                    motion.format(),
+                    output.viewHandle(),
+                    output.imageHandle(),
+                    output.format(),
+                    diffuse.viewHandle(),
+                    diffuse.imageHandle(),
+                    diffuse.format(),
+                    specular.viewHandle(),
+                    specular.imageHandle(),
+                    specular.format(),
+                    normalRoughness.viewHandle(),
+                    normalRoughness.imageHandle(),
+                    normalRoughness.format(),
                     0,
                     0,
                     0,
-                    specularHitDepthView.get().view,
-                    images.specularHitDepth().get().image(),
-                    images.specularHitDepth().get().format,
+                    specularHitDepth.viewHandle(),
+                    specularHitDepth.imageHandle(),
+                    specularHitDepth.format(),
                     JitterManager.getJitterX(),
                     JitterManager.getJitterY(),
                     temporalHistoryValid ? 0 : 1,
@@ -248,8 +291,6 @@ public class DLSSDProcessor {
             LOGGER.error("DLSSD evaluation failed", e);
             recordEvaluationFailure("DLSSD");
             return null;
-        } finally {
-            closeAll(views);
         }
     }
 
@@ -269,27 +310,26 @@ public class DLSSDProcessor {
     }
 
     private VRef<VImage> processStandardDLSS(VCmdBuff cmd, RtxFrameImages images) {
-        List<VRef<?>> views = new ArrayList<>();
         try {
-            VRef<VImageView> radianceView = createView(views, images.radiance());
-            VRef<VImageView> depthView = createView(views, images.linearDepth());
-            VRef<VImageView> motionView = createView(views, images.motionVector());
-            VRef<VImageView> outputView = createView(views, images.processed());
+            ImageBinding radiance = bind(images.radiance(), images.radianceView());
+            ImageBinding depth = bind(images.linearDepth(), images.linearDepthView());
+            ImageBinding motion = bind(images.motionVector(), images.motionVectorView());
+            ImageBinding output = bind(images.processed(), images.processedView());
 
             boolean success = DLSSBridge.evaluateStandardDLSS(
                     cmd.buffer().address(),
-                    radianceView.get().view,
-                    images.radiance().get().image(),
-                    images.radiance().get().format,
-                    depthView.get().view,
-                    images.linearDepth().get().image(),
-                    images.linearDepth().get().format,
-                    motionView.get().view,
-                    images.motionVector().get().image(),
-                    images.motionVector().get().format,
-                    outputView.get().view,
-                    images.processed().get().image(),
-                    images.processed().get().format,
+                    radiance.viewHandle(),
+                    radiance.imageHandle(),
+                    radiance.format(),
+                    depth.viewHandle(),
+                    depth.imageHandle(),
+                    depth.format(),
+                    motion.viewHandle(),
+                    motion.imageHandle(),
+                    motion.format(),
+                    output.viewHandle(),
+                    output.imageHandle(),
+                    output.format(),
                     JitterManager.getJitterX(),
                     JitterManager.getJitterY());
 
@@ -305,8 +345,6 @@ public class DLSSDProcessor {
             LOGGER.error("Standard DLSS evaluation failed", e);
             recordEvaluationFailure("Standard DLSS");
             return null;
-        } finally {
-            closeAll(views);
         }
     }
 
@@ -317,18 +355,11 @@ public class DLSSDProcessor {
                 .get(rrViewToClip);
     }
 
-    private VRef<VImageView> createView(List<VRef<?>> views, VRef<VImage> image) {
-        VRef<VImageView> view = VImageView.create(context, image);
-        views.add(view);
-        return view;
-    }
-
-    private static void closeAll(List<VRef<?>> refs) {
-        for (VRef<?> ref : refs) {
-            if (ref != null) {
-                ref.close();
-            }
+    private static ImageBinding bind(VRef<VImage> image, VRef<VImageView> view) {
+        if (image == null || view == null) {
+            throw new IllegalStateException("DLSS image contract is incomplete");
         }
+        return new ImageBinding(image, view);
     }
 
     public VRef<VImage> getDepthImage() {
@@ -405,6 +436,11 @@ public class DLSSDProcessor {
             } catch (Exception e) {
                 LOGGER.warn("Failed to destroy standard DLSS", e);
             }
+        }
+        try {
+            DLSSBridge.shutdownNGX();
+        } catch (Exception e) {
+            LOGGER.warn("Failed to shut down NGX", e);
         }
 
         initialized = false;

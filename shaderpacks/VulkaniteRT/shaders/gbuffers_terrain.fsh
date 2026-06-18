@@ -47,7 +47,15 @@ const vec3 HCM_METALS[] = vec3[](
 
 void main() {
     // Sample base albedo texture
-    vec4 albedo = texture(gtexture, texCoord) * vertexColor;
+    vec4 textureAlbedo = texture(gtexture, texCoord);
+#if BAREBONES_GBUFFER_ALBEDO != 0
+    vec3 vertexTint = max(vertexColor.rgb, vec3(0.0));
+    float tintPeak = max(max(vertexTint.r, vertexTint.g), vertexTint.b);
+    vec3 tintChroma = tintPeak > 0.0001 ? vertexTint / tintPeak : vec3(1.0);
+    vec4 albedo = vec4(textureAlbedo.rgb * tintChroma, textureAlbedo.a * vertexColor.a);
+#else
+    vec4 albedo = textureAlbedo * vertexColor;
+#endif
 
     // Alpha test
     if (albedo.a < 0.1) discard;

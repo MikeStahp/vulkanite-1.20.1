@@ -1,48 +1,61 @@
 package me.cortex.vulkanite.compat;
 
 import me.jellysquid.mods.sodium.client.render.chunk.compile.ChunkBuildOutput;
-import me.jellysquid.mods.sodium.client.render.chunk.terrain.TerrainRenderPass;
-import me.jellysquid.mods.sodium.client.util.NativeBuffer;
-import org.lwjgl.system.MemoryUtil;
+import me.jellysquid.mods.sodium.client.render.chunk.vertex.format.ChunkVertexType;
 
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 
-//TODO: FIXME! the native buffer is destroyed by the AccelerationBlasBuilder after its copied to the gpu, however
-// on world reload or for whatever reason that the result is destroyed (and not submitted to the blas builder)
-// must find a way to free the native buffers
 public class SodiumResultAdapter {
-    public static void compute(ChunkBuildOutput buildResult) {
-        var ebr = (IAccelerationBuildResult) buildResult;
-        Map<TerrainRenderPass, GeometryData> map = new LinkedHashMap<>();
-        List<NativeBuffer> nativeBuffers = new ArrayList<>();
-        
-        for (var pass : buildResult.meshes.entrySet()) {
-            var vertData = pass.getValue().getVertexData();
-            nativeBuffers.add(vertData); // Track the native buffer
+    public static void compute(ChunkBuildOutput buildResult, ChunkVertexType vertexFormat) {
+        ((IAccelerationBuildResult) buildResult).setAccelerationGeometry(capture(buildResult, vertexFormat));
+    }
 
-            int stride = ebr.getVertexFormat().getVertexFormat().getStride();
-
-            if (vertData.getLength()%stride != 0)
-                throw new IllegalStateException("Mismatch length and stride");
-            int vertices = vertData.getLength()/stride;
-            if (vertices % 4 != 0)
-                throw new IllegalStateException("Non multiple 4 vertex count");
-
-            map.put(pass.getKey(), new GeometryData(vertices>>2));
+    public static SodiumGeometryBatch capture(ChunkBuildOutput buildResult, ChunkVertexType vertexFormat) {
+        if (vertexFormat == null) {
+            throw new IllegalStateException("Missing Sodium chunk vertex format");
         }
 
-        if (!map.isEmpty()) {
-            ebr.setAccelerationGeometryData(map);
-            ebr.setNativeBuffers(nativeBuffers);
-            // Track buffers with the tracker
-            NativeBufferTracker.getInstance().trackBuffers(buildResult, nativeBuffers);
-        } else {
-            ebr.setAccelerationGeometryData(null);
-            ebr.setNativeBuffers(Collections.emptyList());
+        int stride = vertexFormat.getVertexFormat().getStride();
+        if (stride <= 0) {
+            throw new IllegalStateException("Invalid Sodium vertex stride: " + stride);
         }
+
+        List<SodiumGeometry> geometries = new ArrayList<>();
+        long totalSizeBytes = 0;
+
+        for (var entry : buildResult.meshes.entrySet()) {
+            var mesh = entry.getValue();
+            if (mesh == null) {
+                continue;
+            }
+
+            var vertexData = mesh.getVertexData();
+            if (vertexData == null || vertexData.getLength() <= 0) {
+                continue;
+            }
+
+            int sizeBytes = vertexData.getLength();
+            if (sizeBytes % stride != 0) {
+                throw new IllegalStateException("Sodium mesh length " + sizeBytes
+                        + " is not a multiple of vertex stride " + stride);
+            }
+
+            int vertices = sizeBytes / stride;
+            if (vertices % 4 != 0) {
+                throw new IllegalStateException("Sodium mesh vertex count " + vertices
+                        + " is not quad aligned");
+            }
+
+            int quadCount = vertices >> 2;
+            geometries.add(new SodiumGeometry(entry.getKey(), vertexData, quadCount, sizeBytes));
+            totalSizeBytes += sizeBytes;
+        }
+
+        if (geometries.isEmpty()) {
+            return null;
+        }
+
+        return new SodiumGeometryBatch(geometries, totalSizeBytes);
     }
 }

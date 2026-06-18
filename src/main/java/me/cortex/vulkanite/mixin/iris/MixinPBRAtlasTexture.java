@@ -4,9 +4,11 @@ import com.mojang.blaze3d.platform.GlStateManager;
 import me.cortex.vulkanite.client.Vulkanite;
 import me.cortex.vulkanite.compat.IVGImage;
 import me.cortex.vulkanite.lib.base.VRef;
+import me.cortex.vulkanite.lib.memory.VImage;
 import net.irisshaders.iris.texture.pbr.PBRAtlasTexture;
 import net.minecraft.client.texture.AbstractTexture;
-import net.minecraft.client.texture.SpriteAtlasTexture;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Redirect;
@@ -16,12 +18,14 @@ import static org.lwjgl.opengl.GL11C.glDeleteTextures;
 import static org.lwjgl.vulkan.VK10.*;
 
 @Mixin(PBRAtlasTexture.class)
-public abstract class MixinPBRAtlasTexture extends AbstractTexture implements IVGImage  {
+public abstract class MixinPBRAtlasTexture extends AbstractTexture implements IVGImage {
+    private static final Logger LOGGER = LoggerFactory.getLogger(MixinPBRAtlasTexture.class);
+
     @Redirect(method = "upload", at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/platform/TextureUtil;prepareImage(IIII)V"))
     private void redirect(int id, int maxLevel, int width, int height) {
         var existingImage = getVGImage();
         if (existingImage != null) {
-            System.err.println("Vulkan image already allocated, releasing");
+            LOGGER.warn("Vulkan image already allocated for PBR atlas, releasing it");
             existingImage.close();
             setVGImage(null);
         }
@@ -41,10 +45,12 @@ public abstract class MixinPBRAtlasTexture extends AbstractTexture implements IV
         img.get().setDebugUtilsObjectName("PBRAtlasTexture");
         setVGImage(img);
 
-        Vulkanite.INSTANCE.getCtx().cmd.executeWait(cmdbuf -> {
-            cmdbuf.encodeImageTransition(new VRef<>(img.get()), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
-        });
-
+        try (VRef<VImage> image = new VRef<>(img.get())) {
+            Vulkanite.INSTANCE.getCtx().cmd.executeWait(cmdbuf -> {
+                cmdbuf.encodeImageTransition(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+            });
+        }
 
         GlStateManager._bindTexture(getGlId());
         if (maxLevel >= 0) {

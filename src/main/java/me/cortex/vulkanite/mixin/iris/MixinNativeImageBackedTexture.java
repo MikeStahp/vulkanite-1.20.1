@@ -2,33 +2,30 @@ package me.cortex.vulkanite.mixin.iris;
 
 import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.platform.TextureUtil;
-import com.mojang.blaze3d.systems.RenderSystem;
 import me.cortex.vulkanite.client.Vulkanite;
 import me.cortex.vulkanite.compat.IVGImage;
 import me.cortex.vulkanite.lib.base.VRef;
-import me.cortex.vulkanite.mixin.minecraft.MixinAbstractTexture;
-import net.irisshaders.iris.gl.IrisRenderSystem;
+import me.cortex.vulkanite.lib.memory.VImage;
 import net.irisshaders.iris.targets.backed.NativeImageBackedCustomTexture;
 import net.minecraft.client.texture.AbstractTexture;
-import net.minecraft.client.texture.NativeImage;
 import net.minecraft.client.texture.NativeImageBackedTexture;
-import org.jetbrains.annotations.Nullable;
-import org.lwjgl.opengl.GL30;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.spongepowered.asm.mixin.*;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Redirect;
 
-import java.io.IOException;
-import java.nio.ByteBuffer;
-
-import static org.lwjgl.opengl.GL11C.*;
+import static org.lwjgl.opengl.GL11C.GL_RGBA8;
+import static org.lwjgl.opengl.GL11C.glDeleteTextures;
 import static org.lwjgl.vulkan.VK10.*;
 
 @Mixin(value = NativeImageBackedTexture.class, remap = false)
 public abstract class MixinNativeImageBackedTexture extends AbstractTexture implements IVGImage {
+    private static final Logger LOGGER = LoggerFactory.getLogger(MixinNativeImageBackedTexture.class);
+
     @Redirect(remap = true, method = "<init>(Lnet/minecraft/client/texture/NativeImage;)V", at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/platform/TextureUtil;prepareImage(III)V"))
     private void redirectGen(int id, int width, int height) {
-        if(!((Object) this instanceof NativeImageBackedCustomTexture)) {
+        if (!((Object) this instanceof NativeImageBackedCustomTexture)) {
             TextureUtil.prepareImage(id, width, height);
             return;
         }
@@ -39,7 +36,7 @@ public abstract class MixinNativeImageBackedTexture extends AbstractTexture impl
         }
         var existingImage = getVGImage();
         if (existingImage != null) {
-            System.err.println("Vulkan image already allocated, releasing");
+            LOGGER.warn("Vulkan image already allocated for native-backed texture, releasing it");
             existingImage.close();
             setVGImage(null);
         }
@@ -55,9 +52,12 @@ public abstract class MixinNativeImageBackedTexture extends AbstractTexture impl
         img.get().setDebugUtilsObjectName("NativeImageBackedTexture");
         setVGImage(img);
 
-        Vulkanite.INSTANCE.getCtx().cmd.executeWait(cmdbuf -> {
-            cmdbuf.encodeImageTransition(new VRef<>(img.get()), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
-        });
+        try (VRef<VImage> image = new VRef<>(img.get())) {
+            Vulkanite.INSTANCE.getCtx().cmd.executeWait(cmdbuf -> {
+                cmdbuf.encodeImageTransition(image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+            });
+        }
 
         GlStateManager._bindTexture(img.get().glId);
     }

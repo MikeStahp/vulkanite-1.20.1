@@ -1,6 +1,8 @@
 package me.cortex.vulkanite.client;
 
 import me.cortex.vulkanite.acceleration.AccelerationManager;
+import me.cortex.vulkanite.client.lighting.SectionLightManager;
+import me.cortex.vulkanite.client.rendering.DLSSBridge;
 import me.cortex.vulkanite.lib.base.VContext;
 
 import me.cortex.vulkanite.lib.base.VRef;
@@ -50,7 +52,9 @@ public class Vulkanite {
     private final ArbitarySyncPointCallback fencedCallback = new ArbitarySyncPointCallback();
 
     private final AccelerationManager accelerationManager;
+    private final SectionLightManager sectionLightManager = new SectionLightManager();
     private final HashMap<VDescriptorSetLayout, VRef<VDescriptorPool>> descriptorPools = new HashMap<>();
+    private boolean destroyed;
 
     public Vulkanite() {
         ctx = createVulkanContext();
@@ -78,12 +82,16 @@ public class Vulkanite {
 
     public void upload(List<ChunkBuildOutput> results) {
         /*
-         * if (((IAccelerationBuildResult)result).getAccelerationGeometryData() == null)
+         * if (((IAccelerationBuildResult)result).getAccelerationGeometry() == null)
          * return;//TODO: delete the chunk section in this case then or something
          * accelerationManager.chunkBuild(result);
          */
 
         accelerationManager.chunkBuilds(results);
+    }
+
+    public void updateSectionLights(List<ChunkBuildOutput> results) {
+        sectionLightManager.updateFromBuildResults(results);
     }
 
     public VRef<VDescriptorPool> getPoolByLayout(VRef<VDescriptorSetLayout> layout) {
@@ -103,6 +111,7 @@ public class Vulkanite {
     }
 
     public void sectionRemove(RenderSection section) {
+        sectionLightManager.removeSection(section);
         accelerationManager.sectionRemove(section);
     }
 
@@ -125,7 +134,14 @@ public class Vulkanite {
     }
 
     public void destroy() {
+        if (destroyed) {
+            return;
+        }
+        destroyed = true;
+
         vkDeviceWaitIdle(ctx.device);
+        DLSSBridge.shutdownNGX();
+        sectionLightManager.clear();
         accelerationManager.destroy();
         descriptorPools.clear();
     }
@@ -250,6 +266,10 @@ public class Vulkanite {
 
     public AccelerationManager getAccelerationManager() {
         return accelerationManager;
+    }
+
+    public SectionLightManager getSectionLightManager() {
+        return sectionLightManager;
     }
 
 }

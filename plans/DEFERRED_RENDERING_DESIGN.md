@@ -1,5 +1,11 @@
 # Vulkanite Deferred Rendering Pipeline Design
 
+> Superseded for lighting architecture by
+> `plans/DIRECTIONAL_LIGHTING_RESOURCE_PLAN.md`. Keep this document as a
+> historical reference for compute-pass mechanics, but do not implement deferred
+> lighting as a separate owner of sun/block lighting without first merging it
+> into the RTX pass graph described in the directional-lighting plan.
+
 ## Executive Summary
 
 This document describes the architecture for a deferred rendering pipeline in the "vulkanitedeferred" shaderpack. The design leverages the existing Vulkanite Vulkan-OpenGL interop infrastructure to implement a high-performance deferred lighting system using Vulkan compute shaders.

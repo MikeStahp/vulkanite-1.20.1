@@ -26,6 +26,7 @@ import static org.lwjgl.vulkan.VK10.*;
  */
 public class TLASInstanceBuffer {
     private static final int INSTANCE_UPLOAD_SLOTS = 3;
+    private static final int INITIAL_INSTANCE_CAPACITY = 32768;
 
     protected final VContext context;
 
@@ -48,7 +49,7 @@ public class TLASInstanceBuffer {
     public TLASInstanceBuffer(VContext context) {
         this.context = context;
         this.instanceUploadBuffers = new VRef[INSTANCE_UPLOAD_SLOTS];
-        resize(32768);
+        resize(INITIAL_INSTANCE_CAPACITY);
     }
 
     private static int roundUpPow2(int v) {
@@ -81,23 +82,35 @@ public class TLASInstanceBuffer {
      */
     public void resize(int newSize) {
         // Early return if already large enough
-        if (newSize <= maxInstances) {
+        if (newSize <= maxInstances && instances != null) {
             return;
+        }
+
+        int oldMaxInstances = maxInstances;
+        int oldCount = count;
+        boolean mappingsValid = loc2id.length >= oldCount && id2loc.length >= oldMaxInstances;
+        if (!mappingsValid) {
+            freeIds.clear();
+            oldMaxInstances = 0;
+            oldCount = 0;
+            count = 0;
         }
 
         newSize = roundUpPow2(newSize);
 
         // Resize the instance buffer
         VkAccelerationStructureInstanceKHR.Buffer newBuffer = VkAccelerationStructureInstanceKHR.calloc(newSize);
-        if (instances != null) {
+        if (instances != null && mappingsValid) {
             newBuffer.put(instances);
             newBuffer.rewind();
+        }
+        if (instances != null) {
             instances.free();
         }
         instances = newBuffer;
 
         // Add new ids to the free list
-        for (int i = maxInstances; i < newSize; i++) {
+        for (int i = oldMaxInstances; i < newSize; i++) {
             freeIds.enqueue(i);
         }
 
@@ -106,8 +119,8 @@ public class TLASInstanceBuffer {
         int[] newId2Loc = new int[newSize];
         Arrays.fill(newLoc2Id, -1);
         Arrays.fill(newId2Loc, -1);
-        System.arraycopy(loc2id, 0, newLoc2Id, 0, count);
-        System.arraycopy(id2loc, 0, newId2Loc, 0, maxInstances);
+        System.arraycopy(loc2id, 0, newLoc2Id, 0, Math.min(oldCount, newLoc2Id.length));
+        System.arraycopy(id2loc, 0, newId2Loc, 0, Math.min(oldMaxInstances, newId2Loc.length));
         loc2id = newLoc2Id;
         id2loc = newId2Loc;
 
@@ -121,19 +134,20 @@ public class TLASInstanceBuffer {
      * @return The allocated instance ID
      */
     protected int alloc(VkAccelerationStructureInstanceKHR instance) {
-        count++;
-        resize(count);
+        int loc = count;
+        resize(Math.max(loc + 1, INITIAL_INSTANCE_CAPACITY));
 
         int id = freeIds.dequeueInt();
 
         // Append to the end (dense buffer)
-        loc2id[count - 1] = id;
-        id2loc[id] = count - 1;
+        loc2id[loc] = id;
+        id2loc[id] = loc;
 
         // Copy the instance to the buffer
-        MemoryUtil.memCopy(instance.address(), instances.address(count - 1),
+        MemoryUtil.memCopy(instance.address(), instances.address(loc),
                 VkAccelerationStructureInstanceKHR.SIZEOF);
 
+        count = loc + 1;
         return id;
     }
 
@@ -245,6 +259,11 @@ public class TLASInstanceBuffer {
             instances.free();
             instances = null;
         }
+        freeIds.clear();
+        maxInstances = 0;
+        count = 0;
+        loc2id = new int[0];
+        id2loc = new int[0];
 
         for (int i = 0; i < instanceUploadBuffers.length; i++) {
             if (instanceUploadBuffers[i] != null) {
@@ -253,5 +272,6 @@ public class TLASInstanceBuffer {
             }
             instanceUploadCapacities[i] = 0L;
         }
+        instanceUploadCursor = 0;
     }
 }

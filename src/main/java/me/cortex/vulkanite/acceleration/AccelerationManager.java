@@ -12,11 +12,15 @@ import me.cortex.vulkanite.lib.memory.VAccelerationStructure;
 import me.cortex.vulkanite.lib.memory.VGImage;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSection;
 import me.jellysquid.mods.sodium.client.render.chunk.compile.ChunkBuildOutput;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedDeque;
 
 public class AccelerationManager {
+    private static final Logger LOGGER = LoggerFactory.getLogger(AccelerationManager.class);
+
     private final VContext ctx;
 
     private final AccelerationBlasBuilder blasBuilder;
@@ -47,6 +51,7 @@ public class AccelerationManager {
     // This updates the tlas internal structure, DOES NOT INCLUDING BUILDING THE
     // TLAS
     public void updateTick() {
+        long startNanos = System.nanoTime();
         BLASBatchResult batch;
         List<BLASBuildResult> results = new ArrayList<>();
         while ((batch = blasResults.poll()) != null) {
@@ -58,12 +63,21 @@ public class AccelerationManager {
 
         if (!results.isEmpty()) {
             tlasManager.updateSections(results);
+            LOGGER.info("[Vulkanite] BLAS results consumed: sections={}, maxEnqueueToTlas={} ms, updateTick={} ms",
+                    results.size(), formatMillis(maxEnqueueAgeNanos(results)),
+                    formatMillis(System.nanoTime() - startNanos));
         }
     }
 
     public VRef<VAccelerationStructure> buildTLAS(int queueId, VCmdBuff cmd) {
+        long waitStartNanos = System.nanoTime();
+        int waitCount = blasExecutions.size();
         ctx.cmd.queueWaitForExecutions(queueId, blasBuilder.getAsyncQueue(), blasExecutions);
         blasExecutions.clear();
+        if (waitCount > 0) {
+            LOGGER.info("[Vulkanite] TLAS queued wait for {} BLAS executions in {} ms",
+                    waitCount, formatMillis(System.nanoTime() - waitStartNanos));
+        }
         return tlasManager.buildTLAS(cmd);
     }
 
@@ -81,5 +95,18 @@ public class AccelerationManager {
 
     public void destroy() {
         tlasManager.destroy();
+    }
+
+    private static long maxEnqueueAgeNanos(List<BLASBuildResult> results) {
+        long now = System.nanoTime();
+        long max = 0L;
+        for (BLASBuildResult result : results) {
+            max = Math.max(max, Math.max(0L, now - result.data().enqueuedNanos()));
+        }
+        return max;
+    }
+
+    private static String formatMillis(long nanos) {
+        return String.format(Locale.ROOT, "%.3f", nanos / 1_000_000.0);
     }
 }

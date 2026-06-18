@@ -12,6 +12,8 @@ import net.minecraft.util.Pair;
 import net.minecraft.util.math.ChunkSectionPos;
 import org.joml.Matrix4x3f;
 import org.lwjgl.vulkan.VkAccelerationStructureInstanceKHR;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedDeque;
@@ -27,6 +29,8 @@ import static org.lwjgl.vulkan.VK12.*;
  * geometry buffers, and tracking active sections for TLAS building.
  */
 public class TLASSectionManager extends TLASInstanceBuffer {
+    private static final Logger LOGGER = LoggerFactory.getLogger(TLASSectionManager.class);
+
     private final TlasPointerArena arena = new TlasPointerArena(30000);
     private final ConcurrentLinkedDeque<BLASBuildResult> sectionUpdates = new ConcurrentLinkedDeque<>();
     private final ConcurrentLinkedDeque<RenderSection> sectionRemovals = new ConcurrentLinkedDeque<>();
@@ -89,6 +93,7 @@ public class TLASSectionManager extends TLASInstanceBuffer {
 
     @Override
     public Pair<VRef<VBuffer>, Integer> getInstanceBuffer() {
+        long startNanos = System.nanoTime();
         HashSet<RenderSection> removals = new HashSet<>();
         {
             RenderSection section;
@@ -135,6 +140,8 @@ public class TLASSectionManager extends TLASInstanceBuffer {
         for (var entry : updates.entrySet()) {
             newGeoms += entry.getValue().data().bufferOffsets().size();
         }
+        int updateCount = updates.size();
+        int removalCount = removals.size();
         resizeBindlessSet(Integer.max(arena.maxIndex + newGeoms, 1024));
 
         // Process updates
@@ -179,29 +186,40 @@ public class TLASSectionManager extends TLASInstanceBuffer {
 
                 // Ownership of result.structure() is transferred to the holder
                 var holder = TLASSectionHolder.create(id, geometryIndex, numGeometriesInInstance,
-                        result.structure(), this);
+                        result.structure(), geometryBufferDescSet.addRef(), this);
                 activeSections.put(section.getPosition(), holder);
             }
 
             for (var job : descriptorUpdateJobs) {
+                job.holder().get().attachGeometryDescriptorSet(geometryBufferDescSet.addRef());
                 dub.buffer(0, job.element(), job.geometryBuffer(), job.bufferOffsets());
                 job.geometryBuffer().close();
+                job.holder().close();
             }
             descriptorUpdateJobs.clear();
 
             dub.apply();
         }
 
-        return super.getInstanceBuffer();
+        Pair<VRef<VBuffer>, Integer> instanceBuffer = super.getInstanceBuffer();
+        if (updateCount > 0 || removalCount > 0) {
+            LOGGER.info("[Vulkanite] TLAS section table: updates={}, removals={}, newGeometryRanges={}, activeSections={}, instances={}, cpu={} ms",
+                    updateCount, removalCount, newGeoms, activeSections.size(), instanceBuffer.getRight(),
+                    formatMillis(System.nanoTime() - startNanos));
+        }
+        return instanceBuffer;
     }
 
     /**
      * Frees arena indices and removes descriptor set references.
      */
-    public void arenaFree(int index, int count) {
+    public void arenaFree(int index, int count, VRef<VDescriptorSet> descriptorSet) {
         arena.free(index, count);
-        for (int i = 0; i < count; i++) {
-            geometryBufferDescSet.get().removeRef(index + i);
+        VRef<VDescriptorSet> set = descriptorSet != null ? descriptorSet : geometryBufferDescSet;
+        if (set != null) {
+            for (int i = 0; i < count; i++) {
+                set.get().removeRef(index + i);
+            }
         }
     }
     /**
@@ -236,8 +254,10 @@ public class TLASSectionManager extends TLASInstanceBuffer {
 
         addEphemeralInstance(asi);
 
-        descriptorUpdateJobs.add(new DescriptorUpdateJob(geometryIndex, geometryBuffer.addRef(), bufferOffsets));
-        return TLASSectionHolder.create(-1, geometryIndex, numGeometries, structure.addRef(), this);
+        var holder = TLASSectionHolder.create(-1, geometryIndex, numGeometries, structure.addRef(), null, this);
+        descriptorUpdateJobs.add(new DescriptorUpdateJob(geometryIndex, geometryBuffer.addRef(), bufferOffsets,
+                holder.addRef()));
+        return holder;
     }
 
     public void destroy() {
@@ -255,6 +275,7 @@ public class TLASSectionManager extends TLASInstanceBuffer {
 
         for (var job : descriptorUpdateJobs) {
             job.geometryBuffer().close();
+            job.holder().close();
         }
         descriptorUpdateJobs.clear();
 
@@ -262,10 +283,15 @@ public class TLASSectionManager extends TLASInstanceBuffer {
             geometryBufferDescSet.close();
             geometryBufferDescSet = null;
         }
+        setCapacity = 0;
         if (geometryBufferSetLayout != null) {
             geometryBufferSetLayout.close();
             geometryBufferSetLayout = null;
         }
         super.destroy();
+    }
+
+    private static String formatMillis(long nanos) {
+        return String.format(Locale.ROOT, "%.3f", nanos / 1_000_000.0);
     }
 }

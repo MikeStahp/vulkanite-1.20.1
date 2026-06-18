@@ -18,6 +18,7 @@ import net.minecraft.client.texture.MissingSprite;
 import net.minecraft.client.texture.SpriteAtlasTexture;
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.entity.Entity;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -27,6 +28,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -44,19 +46,12 @@ public final class EntityCapture implements AutoCloseable {
     public static final int VERTEX_STRIDE = 64;
     public static final int MAX_TEXTURES = 256;
 
+    private static final int DISTANCE_CULL_DISABLED_RADIUS = 256;
     private static final Logger LOGGER = LoggerFactory.getLogger(EntityCapture.class);
     private final TextureRegistry textures = new TextureRegistry();
 
-    public Frame capture(float tickDelta, ClientWorld world) {
-        return capture(tickDelta, world, Integer.MAX_VALUE);
-    }
-
-    public Frame capture(float tickDelta, ClientWorld world, int maxEntities) {
-        return capture(tickDelta, world, null, maxEntities, 0, false);
-    }
-
     public Frame capture(float tickDelta, ClientWorld world, Camera camera, int maxEntities,
-            int maxParticles, boolean captureParticles) {
+            int maxParticles, boolean captureParticles, int maxEntityDistance) {
         MinecraftClient client = MinecraftClient.getInstance();
         if (world == null || client.worldRenderer == null) {
             return null;
@@ -67,7 +62,7 @@ public final class EntityCapture implements AutoCloseable {
         List<EntityRenderData> entities = new ArrayList<>();
 
         if (maxEntities > 0) {
-            for (var entity : world.getEntities()) {
+            for (Entity entity : collectEntityCandidates(world, camera, maxEntityDistance)) {
                 if (entities.size() >= maxEntities) {
                     break;
                 }
@@ -98,6 +93,34 @@ public final class EntityCapture implements AutoCloseable {
             return null;
         }
         return new Frame(entities, textures.retainImages());
+    }
+
+    private static List<Entity> collectEntityCandidates(ClientWorld world, Camera camera, int maxEntityDistance) {
+        Vec3d cameraPos = camera == null ? null : camera.getPos();
+        double maxDistanceSquared = maxDistanceSquared(maxEntityDistance);
+        List<Entity> candidates = new ArrayList<>();
+        for (Entity entity : world.getEntities()) {
+            if (cameraPos == null || distanceSquared(entity, cameraPos) <= maxDistanceSquared) {
+                candidates.add(entity);
+            }
+        }
+        if (cameraPos != null) {
+            candidates.sort(Comparator.comparingDouble(entity -> distanceSquared(entity, cameraPos)));
+        }
+        return candidates;
+    }
+
+    private static double maxDistanceSquared(int maxEntityDistance) {
+        return maxEntityDistance >= DISTANCE_CULL_DISABLED_RADIUS
+                ? Double.POSITIVE_INFINITY
+                : maxEntityDistance * (double) maxEntityDistance;
+    }
+
+    private static double distanceSquared(Entity entity, Vec3d position) {
+        double dx = entity.getX() - position.x;
+        double dy = entity.getY() - position.y;
+        double dz = entity.getZ() - position.z;
+        return dx * dx + dy * dy + dz * dz;
     }
 
     public record Geometry(ByteBuffer vertices, int vertexCount, Identifier textureId) {
@@ -144,9 +167,11 @@ public final class EntityCapture implements AutoCloseable {
         private final List<VRef<VGImage>> images = new ArrayList<>();
 
         private MinecraftClient client;
+        private int frameMaxTextureIndex = -1;
 
         private void beginFrame(MinecraftClient client) {
             this.client = client;
+            this.frameMaxTextureIndex = -1;
         }
 
         TextureBinding resolve(RenderLayer layer) {
@@ -161,7 +186,7 @@ public final class EntityCapture implements AutoCloseable {
         TextureBinding resolveTexture(Identifier id) {
             Integer existing = indices.get(id);
             if (existing != null) {
-                return new TextureBinding(existing, id);
+                return bind(existing, id);
             }
             if (images.size() >= MAX_TEXTURES) {
                 return resolveMissingTexture();
@@ -182,7 +207,7 @@ public final class EntityCapture implements AutoCloseable {
                 indices.put(id, index);
                 images.add(shared);
                 shared = null;
-                return new TextureBinding(index, id);
+                return bind(index, id);
             } catch (NullPointerException e) {
                 if (!id.equals(MissingSprite.getMissingSpriteId())) {
                     return resolveMissingTexture();
@@ -198,7 +223,7 @@ public final class EntityCapture implements AutoCloseable {
         private TextureBinding resolveMissingTexture() {
             Integer existing = indices.get(MissingSprite.getMissingSpriteId());
             return existing != null
-                    ? new TextureBinding(existing, MissingSprite.getMissingSpriteId())
+                    ? bind(existing, MissingSprite.getMissingSpriteId())
                     : resolveLayerTexture(MissingSprite.getMissingSpriteId());
         }
 
@@ -214,7 +239,7 @@ public final class EntityCapture implements AutoCloseable {
                 indices.put(id, index);
                 images.add(shared);
                 shared = null;
-                return new TextureBinding(index, id);
+                return bind(index, id);
             } catch (NullPointerException e) {
                 return null;
             } finally {
@@ -225,11 +250,17 @@ public final class EntityCapture implements AutoCloseable {
         }
 
         List<VRef<VGImage>> retainImages() {
-            List<VRef<VGImage>> refs = new ArrayList<>(images.size());
-            for (VRef<VGImage> image : images) {
-                refs.add(image.addRef());
+            int count = Math.min(images.size(), frameMaxTextureIndex + 1);
+            List<VRef<VGImage>> refs = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                refs.add(images.get(i).addRef());
             }
             return refs;
+        }
+
+        private TextureBinding bind(int index, Identifier id) {
+            frameMaxTextureIndex = Math.max(frameMaxTextureIndex, index);
+            return new TextureBinding(index, id);
         }
 
         @Override

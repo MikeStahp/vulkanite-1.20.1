@@ -7,6 +7,8 @@ import net.irisshaders.iris.shaderpack.ShaderPack;
 import net.irisshaders.iris.shaderpack.include.AbsolutePackPath;
 import net.irisshaders.iris.shaderpack.programs.ProgramSet;
 import net.irisshaders.iris.shaderpack.properties.ShaderProperties;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
@@ -24,6 +26,9 @@ import java.util.regex.Pattern;
 
 @Mixin(value = ProgramSet.class, remap = false)
 public abstract class MixinProgramSet implements IGetRaytracingSource {
+    @Unique
+    private static final Logger LOGGER = LoggerFactory.getLogger(MixinProgramSet.class);
+
     @Unique
     private static final String VULKANITE_RESTIR_DEFINE = "VULKANITE_RESTIR";
 
@@ -198,15 +203,13 @@ public abstract class MixinProgramSet implements IGetRaytracingSource {
     @Inject(method = "<init>", at = @At("TAIL"))
     private void injectRTShaders(AbsolutePackPath directory, Function<AbsolutePackPath, String> sourceProvider,
             ShaderProperties shaderProperties, ShaderPack pack, CallbackInfo ci) {
-        System.out.println("[Vulkanite] Checking for ray tracing shaders...");
+        LOGGER.info("Checking for ray tracing shaders");
 
         DLSSConfig dlssConfig = DLSSConfig.load();
         boolean enableDLSSRR = dlssConfig.isRayReconstructionEnabled();
         String firstRaygen = sourceProvider.apply(directory.resolve("ray0.rgen"));
-        Boolean packRestirSetting = getPackRestirSetting(firstRaygen);
-        boolean packUsesRestir = usesRestirApi(firstRaygen);
         boolean enableReSTIR = dlssConfig.isReSTIREnabled()
-                && (Boolean.TRUE.equals(packRestirSetting) || packUsesRestir);
+                && (Boolean.TRUE.equals(getPackRestirSetting(firstRaygen)) || usesRestirApi(firstRaygen));
 
         StringBuilder definesBuilder = new StringBuilder();
         definesBuilder.append("#define ENABLE_DLSS_RR ").append(enableDLSSRR ? 1 : 0).append("\n");
@@ -234,7 +237,7 @@ public abstract class MixinProgramSet implements IGetRaytracingSource {
         while (true) {
             int pass = passId++;
             var gen = pass == 0 ? firstRaygen : sourceProvider.apply(directory.resolve("ray" + pass + ".rgen"));
-            System.out.println("[Vulkanite] Looking for ray" + pass + ".rgen, found: " + (gen != null));
+            LOGGER.debug("Looking for ray{}.rgen, found: {}", pass, gen != null);
             if (gen == null)
                 break;
 
@@ -284,14 +287,14 @@ public abstract class MixinProgramSet implements IGetRaytracingSource {
                     gen,
                     missSources.toArray(new String[0]),
                     hitSources.toArray(new RaytracingShaderSource.RayHitSource[0])));
-            System.out.println("[Vulkanite] Found ray pass " + pass + " with " + missSources.size()
-                    + " miss shaders and " + hitSources.size() + " hit shaders");
+            LOGGER.info("Found ray pass {} with {} miss shaders and {} hit shaders",
+                    pass, missSources.size(), hitSources.size());
         }
         if (!sourceList.isEmpty()) {
             sources = sourceList.toArray(new RaytracingShaderSource[0]);
-            System.out.println("[Vulkanite] Ray tracing shaders loaded: " + sources.length + " passes");
+            LOGGER.info("Ray tracing shaders loaded: {} passes", sources.length);
         } else {
-            System.out.println("[Vulkanite] No ray tracing shaders found");
+            LOGGER.info("No ray tracing shaders found");
         }
     }
 

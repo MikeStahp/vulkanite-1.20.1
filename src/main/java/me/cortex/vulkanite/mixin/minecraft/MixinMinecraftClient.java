@@ -2,6 +2,7 @@ package me.cortex.vulkanite.mixin.minecraft;
 
 import com.mojang.blaze3d.systems.RenderSystem;
 import me.cortex.vulkanite.client.Vulkanite;
+import me.cortex.vulkanite.client.rendering.VulkanPipeline;
 import net.minecraft.client.MinecraftClient;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -19,5 +20,11 @@ public class MixinMinecraftClient {
     @Inject(method = "render", at = @At(value = "TAIL"))
     private void tickFences(boolean tick, CallbackInfo ci) {
         Vulkanite.INSTANCE.fenceTick();
+    }
+
+    @Inject(method = "close", at = @At("HEAD"))
+    private void shutdownVulkanite(CallbackInfo ci) {
+        VulkanPipeline.destroyActivePipelines();
+        Vulkanite.INSTANCE.destroy();
     }
 }

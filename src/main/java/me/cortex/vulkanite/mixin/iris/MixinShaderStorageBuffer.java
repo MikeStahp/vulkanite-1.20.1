@@ -1,6 +1,5 @@
 package me.cortex.vulkanite.mixin.iris;
 
-import me.cortex.vulkanite.client.Vulkanite;
 import me.cortex.vulkanite.compat.IVGBuffer;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.memory.VGBuffer;
@@ -10,7 +9,6 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
 
 import static org.lwjgl.opengl.GL15C.glDeleteBuffers;
@@ -29,6 +27,9 @@ public class MixinShaderStorageBuffer implements IVGBuffer {
         if (vkBuffer != null && buffer != null) {
             throw new IllegalStateException("Override buffer not null");
         }
+        if (vkBuffer != null) {
+            safeClose(vkBuffer);
+        }
         this.vkBuffer = buffer;
         if (buffer != null) {
             glDeleteBuffers(id);
@@ -39,9 +40,19 @@ public class MixinShaderStorageBuffer implements IVGBuffer {
     @Redirect(method = "destroy", at = @At(value = "INVOKE", target = "Lnet/irisshaders/iris/gl/IrisRenderSystem;deleteBuffers(I)V"))
     private void redirectDelete(int id) {
         if (vkBuffer != null) {
+            safeClose(vkBuffer);
             vkBuffer = null;
         } else {
             IrisRenderSystem.deleteBuffers(id);
+        }
+    }
+
+    @Unique
+    private static void safeClose(VRef<?> ref) {
+        try {
+            ref.close();
+        } catch (NullPointerException ignored) {
+            // The referenced buffer may already have been collected during reload.
         }
     }
 }

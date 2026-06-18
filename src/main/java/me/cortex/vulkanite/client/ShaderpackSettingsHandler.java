@@ -265,6 +265,11 @@ public class ShaderpackSettingsHandler {
                     config.rtxMaxCapturedParticles = value;
                     LOGGER.info("[Vulkanite] Set RTX particle capture cap to {} from {}", value, source);
                 });
+        applyInt(settings, source, "rtxEntityCaptureRadius", "RTX_ENTITY_CAPTURE_RADIUS", 8, 256,
+                value -> {
+                    config.rtxEntityCaptureRadius = value;
+                    LOGGER.info("[Vulkanite] Set RTX entity capture radius to {} from {}", value, source);
+                });
         applyInt(settings, source, "rtxEntityBlasCacheSize", "RTX_ENTITY_BLAS_CACHE", 32, 2048,
                 value -> {
                     config.rtxEntityBlasCacheSize = value;

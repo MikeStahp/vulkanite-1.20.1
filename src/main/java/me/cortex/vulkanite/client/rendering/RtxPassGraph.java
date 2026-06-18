@@ -62,7 +62,6 @@ final class RtxPassGraph {
                     frame.enableReSTIR(),
                     frame.debugMode(),
                     frame.debugCellIndex(),
-                    frame.separateStableBlocklight(),
                     frame.currentReservoir(),
                     frame.previousReservoir(),
                     frame.diffuseAlbedoMetallic(),
@@ -73,6 +72,8 @@ final class RtxPassGraph {
                     frame.specularHitDepth(),
                     frame.firstHitDepth(),
                     frame.blocklightDetail(),
+                    frame.sectionLightBuffer(),
+                    frame.sectionLightProbeBuffer(),
                     frame.noisyOutput(),
                     frame.renderWidth(),
                     frame.renderHeight());
@@ -107,7 +108,6 @@ final class RtxPassGraph {
             int enableReSTIR,
             int debugMode,
             int debugCellIndex,
-            int separateStableBlocklight,
             VRef<VImage> currentReservoir,
             VRef<VImage> previousReservoir,
             VRef<VImage> diffuseAlbedoMetallic,
@@ -118,6 +118,8 @@ final class RtxPassGraph {
             VRef<VImage> specularHitDepth,
             VRef<VImage> firstHitDepth,
             VRef<VImage> blocklightDetail,
+            VRef<VBuffer> sectionLightBuffer,
+            VRef<VBuffer> sectionLightProbeBuffer,
             VRef<VImage> noisyOutput,
             int renderWidth,
             int renderHeight) {

@@ -17,6 +17,8 @@ import me.cortex.vulkanite.acceleration.tlas.TLASSectionHolder;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSection;
 import org.joml.Matrix4x3f;
 import org.lwjgl.vulkan.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.*;
 
@@ -30,6 +32,7 @@ import static org.lwjgl.vulkan.VK10.*;
  * Coordinates section updates, entity geometry, and TLAS building.
  */
 public class AccelerationTLASManager {
+    private static final Logger LOGGER = LoggerFactory.getLogger(AccelerationTLASManager.class);
     private static final int TLAS_BUILD_SLOTS = 3;
 
     private final EntityBlasBuilder entityBlasBuilder;
@@ -94,6 +97,7 @@ public class AccelerationTLASManager {
      */
     public VRef<VAccelerationStructure> buildTLAS(VCmdBuff cmd) {
         RenderSystem.assertOnRenderThread();
+        long startNanos = System.nanoTime();
 
         if (!tlasDirty) {
             if (cachedTlas != null) {
@@ -139,6 +143,8 @@ public class AccelerationTLASManager {
                 replaceCachedTlas(cmd, null, List.of());
                 installedTransientHolders = true;
                 tlasDirty = false;
+                LOGGER.info("[Vulkanite] TLAS encode: no instances, activeSections={}, cpu={} ms",
+                        buildDataManager.activeSections.size(), formatMillis(System.nanoTime() - startNanos));
                 return null;
             }
 
@@ -218,6 +224,9 @@ public class AccelerationTLASManager {
             replaceCachedTlas(cmd, tlas.addRef(), transientHolders);
             installedTransientHolders = true;
             tlasDirty = false;
+            LOGGER.info("[Vulkanite] TLAS encode: instances={}, activeSections={}, transientInstances={}, cpu={} ms",
+                    numInstances, buildDataManager.activeSections.size(), transientHolders.size(),
+                    formatMillis(System.nanoTime() - startNanos));
             return tlas;
         } finally {
             if (!installedTransientHolders) {
@@ -336,5 +345,9 @@ public class AccelerationTLASManager {
                 slot.scratch = null;
             }
         }
+    }
+
+    private static String formatMillis(long nanos) {
+        return String.format(Locale.ROOT, "%.3f", nanos / 1_000_000.0);
     }
 }

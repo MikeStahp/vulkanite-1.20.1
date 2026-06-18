@@ -118,25 +118,31 @@ public class BLASCompactor {
         
         // Submit compaction command
         LOGGER.info("[BLAS Compactor] Batch #{} Enqueueing compaction command", batchNumber);
+        long submitStartTime = System.nanoTime();
         CompletableFuture<Long> blasExecutionFuture = context.cmd.enqueueSubmission(asyncQueue, cmdRef);
+        long submitTime = System.nanoTime() - submitStartTime;
         cmdRef.close();
         
-        // Wait for compaction to complete
-        Long blasExecution;
+        long blasExecution;
         try {
+            long waitStartTime = System.nanoTime();
             blasExecution = blasExecutionFuture.get();
-            long compactTime = (System.nanoTime() - compactStartTime) / 1_000_000;
-            LOGGER.debug("[BLAS Compactor] Batch #{} Compaction completed in {} ms (execution={})",
-                batchNumber, compactTime, blasExecution);
+            long waitTime = System.nanoTime() - waitStartTime;
+            long compactTime = System.nanoTime() - compactStartTime;
+            LOGGER.info("[BLAS Compactor] Batch #{} Compaction completed (execution={}) enqueue={} ms, submissionWait={} ms, compactStage={} ms",
+                    batchNumber, blasExecution, formatMillis(submitTime), formatMillis(waitTime),
+                    formatMillis(compactTime));
         } catch (Exception e) {
-            LOGGER.error("[BLAS Compactor] Batch #{} Error waiting for compaction", batchNumber, e);
-            throw new RuntimeException("Failed to complete BLAS compaction submission", e);
+            LOGGER.error("[BLAS Compactor] Batch #{} Failed while waiting for compaction submission", batchNumber, e);
+            throw new RuntimeException(e);
         }
         
         // Publish results
         try {
             resultConsumer.accept(new BLASBatchResult(results, blasExecution));
-            LOGGER.debug("[BLAS Compactor] Batch #{} Results published successfully", batchNumber);
+            LOGGER.info("[BLAS Compactor] Batch #{} Published {} results, enqueueToPublish avg={} ms, max={} ms",
+                    batchNumber, results.size(), formatMillis(averageEnqueueToPublishNanos(results)),
+                    formatMillis(maxEnqueueToPublishNanos(results)));
         } catch (Exception e) {
             LOGGER.error("[BLAS Compactor] Batch #{} Error publishing results", batchNumber, e);
             throw e;
@@ -151,5 +157,30 @@ public class BLASCompactor {
         }
         
         LOGGER.info("[BLAS Compactor] Batch #{} Compaction complete", batchNumber);
+    }
+
+    private static long averageEnqueueToPublishNanos(List<BLASBuildResult> results) {
+        if (results.isEmpty()) {
+            return 0L;
+        }
+        long now = System.nanoTime();
+        long total = 0L;
+        for (BLASBuildResult result : results) {
+            total += Math.max(0L, now - result.data().enqueuedNanos());
+        }
+        return total / results.size();
+    }
+
+    private static long maxEnqueueToPublishNanos(List<BLASBuildResult> results) {
+        long now = System.nanoTime();
+        long max = 0L;
+        for (BLASBuildResult result : results) {
+            max = Math.max(max, Math.max(0L, now - result.data().enqueuedNanos()));
+        }
+        return max;
+    }
+
+    private static String formatMillis(long nanos) {
+        return String.format(java.util.Locale.ROOT, "%.3f", nanos / 1_000_000.0);
     }
 }

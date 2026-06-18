@@ -1,6 +1,7 @@
 package me.cortex.vulkanite.mixin.minecraft;
 
 import me.cortex.vulkanite.client.rendering.JitterManager;
+import me.cortex.vulkanite.client.config.DLSSConfig;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.GameRenderer;
 import org.joml.Matrix4f;
@@ -23,6 +24,11 @@ public class MixinGameRenderer {
     private void onRenderUpdateJitter(float tickDelta, long startTime, boolean tick, CallbackInfo ci) {
     	MinecraftClient client = MinecraftClient.getInstance();
     	if (client.getWindow() != null) {
+            DLSSConfig config = DLSSConfig.load();
+            if (client.world == null || client.currentScreen != null || client.isPaused()
+                    || !config.isEnabled() || config.isDebugEnabled()) {
+                JitterManager.setDLSSActive(false);
+            }
     		// Only update jitter values; activation state is managed by VulkanPipeline
     		JitterManager.updateJitter(client.getWindow().getFramebufferWidth(),
     			client.getWindow().getFramebufferHeight());

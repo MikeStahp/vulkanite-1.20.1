@@ -81,7 +81,16 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 tasks.withType(JavaExec).configureEach {
-    javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
+    def customJavaHome = providers.gradleProperty("vulkanite.java.home")
+            .orElse(providers.environmentVariable("VULKANITE_JAVA_HOME"))
+    if (customJavaHome.present) {
+        def javaExecutable = System.getProperty("os.name").toLowerCase().contains("win")
+                ? "bin/java.exe"
+                : "bin/java"
+        executable = layout.projectDirectory.file("${customJavaHome.get()}/${javaExecutable}").asFile.absolutePath
+    } else {
+        javaLauncher.set(javaToolchains.launcherFor(java.toolchain))
+    }
     jvmArgs "-Dorg.lwjgl.system.stackSize=8192", "-Xmx6G",
             "--add-opens=java.base/java.nio=ALL-UNNAMED",
             "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED",
@@ -142,6 +151,62 @@ tasks.register("syncVulkaniteShaderpacks") {
                 exclude("**/*.spv")
             }
         }
+    }
+}
+
+tasks.register("validateVulkaniteShaderpackDrift") {
+    group = "vulkanite"
+    description = "Fails if runtime Vulkanite shaderpacks differ from tracked sources after sync."
+    dependsOn(tasks.named("syncVulkaniteShaderpacks"))
+
+    doLast {
+        def packNames = ["VulkaniteRT", "VulkaniteDeferred", "VulkaniteNormal"]
+        def normalize = { File file ->
+            file.getText("UTF-8").replace("\r\n", "\n").replace("\r", "\n")
+        }
+        def relativize = { File root, File file ->
+            root.toPath().relativize(file.toPath()).toString().replace(File.separatorChar, '/' as char)
+        }
+
+        def drift = []
+        packNames.each { packName ->
+            def sourceRoot = layout.projectDirectory.dir("shaderpacks/${packName}").asFile
+            if (!sourceRoot.isDirectory()) {
+                logger.info("Skipping ${packName}: tracked source directory does not exist")
+                return
+            }
+
+            def targetRoot = layout.projectDirectory.dir("run/shaderpacks/${packName}").asFile
+            if (!targetRoot.isDirectory()) {
+                drift.add("${packName}: runtime shaderpack directory is missing")
+                return
+            }
+
+            def sourceFiles = fileTree(sourceRoot) {
+                exclude("**/*.spv")
+            }.files.findAll { it.isFile() }.collectEntries { [relativize(sourceRoot, it), it] }
+            def targetFiles = fileTree(targetRoot) {
+                exclude("**/*.spv")
+            }.files.findAll { it.isFile() }.collectEntries { [relativize(targetRoot, it), it] }
+
+            (sourceFiles.keySet() - targetFiles.keySet()).sort().each {
+                drift.add("${packName}: missing runtime file ${it}")
+            }
+            (targetFiles.keySet() - sourceFiles.keySet()).sort().each {
+                drift.add("${packName}: extra runtime file ${it}")
+            }
+            sourceFiles.keySet().intersect(targetFiles.keySet()).sort().each {
+                if (normalize(sourceFiles[it]) != normalize(targetFiles[it])) {
+                    drift.add("${packName}: content differs for ${it}")
+                }
+            }
+        }
+
+        if (!drift.isEmpty()) {
+            throw new GradleException("Runtime shaderpack drift detected:\n - " + drift.join("\n - "))
+        }
+
+        logger.lifecycle("Vulkanite shaderpack runtime copies match tracked sources.")
     }
 }
 

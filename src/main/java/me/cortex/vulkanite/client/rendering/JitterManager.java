@@ -69,8 +69,8 @@ private static int currentRenderHeight = 1080;
 public static void updateJitter(int outputWidth, int outputHeight) {
 frameCounter++;
 // Store previous jitter before updating (for DLSS motion vectors)
-prevJitterX = jitterX;
-prevJitterY = jitterY;
+prevJitterX = getJitterX();
+prevJitterY = getJitterY();
 
 // Update the ResolutionScaleManager with current output dimensions
 // This ensures all components use consistent scaled dimensions
@@ -82,8 +82,8 @@ scaleManager.update(outputWidth, outputHeight);
 currentRenderWidth = scaleManager.getRenderWidth();
 currentRenderHeight = scaleManager.getRenderHeight();
 
-// Only apply jitter when DLSS is actively processing
-// Otherwise, disable jitter to prevent image shaking
+// Only advance the camera jitter while the temporal path is active. Public
+// getters also mask stale values if DLSS is disabled later in the frame.
 if (!isEnabled || !dlssActive || currentRenderWidth <= 0 || currentRenderHeight <= 0) {
 jitterX = 0;
 jitterY = 0;
@@ -92,7 +92,7 @@ return;
 
 // On first frame after activation, set prevJitter to current to avoid
 // spurious motion from invalid previous state
-if (firstFrameAfterActivation) {
+if (dlssActive && firstFrameAfterActivation) {
 prevJitterX = 0;
 prevJitterY = 0;
 firstFrameAfterActivation = false;
@@ -129,14 +129,16 @@ System.out.println("[JitterManager] frameIndex=" + frameIndex +
      * @param projectionMatrix The projection matrix to modify
      */
  public static void applyJitter(Matrix4f projectionMatrix) {
-     if (!isEnabled || !dlssActive || (jitterX == 0 && jitterY == 0))
+     float activeJitterX = getJitterX();
+     float activeJitterY = getJitterY();
+     if (activeJitterX == 0 && activeJitterY == 0)
          return;
      // Use RENDER resolution for NDC conversion (correct for DLSS temporal sampling)
      // Jitter offsets are in render resolution pixel space and must be converted
      // to NDC using the render resolution, not the output resolution.
      // Using output resolution causes incorrect jitter scaling and artifacts.
-     float ndcJitterX = (jitterX * 2.0f) / currentRenderWidth;
-     float ndcJitterY = (jitterY * 2.0f) / currentRenderHeight;
+     float ndcJitterX = (activeJitterX * 2.0f) / currentRenderWidth;
+     float ndcJitterY = (activeJitterY * 2.0f) / currentRenderHeight;
      // Perspective view-space Z is negative, so adding the projection offset
      // shifts geometry by -jitter on screen. A fixed output pixel therefore
      // samples the same world point as the RT path's pixelCenter + jitter.
@@ -146,11 +148,13 @@ System.out.println("[JitterManager] frameIndex=" + frameIndex +
 
  public static Matrix4f copyWithoutJitter(Matrix4f jitteredProjection, Matrix4f destination) {
      destination.set(jitteredProjection);
-     if (!isEnabled || !dlssActive || currentRenderWidth <= 0 || currentRenderHeight <= 0 || (jitterX == 0 && jitterY == 0))
+     float activeJitterX = getJitterX();
+     float activeJitterY = getJitterY();
+     if (currentRenderWidth <= 0 || currentRenderHeight <= 0 || (activeJitterX == 0 && activeJitterY == 0))
          return destination;
 
-     float ndcJitterX = (jitterX * 2.0f) / currentRenderWidth;
-     float ndcJitterY = (jitterY * 2.0f) / currentRenderHeight;
+     float ndcJitterX = (activeJitterX * 2.0f) / currentRenderWidth;
+     float ndcJitterY = (activeJitterY * 2.0f) / currentRenderHeight;
      destination.m20(destination.m20() - ndcJitterX);
      destination.m21(destination.m21() - ndcJitterY);
      return destination;
@@ -173,7 +177,7 @@ System.out.println("[JitterManager] frameIndex=" + frameIndex +
      * This is what DLSS expects for InJitterOffsetX.
      */
     public static float getJitterX() {
-        return jitterX;
+        return isEnabled && dlssActive ? jitterX : 0.0f;
     }
 
     /**
@@ -181,7 +185,7 @@ System.out.println("[JitterManager] frameIndex=" + frameIndex +
      * This is what DLSS expects for InJitterOffsetY.
      */
     public static float getJitterY() {
-        return jitterY;
+        return isEnabled && dlssActive ? jitterY : 0.0f;
     }
 
     /**
@@ -229,6 +233,9 @@ System.out.println("[JitterManager] frameIndex=" + frameIndex +
         // Mark first frame after activation to handle temporal state properly
         if (active) {
             firstFrameAfterActivation = true;
+        } else {
+            prevJitterX = 0;
+            prevJitterY = 0;
         }
         // Do NOT reset jitter state here - let the sequence continue
         // to maintain temporal consistency for DLSS motion vectors
@@ -286,7 +293,7 @@ System.out.println("[JitterManager] frameIndex=" + frameIndex +
      * @return the difference between current and previous jitter X
      */
     public static float getJitterDeltaX() {
-        return jitterX - prevJitterX;
+        return getJitterX() - prevJitterX;
     }
 
     /**
@@ -294,7 +301,7 @@ System.out.println("[JitterManager] frameIndex=" + frameIndex +
      * @return the difference between current and previous jitter Y
      */
     public static float getJitterDeltaY() {
-        return jitterY - prevJitterY;
+        return getJitterY() - prevJitterY;
     }
 
     /**
@@ -363,8 +370,8 @@ System.out.println("[JitterManager] frameIndex=" + frameIndex +
      */
     public static float[] getJitterDebugInfo() {
         return new float[] {
-            jitterX,
-            jitterY,
+            getJitterX(),
+            getJitterY(),
             prevJitterX,
             prevJitterY,
             currentRenderWidth,

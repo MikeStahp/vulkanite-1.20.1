@@ -55,8 +55,6 @@ public class MixinIrisRenderingPipeline {
     @Final
     private float sunPathRotation;
     @Unique
-    private RaytracingShaderSet[] rtShaderPasses = null;
-    @Unique
     private VContext ctx;
     @Unique
     private VulkanPipeline pipeline;
@@ -83,6 +81,7 @@ public class MixinIrisRenderingPipeline {
         ctx = Vulkanite.INSTANCE.getCtx();
         var passes = ((IGetRaytracingSource) set).getRaytracingSource();
         LOGGER.info("Creating RT pipeline, passes: {}", passes != null ? passes.length : "null");
+        RaytracingShaderSet[] rtShaderPasses = null;
         if (passes != null) {
             rtShaderPasses = new RaytracingShaderSet[passes.length];
             for (int i = 0; i < passes.length; i++) {
@@ -100,29 +99,6 @@ public class MixinIrisRenderingPipeline {
         ShaderpackSettingsHandler.detectAndApplyShaderpack(pipeline);
     }
 
-    // Inject after renderTerrain (when G-Buffer is ready)
-    // NOTE: The target method name might vary depending on Iris version/mappings.
-    // In some versions it's renderTerrain, in others it might be different or have
-    // different arguments.
-    // Based on IrisRenderingPipeline source, there is a renderTerrain method.
-    // Let's try to match the exact signature or use a broader target if possible.
-    // The previous error was: "could not find any targets matching 'renderTerrain'
-    // in net.irisshaders.iris.pipeline.IrisRenderingPipeline"
-    // This means the method renderTerrain doesn't exist or has a different
-    // signature/name in the runtime jar.
-
-    // Fallback: Use composite pass start or similar point.
-    // Or check if renderTerrain is private/protected and needs mapping?
-    // Iris uses "renderTerrain" in source but it might be obfuscated or changed.
-
-    // Let's try to inject into "renderSolid" or similar if renderTerrain fails.
-    // Actually, looking at standard Iris pipeline, it calls:
-    // renderShadows -> renderTerrain -> renderTranslucents -> ...
-
-    // If renderTerrain is missing, maybe we can inject at the HEAD of
-    // renderTranslucents?
-    // That would be effectively after opaque terrain.
-
     @Inject(method = "finalizeLevelRendering", at = @At("HEAD"))
     private void finalizeLevelRendering(CallbackInfo ci) {
         // Keep OpenGL responsible for the complete compatibility frame, including
@@ -131,20 +107,11 @@ public class MixinIrisRenderingPipeline {
         runRayTracing(camera);
     }
 
-    @Inject(method = "renderShadows", at = @At("TAIL"))
-    private void renderShadows(CallbackInfo ci) {
-        // Remove RT from here, it's too early for Hybrid Rendering!
-        }
-
-        // NOTE: ResolutionScaleManager.update() is called from:
-        // 1. DeferredGBufferManager.initialize() - when creating G-buffers
-        // 2. VulkanPipeline.render() - during main render loop
-        // This ensures correct resolution is used for DLSS low-res output.
-
     @Unique
     private void runRayTracing(Camera camera) {
-        if (pipeline == null)
+        if (pipeline == null) {
             return;
+        }
         ShaderpackSettingsHandler.detectAndApplyShaderpack(pipeline);
 
         var prof = MinecraftClient.getInstance().getProfiler();
@@ -161,131 +128,17 @@ public class MixinIrisRenderingPipeline {
             outImgs.add(((IRenderTargetVkGetter) renderTargets.getOrCreate(i)).getMain());
         }
 
-        // Create G-buffer views for hybrid rendering
-        // G-buffer bindings:
-        // - Binding 7: colortex1 (Albedo) - render target index 1
-        // - Binding 8: colortex2 (Material Properties) - render target index 2
-        // - Binding 9: colortex3 (Normal) - render target index 3
-        // - Binding 10: colortex4 (World Position) - render target index 4
-        // - Binding 11: colortex5 (Additional Properties) - render target index 5
-        @SuppressWarnings("unchecked")
-        VRef<VImageView>[] gbufferViews = new VRef[5];
-        try {
-        var ctx = Vulkanite.INSTANCE.getCtx();
-        var requirements = pipeline.getPipelineRequirements();
-        boolean deferredMode = pipeline.isDeferredModeActive();
-
-        if (deferredMode) {
-            LOGGER.debug("Deferred mode active: binding colortex0-4 as deferred G-buffer inputs");
-            for (int i = 0; i < gbufferViews.length; i++) {
-                var target = renderTargets.getOrCreate(i);
-                var image = ((IRenderTargetVkGetter) target).getMain();
-                if (image != null && image.get() != null) {
-                    gbufferViews[i] = VImageView.create(ctx, new VRef<>(image.get()));
-                    LOGGER.debug("Deferred G-buffer colortex{} bound: {}x{}",
-                            i, image.get().width, image.get().height);
-                } else {
-                    LOGGER.warn("Deferred G-buffer colortex{} is null or invalid", i);
-                }
-            }
-        } else {
-        
-        LOGGER.info("G-buffer requirements: albedo={}, material={}, normal={}, worldPos={}, extra={}", 
-            requirements.needsAlbedo(), requirements.needsMaterial(), requirements.needsNormal(), 
-            requirements.needsWorldPos(), requirements.needsExtra());
-        
-        // Get colortex1 (Albedo) - render target 1
-        if (requirements.needsAlbedo()) {
-        	var albedoTarget = renderTargets.getOrCreate(1);
-        	var albedoImg = ((IRenderTargetVkGetter) albedoTarget).getMain();
-        	if (albedoImg != null && albedoImg.get() != null) {
-        		gbufferViews[0] = VImageView.create(ctx, new VRef<>(albedoImg.get()));
-        		// DIAGNOSTIC: Log G-buffer dimensions to verify full-resolution creation
-        		LOGGER.info("[DIAG-GBuffer] G-buffer albedo (colortex1) bound: {}x{} (window: {}x{})",
-        			albedoImg.get().width, albedoImg.get().height,
-        			MinecraftClient.getInstance().getWindow().getFramebufferWidth(),
-        			MinecraftClient.getInstance().getWindow().getFramebufferHeight());
-        		// TRANSPARENCY DIAG: Log resolution mismatch for transparent ghosting investigation
-        		var scaleManager = me.cortex.vulkanite.client.rendering.ResolutionScaleManager.getInstance();
-        		LOGGER.info("[TRANSPARENCY DIAG] G-buffer resolution: {}x{}, Render resolution: {}x{}, Output resolution: {}x{}, DLSS scaling: {}, Scale factor: {}",
-        			albedoImg.get().width, albedoImg.get().height,
-        			scaleManager.getRenderWidth(), scaleManager.getRenderHeight(),
-        			scaleManager.getOutputWidth(), scaleManager.getOutputHeight(),
-        			scaleManager.isScalingActive(), scaleManager.getScale());
-        	} else {
-        		LOGGER.warn("G-buffer albedo (colortex1) is null or invalid!");
-        	}
-        	// Note: Do NOT close albedoImg here - the view holds a reference to it
-        }
-        // Get colortex2 (Material Properties) - render target 2
-        if (requirements.needsMaterial()) {
-        var materialTarget = renderTargets.getOrCreate(2);
-        var materialImg = ((IRenderTargetVkGetter) materialTarget).getMain();
-        if (materialImg != null && materialImg.get() != null) {
-        gbufferViews[1] = VImageView.create(ctx, new VRef<>(materialImg.get()));
-        LOGGER.debug("G-buffer material (colortex2) bound: {}x{}", materialImg.get().width, materialImg.get().height);
-        } else {
-        LOGGER.warn("G-buffer material (colortex2) is null or invalid!");
-        }
-        // Note: Do NOT close materialImg here - the view holds a reference to it
-        }
-        // Get colortex3 (Normal) - render target 3
-        if (requirements.needsNormal()) {
-        var normalTarget = renderTargets.getOrCreate(3);
-        var normalImg = ((IRenderTargetVkGetter) normalTarget).getMain();
-        if (normalImg != null && normalImg.get() != null) {
-        gbufferViews[2] = VImageView.create(ctx, new VRef<>(normalImg.get()));
-        LOGGER.debug("G-buffer normal (colortex3) bound: {}x{}", normalImg.get().width, normalImg.get().height);
-        } else {
-        LOGGER.warn("G-buffer normal (colortex3) is null or invalid!");
-        }
-        // Note: Do NOT close normalImg here - the view holds a reference to it
-        }
-        // Get colortex4 (World Position) - render target 4
-        if (requirements.needsWorldPos()) {
-        var positionTarget = renderTargets.getOrCreate(4);
-        var positionImg = ((IRenderTargetVkGetter) positionTarget).getMain();
-        if (positionImg != null && positionImg.get() != null) {
-        gbufferViews[3] = VImageView.create(ctx, new VRef<>(positionImg.get()));
-        LOGGER.debug("G-buffer worldPos (colortex4) bound: {}x{}", positionImg.get().width, positionImg.get().height);
-        } else {
-        LOGGER.warn("G-buffer worldPos (colortex4) is null or invalid!");
-        }
-        // Note: Do NOT close positionImg here - the view holds a reference to it
-        }
-        // Get colortex5 (Additional Properties) - render target 5
-        if (requirements.needsExtra()) {
-        var additionalTarget = renderTargets.getOrCreate(5);
-        var additionalImg = ((IRenderTargetVkGetter) additionalTarget).getMain();
-        if (additionalImg != null && additionalImg.get() != null) {
-        gbufferViews[4] = VImageView.create(ctx, new VRef<>(additionalImg.get()));
-        LOGGER.debug("G-buffer extra (colortex5) bound: {}x{}", additionalImg.get().width, additionalImg.get().height);
-        } else {
-        LOGGER.warn("G-buffer extra (colortex5) is null or invalid!");
-        }
-        // Note: Do NOT close additionalImg here - the view holds a reference to it
-        }
-        }
-        } catch (Exception e) {
-        LOGGER.warn("Could not create G-buffer views: {}", e.getMessage());
-        e.printStackTrace();
-        }
-
+        VRef<VImageView>[] gbufferViews = createGbufferViews();
         MixinCelestialUniforms celestialUniforms = (MixinCelestialUniforms) (Object) new CelestialUniforms(
                 this.sunPathRotation);
 
-        // Camera is already available from method parameter
         if (camera == null) {
             camera = MinecraftClient.getInstance().gameRenderer.getCamera();
         }
 
         try {
             pipeline.renderPostShadows(outImgs, camera, buffers, celestialUniforms, gbufferViews);
-            
-            // DLSSD processing is now handled inside VulkanPipeline.renderPostShadows()
-            // where it has access to the command buffer for proper GPU synchronization
         } catch (DeviceLostException e) {
-            // Handle device loss - disable Vulkanite and log the error
             LOGGER.error("Device lost during rendering: {}", e.getMessage());
             Vulkanite.IS_ENABLED = false;
             LOGGER.error("Disabled due to device loss. Falling back to standard rendering.");
@@ -293,7 +146,6 @@ public class MixinIrisRenderingPipeline {
             for (var ref : outImgs) {
                 ref.close();
             }
-            // Clean up G-buffer views
             for (var ref : gbufferViews) {
                 if (ref != null) {
                     ref.close();
@@ -302,6 +154,54 @@ public class MixinIrisRenderingPipeline {
         }
 
         prof.pop();
+    }
+
+    @Unique
+    @SuppressWarnings("unchecked")
+    private VRef<VImageView>[] createGbufferViews() {
+        VRef<VImageView>[] views = new VRef[5];
+        try {
+            var requirements = pipeline.getPipelineRequirements();
+            if (requirements.needsAlbedo()) {
+                views[0] = createRenderTargetView(1, "albedo");
+            }
+            if (requirements.needsMaterial()) {
+                views[1] = createRenderTargetView(2, "material");
+            }
+            if (requirements.needsNormal()) {
+                views[2] = createRenderTargetView(3, "normal");
+            }
+            if (requirements.needsWorldPos()) {
+                views[3] = createRenderTargetView(4, "world position");
+            }
+            if (requirements.needsExtra()) {
+                views[4] = createRenderTargetView(5, "extra");
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Could not create G-buffer views: {}", e.getMessage());
+        }
+        return views;
+    }
+
+    @Unique
+    private VRef<VImageView> createRenderTargetView(int targetIndex, String label) {
+        var image = ((IRenderTargetVkGetter) renderTargets.getOrCreate(targetIndex)).getMain();
+        try {
+            if (image == null || image.get() == null) {
+                LOGGER.warn("G-buffer {} colortex{} is null or invalid", label, targetIndex);
+                return null;
+            }
+
+            LOGGER.debug("G-buffer {} colortex{} bound: {}x{}",
+                    label, targetIndex, image.get().width, image.get().height);
+            try (VRef<VImage> imageRef = new VRef<>(image.get())) {
+                return VImageView.create(Vulkanite.INSTANCE.getCtx(), imageRef);
+            }
+        } finally {
+            if (image != null) {
+                image.close();
+            }
+        }
     }
 
     @Inject(method = "shouldDisableVanillaEntityShadows", at = @At("HEAD"), cancellable = true)
@@ -318,10 +218,6 @@ public class MixinIrisRenderingPipeline {
 
         ctx.cmd.waitQueueIdle(0);
         pipeline.destroy();
-        rtShaderPasses = null;
         pipeline = null;
-
-        // Force a GC, collect all dangling resources
-        System.gc();
     }
 }

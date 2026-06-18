@@ -57,6 +57,8 @@ public final class PipelineDescriptorSets {
                     new ShaderReflection.Binding("", 19, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
                     new ShaderReflection.Binding("", 20, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
                     new ShaderReflection.Binding("", 21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
             });
 
     // Cache for base common set without G-buffer bindings (for full path tracers)
@@ -108,6 +110,8 @@ public final class PipelineDescriptorSets {
                     new ShaderReflection.Binding("", 19, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
                     new ShaderReflection.Binding("", 20, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
                     new ShaderReflection.Binding("", 21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
             });
 
     private PipelineDescriptorSets() {
@@ -151,6 +155,8 @@ public final class PipelineDescriptorSets {
                 new ShaderReflection.Binding("", 19, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
                 new ShaderReflection.Binding("", 20, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
                 new ShaderReflection.Binding("", 21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                new ShaderReflection.Binding("", 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                new ShaderReflection.Binding("", 23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
         });
     }
 
@@ -214,35 +220,4 @@ public final class PipelineDescriptorSets {
 		return new ShaderReflection.Set(new ArrayList<>(Arrays.asList(bindings)));
 	}
 
-	/**
-	 * Creates the expected deferred lighting descriptor set layout.
-	 * This set contains bindings for the deferred lighting compute shader:
-	 * <ul>
-	 * <li>Binding 0: UBO - Camera/sun uniforms</li>
-	 * <li>Bindings 7-11: G-buffer textures (colortex1-5)</li>
-	 * <li>Binding 20: Shadow map</li>
-	 * <li>Bindings 21-23: Output storage images</li>
-	 * </ul>
-	 */
-	public static ShaderReflection.Set createDeferredLightingSet() {
-		ArrayList<ShaderReflection.Binding> bindings = new ArrayList<>();
-
-		// Binding 0: UBO
-		bindings.add(new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, false));
-
-		// Bindings 7-11: G-buffer inputs (combined image samplers)
-		for (int i = 7; i <= 11; i++) {
-			bindings.add(new ShaderReflection.Binding("", i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false));
-		}
-
-		// Binding 20: Shadow map
-		bindings.add(new ShaderReflection.Binding("", 20, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, false));
-
-		// Bindings 21-23: Output storage images
-		for (int i = 21; i <= 23; i++) {
-			bindings.add(new ShaderReflection.Binding("", i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false));
-		}
-
-		return new ShaderReflection.Set(bindings);
-	}
 }

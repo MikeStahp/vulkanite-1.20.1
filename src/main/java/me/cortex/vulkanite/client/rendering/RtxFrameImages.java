@@ -4,6 +4,7 @@ import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.cmd.VCmdBuff;
 import me.cortex.vulkanite.lib.memory.VImage;
+import me.cortex.vulkanite.lib.other.VImageView;
 import org.lwjgl.vulkan.VkClearColorValue;
 import org.lwjgl.vulkan.VkImageSubresourceRange;
 import org.slf4j.Logger;
@@ -19,8 +20,7 @@ import static org.lwjgl.vulkan.VK10.*;
  *
  * <p>The DLSS-facing resources mirror Radiance's module contract: ray tracing
  * produces radiance, material guides, motion, linear depth, and hit-depth
- * sidecars; DLSS consumes those and produces processed HDR plus upscaled
- * sidecars.</p>
+ * sidecars; DLSS consumes those and produces processed HDR.</p>
  */
 final class RtxFrameImages {
     private static final Logger LOGGER = LoggerFactory.getLogger(RtxFrameImages.class);
@@ -29,21 +29,24 @@ final class RtxFrameImages {
     private final VRef<VImage>[] reservoirs = new VRef[2];
 
     private VRef<VImage> radiance;
+    private VRef<VImageView> radianceView;
     private VRef<VImage> diffuseAlbedoMetallic;
+    private VRef<VImageView> diffuseAlbedoMetallicView;
     private VRef<VImage> specularAlbedo;
+    private VRef<VImageView> specularAlbedoView;
     private VRef<VImage> normalRoughness;
+    private VRef<VImageView> normalRoughnessView;
     private VRef<VImage> motionVector;
+    private VRef<VImageView> motionVectorView;
     private VRef<VImage> linearDepth;
+    private VRef<VImageView> linearDepthView;
     private VRef<VImage> specularHitDepth;
+    private VRef<VImageView> specularHitDepthView;
     private VRef<VImage> firstHitDepth;
     private VRef<VImage> blocklightDetail;
 
     private VRef<VImage> processed;
-    private VRef<VImage> upscaledDiffuseAlbedoMetallic;
-    private VRef<VImage> upscaledFirstHitDepth;
-    private VRef<VImage> upscaledMotionVector;
-    private VRef<VImage> upscaledNormalRoughness;
-    private VRef<VImage> upscaledBlocklightDetail;
+    private VRef<VImageView> processedView;
 
     private int renderWidth;
     private int renderHeight;
@@ -102,19 +105,21 @@ final class RtxFrameImages {
 
         processed = createStorageImage(ctx, outputWidth, outputHeight,
                 VK_FORMAT_R16G16B16A16_SFLOAT, "Radiance DLSS Output Processed");
-        upscaledDiffuseAlbedoMetallic = createStorageImage(ctx, outputWidth, outputHeight,
-                VK_FORMAT_R8G8B8A8_UNORM, "Radiance Upscaled DiffuseAlbedoMetallic");
-        upscaledFirstHitDepth = createStorageImage(ctx, outputWidth, outputHeight,
-                VK_FORMAT_R16_SFLOAT, "Radiance DLSS Output UpscaledFirstHitDepth");
-        upscaledMotionVector = createStorageImage(ctx, outputWidth, outputHeight,
-                VK_FORMAT_R16G16_SFLOAT, "Radiance DLSS Output UpscaledMotionVector");
-        upscaledNormalRoughness = createStorageImage(ctx, outputWidth, outputHeight,
-                VK_FORMAT_R16G16B16A16_SFLOAT, "Radiance DLSS Output UpscaledNormalRoughness");
-        upscaledBlocklightDetail = createStorageImage(ctx, outputWidth, outputHeight,
-                VK_FORMAT_R16G16B16A16_SFLOAT, "Radiance Upscaled Blocklight Detail");
+        createDlssViews(ctx);
 
         LOGGER.info("Allocated Radiance-style RTX frame images: render={}x{}, output={}x{}",
                 renderWidth, renderHeight, outputWidth, outputHeight);
+    }
+
+    private void createDlssViews(VContext ctx) {
+        radianceView = VImageView.create(ctx, radiance);
+        diffuseAlbedoMetallicView = VImageView.create(ctx, diffuseAlbedoMetallic);
+        specularAlbedoView = VImageView.create(ctx, specularAlbedo);
+        normalRoughnessView = VImageView.create(ctx, normalRoughness);
+        motionVectorView = VImageView.create(ctx, motionVector);
+        linearDepthView = VImageView.create(ctx, linearDepth);
+        specularHitDepthView = VImageView.create(ctx, specularHitDepth);
+        processedView = VImageView.create(ctx, processed);
     }
 
     private static VRef<VImage> createStorageImage(VContext ctx, int width, int height, int format, String debugName) {
@@ -141,32 +146,6 @@ final class RtxFrameImages {
         layoutsInitialized = true;
     }
 
-    void upscaleSidecars(VCmdBuff cmd) {
-        blit(cmd, diffuseAlbedoMetallic, upscaledDiffuseAlbedoMetallic, VK_FILTER_LINEAR);
-        blit(cmd, firstHitDepth, upscaledFirstHitDepth, VK_FILTER_LINEAR);
-        blit(cmd, motionVector, upscaledMotionVector, VK_FILTER_LINEAR);
-        blit(cmd, normalRoughness, upscaledNormalRoughness, VK_FILTER_NEAREST);
-        blit(cmd, blocklightDetail, upscaledBlocklightDetail, VK_FILTER_LINEAR);
-    }
-
-    private static void blit(VCmdBuff cmd, VRef<VImage> source, VRef<VImage> target, int filter) {
-        if (source == null || target == null) {
-            return;
-        }
-        cmd.encodeImageTransition(source, VK_IMAGE_LAYOUT_GENERAL,
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-        cmd.encodeImageTransition(target, VK_IMAGE_LAYOUT_GENERAL,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-        cmd.blitImage(source, target,
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                filter);
-        cmd.encodeImageTransition(target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-        cmd.encodeImageTransition(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-    }
-
     private List<VRef<VImage>> allImages() {
         return List.of(
                 reservoirs[0],
@@ -180,12 +159,7 @@ final class RtxFrameImages {
                 specularHitDepth,
                 firstHitDepth,
                 blocklightDetail,
-                processed,
-                upscaledDiffuseAlbedoMetallic,
-                upscaledFirstHitDepth,
-                upscaledMotionVector,
-                upscaledNormalRoughness,
-                upscaledBlocklightDetail);
+                processed);
     }
 
     private static void clearColorImage(VCmdBuff cmd, VRef<VImage> image) {
@@ -215,40 +189,60 @@ final class RtxFrameImages {
         return reservoirs[(frameIndex + 1) & 1];
     }
 
-    VRef<VImage>[] reservoirs() {
-        return reservoirs;
-    }
-
     VRef<VImage> radiance() {
         return radiance;
+    }
+
+    VRef<VImageView> radianceView() {
+        return radianceView;
     }
 
     VRef<VImage> diffuseAlbedoMetallic() {
         return diffuseAlbedoMetallic;
     }
 
+    VRef<VImageView> diffuseAlbedoMetallicView() {
+        return diffuseAlbedoMetallicView;
+    }
+
     VRef<VImage> specularAlbedo() {
         return specularAlbedo;
+    }
+
+    VRef<VImageView> specularAlbedoView() {
+        return specularAlbedoView;
     }
 
     VRef<VImage> normalRoughness() {
         return normalRoughness;
     }
 
+    VRef<VImageView> normalRoughnessView() {
+        return normalRoughnessView;
+    }
+
     VRef<VImage> motionVector() {
         return motionVector;
     }
 
-    VRef<VImage> motionVectors() {
-        return motionVector;
+    VRef<VImageView> motionVectorView() {
+        return motionVectorView;
     }
 
     VRef<VImage> linearDepth() {
         return linearDepth;
     }
 
+    VRef<VImageView> linearDepthView() {
+        return linearDepthView;
+    }
+
     VRef<VImage> specularHitDepth() {
         return specularHitDepth;
+    }
+
+    VRef<VImageView> specularHitDepthView() {
+        return specularHitDepthView;
     }
 
     VRef<VImage> firstHitDepth() {
@@ -263,28 +257,8 @@ final class RtxFrameImages {
         return processed;
     }
 
-    VRef<VImage> upscaledDiffuseAlbedoMetallic() {
-        return upscaledDiffuseAlbedoMetallic;
-    }
-
-    VRef<VImage> upscaledFirstHitDepth() {
-        return upscaledFirstHitDepth;
-    }
-
-    VRef<VImage> upscaledMotionVector() {
-        return upscaledMotionVector;
-    }
-
-    VRef<VImage> upscaledNormalRoughness() {
-        return upscaledNormalRoughness;
-    }
-
-    VRef<VImage> upscaledBlocklightDetail() {
-        return upscaledBlocklightDetail;
-    }
-
-    VRef<VImage> noisyColor() {
-        return radiance;
+    VRef<VImageView> processedView() {
+        return processedView;
     }
 
     int renderWidth() {
@@ -304,6 +278,15 @@ final class RtxFrameImages {
     }
 
     void destroy() {
+        radianceView = closeView(radianceView);
+        diffuseAlbedoMetallicView = closeView(diffuseAlbedoMetallicView);
+        specularAlbedoView = closeView(specularAlbedoView);
+        normalRoughnessView = closeView(normalRoughnessView);
+        motionVectorView = closeView(motionVectorView);
+        linearDepthView = closeView(linearDepthView);
+        specularHitDepthView = closeView(specularHitDepthView);
+        processedView = closeView(processedView);
+
         closeAll(reservoirs);
         radiance = close(radiance);
         diffuseAlbedoMetallic = close(diffuseAlbedoMetallic);
@@ -315,11 +298,6 @@ final class RtxFrameImages {
         firstHitDepth = close(firstHitDepth);
         blocklightDetail = close(blocklightDetail);
         processed = close(processed);
-        upscaledDiffuseAlbedoMetallic = close(upscaledDiffuseAlbedoMetallic);
-        upscaledFirstHitDepth = close(upscaledFirstHitDepth);
-        upscaledMotionVector = close(upscaledMotionVector);
-        upscaledNormalRoughness = close(upscaledNormalRoughness);
-        upscaledBlocklightDetail = close(upscaledBlocklightDetail);
         renderWidth = 0;
         renderHeight = 0;
         outputWidth = 0;
@@ -336,6 +314,13 @@ final class RtxFrameImages {
     private static VRef<VImage> close(VRef<VImage> image) {
         if (image != null) {
             image.close();
+        }
+        return null;
+    }
+
+    private static VRef<VImageView> closeView(VRef<VImageView> view) {
+        if (view != null) {
+            view.close();
         }
         return null;
     }

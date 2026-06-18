@@ -30,9 +30,6 @@ import static org.lwjgl.vulkan.VK10.*;
 /**
  * Executes ray tracing render passes by building descriptor sets and
  * dispatching rays.
- *
- * Also supports deferred rendering path detection when using VulkaniteDeferred
- * shaderpack.
  */
 public final class RenderPassExecutor {
     private static final Logger LOGGER = LoggerFactory.getLogger(RenderPassExecutor.class);
@@ -48,32 +45,12 @@ public final class RenderPassExecutor {
     private final List<VRef<VDescriptorSet>> setsCache = new ArrayList<>();
     private final Map<Long, VRef<VDescriptorPool>> entityTexturePools = new HashMap<>();
 
-    // Deferred rendering mode flag
-    private boolean deferredMode = false;
-
     public RenderPassExecutor(VContext ctx, AccelerationManager accelerationManager,
             VRef<VSampler> sampler, VRef<VSampler> ctexSampler) {
         this.ctx = ctx;
         this.accelerationManager = accelerationManager;
         this.sampler = sampler;
         this.ctexSampler = ctexSampler;
-    }
-
-    /**
-     * Sets whether deferred rendering mode is active.
-     * When true, G-buffer textures are passed to the deferred lighting pass.
-     * @param deferred true to enable deferred mode
-     */
-    public void setDeferredMode(boolean deferred) {
-        this.deferredMode = deferred;
-    }
-
-    /**
-     * Checks if deferred rendering mode is active.
-     * @return true if using deferred rendering
-     */
-    public boolean isDeferredMode() {
-        return deferredMode;
     }
 
     /**
@@ -117,7 +94,6 @@ public final class RenderPassExecutor {
             int enableReSTIR, // New parameter for ReSTIR toggle (0/1)
             int debugMode, // New parameter for Debug Mode (0=NONE, 1=DLSS, 2=BUFFERS)
             int debugCellIndex, // For DLSS debug mode: which cell to display (0-5), -1 for grid view
-            int separateStableBlocklight,
             VRef<VImage> currentReservoirImage,
             VRef<VImage> prevReservoirImage,
             VRef<VImage> diffuseAlbedoMetallicImage,
@@ -128,6 +104,8 @@ public final class RenderPassExecutor {
             VRef<VImage> specularHitDepthImage,
             VRef<VImage> firstHitDepthImage,
             VRef<VImage> blocklightDetailImage,
+            VRef<VBuffer> sectionLightBuffer,
+            VRef<VBuffer> sectionLightProbeBuffer,
             VRef<VImage> scaledOutputImage, // DLSS: Scaled output image for binding 12 (or null to use Iris target)
             int renderWidth, // DLSS: Scaled render width (or full resolution if DLSS inactive)
             int renderHeight) { // DLSS: Scaled render height (or full resolution if DLSS inactive)
@@ -187,7 +165,7 @@ public final class RenderPassExecutor {
                 // Binding 11: colortex5 (Extra) - gbufferViews[4]
                 if (gbufferViews != null && gbufferViews.length >= 5) {
                     if (gbufferViews[0] != null) {
-                        LOGGER.info("Binding 7: gbufferAlbedo OK");
+                        LOGGER.trace("Binding 7: gbufferAlbedo OK");
                         updater.imageSampler(7, gbufferViews[0], sampler);
                     } else {
                         LOGGER.warn("Binding 7: gbufferAlbedo is NULL! Binding placeholder.");
@@ -231,7 +209,7 @@ public final class RenderPassExecutor {
                         if (binding12 != null) {
                             // VulkaniteRT/Dirt-RT-Optimized: binding 6 is reservoir/intermediate
                             if (currentReservoirImage != null) {
-                                LOGGER.info(
+                                LOGGER.trace(
                                         "Binding 6: Binding ReSTIR reservoir image (VulkaniteRT/Dirt-RT-Optimized path)");
                                 var reservoirView = VImageView.create(ctx, currentReservoirImage);
                                 resourcesToClose.add(reservoirView);
@@ -241,7 +219,7 @@ public final class RenderPassExecutor {
                             }
                         } else {
                             // dirtrtold: binding 6 is the output
-                            LOGGER.info("Binding 6: Binding final output as fallback (dirtrtold path)");
+                            LOGGER.trace("Binding 6: Binding final output as fallback (dirtrtold path)");
                             if (outImgViewListCache.isEmpty() && !outImgs.isEmpty()) {
                                 var view = irisRenderTargetViews[0].getView(() -> vgOutImgs.get(0));
                                 if (view != null)
@@ -255,7 +233,7 @@ public final class RenderPassExecutor {
                             }
                         }
                     } else if (binding6.arraySize() > 0) {
-                        LOGGER.info("Binding 6: Binding array of " + binding6.arraySize() + " images (Legacy path)");
+                        LOGGER.trace("Binding 6: Binding array of {} images (Legacy path)", binding6.arraySize());
                         // Traditional use: binding 6 as an array of render targets
                         int maxImages = binding6.arraySize();
                         int imageCount = Math.min(outImgs.size(), maxImages);
@@ -282,7 +260,7 @@ public final class RenderPassExecutor {
                         List<VRef<VImageView>> scaledViewList = new ArrayList<>();
                         scaledViewList.add(scaledView);
                         updater.imageStore(12, 0, scaledViewList); // Scaled output for DLSS
-                        LOGGER.debug("Binding 12: Using scaled output image ({}x{}) for DLSS",
+                        LOGGER.trace("Binding 12: Using scaled output image ({}x{}) for DLSS",
                                 scaledOutputImage.get().width, scaledOutputImage.get().height);
                     } else {
                         // Use the first output image for final output if no dedicated intermediate buffer
@@ -351,6 +329,8 @@ public final class RenderPassExecutor {
                         20, firstHitDepthImage, "FirstHitDepth");
                 bindOptionalStorageImage(updater, setReflection, resourcesToClose, outImgViewListCache,
                         21, blocklightDetailImage, "BlocklightDetail");
+                bindOptionalStorageBuffer(updater, setReflection, 22, sectionLightBuffer, "SectionLights");
+                bindOptionalStorageBuffer(updater, setReflection, 23, sectionLightProbeBuffer, "SectionLightProbes");
 
                 updater.apply();
 
@@ -433,10 +413,7 @@ public final class RenderPassExecutor {
             // are visible before ray tracing dispatch reads them
             cmd.encodeMemoryBarrier();
 
-            // Push constants for ray tracing shader
-            // Layout: uint frameIndex, uint sampleIndex, vec3 sunDirection, vec3 sunColor,
-            // int enableReSTIR, int debugMode, int debugCellIndex
-            // Total: 4 + 4 + 12 + 12 + 4 + 4 + 4 = 44 bytes (needs 6 longs for 48 bytes)
+            // Push constants for ray tracing shader.
             long[] pushConstants = new long[6];
             // Pack frameIndex (uint) and sampleIndex (uint) into first long
             pushConstants[0] = (long) frameIndex & 0xFFFFFFFFL | (((long) sampleIndex & 0xFFFFFFFFL) << 32);
@@ -449,9 +426,7 @@ public final class RenderPassExecutor {
                 (((long) Float.floatToRawIntBits(sunColorB) & 0xFFFFFFFFL) << 32);
             // Pack enableReSTIR (int) and debugMode (int)
             pushConstants[4] = ((long) enableReSTIR & 0xFFFFFFFFL) | (((long) debugMode & 0xFFFFFFFFL) << 32);
-            // Pack debugCellIndex and whether deterministic blocklight is added after DLSS.
-            pushConstants[5] = ((long) debugCellIndex & 0xFFFFFFFFL)
-                    | (((long) separateStableBlocklight & 0xFFFFFFFFL) << 32);
+            pushConstants[5] = (long) debugCellIndex & 0xFFFFFFFFL;
 
             // DLSS FIX: Use render dimensions (scaled if DLSS active) for ray tracing dispatch
             // This ensures ray tracing renders at lower resolution when DLSS downscaling is active
@@ -516,6 +491,22 @@ public final class RenderPassExecutor {
             updater.imageStore(binding, fallbackViews.get(0));
         } else {
             LOGGER.warn("Binding {}: {} image is null and no fallback output exists", binding, debugName);
+        }
+    }
+
+    private void bindOptionalStorageBuffer(
+            DescriptorUpdateBuilder updater,
+            me.cortex.vulkanite.lib.shader.reflection.ShaderReflection.Set setReflection,
+            int binding,
+            VRef<VBuffer> buffer,
+            String debugName) {
+        if (setReflection.getBindingAt(binding) == null) {
+            return;
+        }
+        if (buffer != null) {
+            updater.buffer(binding, buffer);
+        } else {
+            LOGGER.warn("Binding {}: {} buffer is null", binding, debugName);
         }
     }
 

@@ -13,14 +13,13 @@
 #define AMBIENT_FACTOR 0.05 // Base sky ambient fill [0.0 0.02 0.05 0.08 0.12 0.18 0.25]
 #define INDIRECT_SCALE 0.6 // Secondary bounce strength [0.0 0.25 0.45 0.6 0.8 1.0 1.25 1.5 2.0]
 #define MIN_LIGHTING 0.05 // Floor for very dark diffuse surfaces [0.0 0.02 0.05 0.08 0.12 0.18 0.25]
-#define BLOCKLIGHT_VISUAL_INTENSITY 8.0 // Smooth local-light strength [2.0 4.0 6.0 8.0 10.0 12.0 16.0]
-#define BLOCKLIGHT_VISUAL_RANGE 1.45 // Smooth local-light range curve [0.75 1.0 1.25 1.45 1.7 2.0 2.4]
-#define BLOCKLIGHT_LOW_FLOOR 0.08 // Keeps low local-light levels visible [0.0 0.03 0.05 0.08 0.12 0.16 0.22]
+#define BAREBONES_GBUFFER_ALBEDO 1 // Strip vanilla vertex lighting from G-buffer albedo while preserving tint hue [0 1]
 #define SPECULAR_INTENSITY 1.0 // Direct and environment specular strength [0.0 0.35 0.6 0.8 1.0 1.25 1.6 2.0 3.0]
 
 // Soft shadow settings
+#define SUN_SHADOW_MODE 1 // Sun shadow mode: 0=off, 1=1 ray temporal, 2=checkerboard, 3=high quality disk [0 1 2 3]
 #define PENUMBRA_RADIUS 0.034 // Sun angular radius for soft shadows [0.004 0.012 0.02 0.034 0.05 0.075 0.1]
-#define PENUMBRA_SAMPLES 8 // Soft shadow samples [2 4 6 8 12 16]
+#define PENUMBRA_SAMPLES 1 // Soft shadow samples used by high quality disk mode [1 2 4 6 8 12 16]
 #define PENUMBRA_DIFFUSE_BLEND 0.75 // Diffuse soft-shadow blend [0.0 0.35 0.55 0.75 0.9 1.0]
 
 // ReSTIR Settings
@@ -30,11 +29,12 @@
 
 // RTX capture workload settings
 #define RTX_ENTITY_CAPTURE 1 // Capture entities into the RTX acceleration structure [0 1]
-#define RTX_PARTICLE_CAPTURE 1 // Capture particles into the RTX acceleration structure [0 1]
-#define RTX_CAPTURE_INTERVAL 2 // Frames between transient RTX captures; higher is cheaper but less reactive [1 2 3 4 5 8 10 12 16 20]
-#define RTX_MAX_CAPTURED_ENTITIES 96 // Maximum entities captured per update [16 32 64 96 128 192 256 384 512]
-#define RTX_MAX_CAPTURED_PARTICLES 384 // Maximum particles captured per update [64 128 256 384 512 768 1024 1536 2048]
-#define RTX_ENTITY_BLAS_CACHE 384 // Cached stable entity BLAS count [32 64 128 256 384 512 768 1024 1536 2048]
+#define RTX_PARTICLE_CAPTURE 0 // Capture particles into the RTX acceleration structure [0 1]
+#define RTX_CAPTURE_INTERVAL 6 // Frames between transient RTX captures; higher is cheaper but less reactive [2 4 6 8 10 12 16 20]
+#define RTX_MAX_CAPTURED_ENTITIES 32 // Maximum entities captured per update [16 24 32 48 64 96 128 192 256]
+#define RTX_MAX_CAPTURED_PARTICLES 128 // Maximum particles captured per update [64 128 256 384 512 768 1024]
+#define RTX_ENTITY_CAPTURE_RADIUS 48 // Entity capture radius in blocks; 256 disables distance culling [24 32 48 64 96 128 192 256]
+#define RTX_ENTITY_BLAS_CACHE 128 // Cached stable entity BLAS count [32 64 128 256 384 512 768 1024]
 
 // Emission and local-light settings
 #define EMISSIVE_SURFACE_INTENSITY 12.0 // Visible emitter surface intensity [4.0 6.0 8.0 10.0 12.0 16.0 20.0 24.0 32.0]
@@ -44,13 +44,25 @@
 #define REDSTONE_EMISSION 0.42 // Redstone torch surface intensity [0.15 0.25 0.35 0.42 0.5 0.65 0.8 1.0]
 #define SHULKER_EMISSION 0.55 // Custom shulker-box glow intensity [0.0 0.2 0.35 0.55 0.75 1.0 1.35 1.75]
 #define RT_BLOCKLIGHT_PROBES 0 // Experimental ray-query blocklight probes; 0 avoids alpha-cutout texture projection [0 1]
+#define SECTION_LIGHT_PROBE_VOLUME_ENABLE 1 // Prototype 6-face section directional probe volume [0 1]
+#define SECTION_LIGHT_PROBE_INTENSITY 2.0 // Prototype directional probe intensity [1.0 2.0 3.0 5.0 8.0 12.0]
+#define SECTION_LIGHT_PROBE_ISOTROPIC_FILL 0.0 // Low-frequency fill from average probe radiance; keep near zero to avoid source/page halos [0.0 0.02 0.04 0.08]
+#define SECTION_LIGHT_PROBE_SURFACE_OFFSET 0.0 // Offset probe sampling along the shaded surface normal; keep near zero for source alignment [0.0 0.02 0.04 0.08]
+#define SECTION_LIGHT_PROBE_HASH_PROBES 64 // Hash probes for section probe-page lookup; replaces full directory scans [16 32 64 128]
+#define SECTION_LIGHT_PROBE_TRILINEAR 1 // Probe volume filtering: 0=nearest 6 reads, 1=trilinear 48 reads [0 1]
+#define SECTION_LIGHT_PROBE_DEBUG_MODE 0 // Section probe debug view: 0=off, 1=pages, 2=radiance, 3=faces, 4=leak check, 5=dominant stored face, 6=confidence, 7=source markers [0 1 2 3 4 5 6 7]
+#define SECTION_LIGHT_PROBE_CONFIDENCE_FLOOR 0.0 // Minimum effective confidence for nonzero probe faces after visibility packing [0.0 0.01 0.02 0.04]
+#define SECTION_LIGHT_SPARSE_RT_CORRECTION 1 // Validate low-confidence bright probe samples with a tiny RT budget [0 1]
+#define SECTION_LIGHT_SPARSE_RT_SAMPLES 1 // Sparse RT validation rays for suspicious probe samples [1 2 3 4]
+#define SECTION_LIGHT_SPARSE_RT_CONFIDENCE_THRESHOLD 0.45 // Confidence below this can trigger sparse RT validation [0.2 0.3 0.45 0.6 0.75]
+#define SECTION_LIGHT_SPARSE_RT_LEAK_LUMA 0.035 // Minimum probe luma before sparse leak validation [0.01 0.02 0.035 0.06 0.1]
+#define SECTION_LIGHT_TABLE_FALLBACK_ENABLE 0 // Final-light fallback from unoccluded binding 22 table; keep 0 outside debug experiments [0 1]
+#define SECTION_LIGHT_TABLE_ENABLE 1 // Prototype section light SSBO sampling [0 1]
+#define SECTION_LIGHT_SAMPLE_LIMIT 96 // Maximum uploaded section lights sampled per pixel [16 32 64 96 128 256]
 #define BLOCKLIGHT_SAMPLES 8 // Samples per pixel for RT blocklights [2 4 6 8 12 16]
 #define BLOCKLIGHT_MAX_DISTANCE 64.0 // Maximum search distance for blocklight rays [16.0 24.0 32.0 48.0 64.0 96.0]
 #define BLOCKLIGHT_EMISSION_SCALE 5.0 // Indirect emitter intensity [1.0 2.0 3.0 4.0 5.0 6.0 8.0 10.0]
 #define BLOCKLIGHT_FALLOFF 0.0125 // Quadratic attenuation factor [0.01 0.0125 0.025 0.05 0.075 0.1]
-#define BLOCKLIGHT_COLOR_R 1.0 // Smooth blocklight red channel [0.5 0.6 0.7 0.8 0.9 1.0]
-#define BLOCKLIGHT_COLOR_G 0.82 // Smooth blocklight green channel [0.4 0.5 0.6 0.7 0.75 0.82 0.9 1.0]
-#define BLOCKLIGHT_COLOR_B 0.55 // Smooth blocklight blue channel [0.25 0.35 0.45 0.55 0.65 0.75 0.9 1.0]
 
 // Shadowed camera-space volumetrics
 #define VOLUMETRICS_ENABLED 1 // [0 1]

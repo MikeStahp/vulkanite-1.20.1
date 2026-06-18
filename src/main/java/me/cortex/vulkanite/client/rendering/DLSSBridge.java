@@ -75,6 +75,7 @@ public class DLSSBridge {
     // Native library loaded flag
     private static boolean nativeLibraryLoaded = false;
     private static boolean nativeLibraryLoadAttempted = false;
+    private static boolean ngxActive = false;
 
     // JNA interface to native library
     private interface NativeDLSS extends Library {
@@ -111,6 +112,9 @@ public class DLSSBridge {
 
         // DLSSD destruction - maps to destroyDLSSD()
         void destroyDLSSD(long device);
+
+        // NGX shutdown - maps to shutdownNGX()
+        void shutdownNGX();
 
         // NGX initialization - maps to initializeNGX()
         int initializeNGX(long instance, long physicalDevice, long device, String dlssPath);
@@ -297,6 +301,7 @@ public class DLSSBridge {
             // Return a non-zero handle to indicate success
             // The actual feature is managed internally by the native bridge
             long handle = 1; // Use 1 as success indicator
+            ngxActive = true;
             LOGGER.info("DLSSD feature created: handle={}, render={}x{}, output={}x{}",
                 handle, renderWidth, renderHeight, outputWidth, outputHeight);
             return handle;
@@ -410,6 +415,25 @@ public class DLSSBridge {
     }
 
     /**
+     * Shut down the NGX lifecycle after DLSS/DLSSD features have been released.
+     */
+    public static void shutdownNGX() {
+        if (!nativeLibraryLoaded || nativeLib == null) {
+            return;
+        }
+        if (!ngxActive) {
+            return;
+        }
+        try {
+            nativeLib.shutdownNGX();
+            ngxActive = false;
+            LOGGER.debug("NGX shutdown requested");
+        } catch (UnsatisfiedLinkError e) {
+            LOGGER.warn("NGX shutdown native method not available: {}", e.getMessage());
+        }
+    }
+
+    /**
      * Initialize standard DLSS Super Resolution feature.
      * This is the fallback when DLSSD (Ray Reconstruction) is not available.
      *
@@ -434,6 +458,7 @@ public class DLSSBridge {
             int result = nativeLib.initDLSS(instance, physicalDevice, device,
                     renderWidth, renderHeight, outputWidth, outputHeight);
             if (result == 1) { // NVSDK_NGX_Result_Success = 1
+                ngxActive = true;
                 LOGGER.info("Standard DLSS initialized: render={}x{}, output={}x{}",
                         renderWidth, renderHeight, outputWidth, outputHeight);
                 return true;

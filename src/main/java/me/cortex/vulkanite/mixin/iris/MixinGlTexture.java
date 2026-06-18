@@ -5,6 +5,7 @@ import me.cortex.vulkanite.client.Vulkanite;
 import me.cortex.vulkanite.compat.IVGImage;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.memory.VGImage;
+import me.cortex.vulkanite.lib.memory.VImage;
 import me.cortex.vulkanite.lib.other.FormatConverter;
 import net.irisshaders.iris.gl.IrisRenderSystem;
 import net.irisshaders.iris.gl.texture.GlTexture;
@@ -57,10 +58,12 @@ public abstract class MixinGlTexture extends MixinGlResource implements IVGImage
                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         sharedImage.get().setDebugUtilsObjectName("GlTexture");
 
-        Vulkanite.INSTANCE.getCtx().cmd.executeWait(cmdbuf -> {
-            cmdbuf.encodeImageTransition(new VRef<>(sharedImage.get()), VK_IMAGE_LAYOUT_UNDEFINED,
-                    VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
-        });
+        try (VRef<VImage> image = new VRef<>(sharedImage.get())) {
+            Vulkanite.INSTANCE.getCtx().cmd.executeWait(cmdbuf -> {
+                cmdbuf.encodeImageTransition(image, VK_IMAGE_LAYOUT_UNDEFINED,
+                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_COLOR_BIT, VK_REMAINING_MIP_LEVELS);
+            });
+        }
 
         this.setGlId(sharedImage.get().glId);
 

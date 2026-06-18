@@ -176,13 +176,13 @@ public class BLASBuildWorker implements Runnable {
      * Logs current memory usage.
      */
     private void logMemoryUsage(String phase) {
-        if (!LOGGER.isInfoEnabled()) return;
+        if (!LOGGER.isTraceEnabled()) return;
         
         long freeMemory = Runtime.getRuntime().freeMemory();
         long totalMemory = Runtime.getRuntime().totalMemory();
         long maxMemory = Runtime.getRuntime().maxMemory();
         
-        LOGGER.info("[BLAS Worker] Memory {}: free={}MB, total={}MB, max={}MB",
+        LOGGER.trace("[BLAS Worker] Memory {}: free={}MB, total={}MB, max={}MB",
             phase,
             freeMemory / (1024 * 1024),
             totalMemory / (1024 * 1024),

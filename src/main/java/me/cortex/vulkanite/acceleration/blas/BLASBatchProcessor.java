@@ -133,16 +133,21 @@ public class BLASBatchProcessor {
         
         // Submit and wait for build to complete
         LOGGER.info("[BLAS Batch #{}] Submitting build command", batchNumber);
+        long submitStartTime = System.nanoTime();
         CompletableFuture<Long> buildExecutionFuture = context.cmd.enqueueSubmission(asyncQueue, uploadBuildCmdRef);
-        
-        Long buildExecution;
+        long submitTime = System.nanoTime() - submitStartTime;
+        long buildExecution;
         try {
+            long waitStartTime = System.nanoTime();
             buildExecution = buildExecutionFuture.get();
-            long buildTime = (System.nanoTime() - buildStartTime) / 1_000_000;
-            LOGGER.debug("[BLAS Batch #{}] Build completed in {} ms (execution={})", batchNumber, buildTime, buildExecution);
+            long waitTime = System.nanoTime() - waitStartTime;
+            long buildTime = System.nanoTime() - buildStartTime;
+            LOGGER.info("[BLAS Batch #{}] Build completed (execution={}) enqueue={} ms, submissionWait={} ms, buildStage={} ms",
+                    batchNumber, buildExecution, formatMillis(submitTime), formatMillis(waitTime),
+                    formatMillis(buildTime));
         } catch (Exception e) {
-            LOGGER.error("[BLAS Batch #{}] Error waiting for build completion", batchNumber, e);
-            throw new RuntimeException("Failed to complete BLAS build submission", e);
+            LOGGER.error("[BLAS Batch #{}] Failed while waiting for build submission", batchNumber, e);
+            throw new RuntimeException(e);
         }
         
         uploadBuildCmdRef.close();
@@ -168,6 +173,10 @@ public class BLASBatchProcessor {
 
         long totalBatchTime = (System.nanoTime() - batchStartTime) / 1_000_000;
         LOGGER.info("[BLAS Batch #{}] Completed in {} ms total", batchNumber, totalBatchTime);
+    }
+
+    private static String formatMillis(long nanos) {
+        return String.format(java.util.Locale.ROOT, "%.3f", nanos / 1_000_000.0);
     }
     
     /**
