@@ -1,0 +1,3 @@
+## 2024-06-25 - Avoid Streams in Hot Rendering Paths
+**Learning:** In Minecraft rendering loops utilizing Vulkanite, iterating through collections with Java 8 Streams (e.g. `.stream().mapToInt().toArray()`, `.stream().map().toList()`) causes noticeable GC pressure and performance degradation from implicit unboxing and Iterator allocation.
+**Action:** Always replace Stream pipelines in hot paths (like `VCmdBuff`, `CommandManager`, `VulkanPipeline`) with explicit, pre-sized primitive array loops (`new long[size]`, `for (int i...)`) and pre-sized ArrayLists to eliminate per-frame dynamic resizing, wrapper allocations, and closure captures.
