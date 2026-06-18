@@ -805,10 +805,13 @@ Current status:
 - Dirty probe-page regeneration blends against page history so torch/blocker
   changes are amortized instead of snapping every affected face to the newest
   CPU estimate immediately.
-- A sparse RT correction path is gated by
-  `SECTION_LIGHT_SPARSE_RT_CORRECTION`. It validates bright, low-confidence
-  probe samples with a fixed `SECTION_LIGHT_SPARSE_RT_SAMPLES` budget before
-  they become final local diffuse lighting.
+- The sparse RT correction path is now opt-in through
+  `SECTION_LIGHT_SPARSE_RT_CORRECTION`. The normal/default path stays on the
+  deterministic probe cache plus voxel confidence while Phase 4 is tuned.
+- When sparse validation is enabled, it traces toward explicit uploaded
+  section-light candidates instead of using the old hemispheric fake blocklight
+  sampler. This keeps validation deterministic and avoids adding stochastic
+  fake-light artifacts to final diffuse lighting.
 - Debug mode `4` compares probe/table categories; red now means probe leak or
   over-bright, not merely an unoccluded table reference.
 
@@ -818,9 +821,10 @@ Optimized work:
   diagonals, corners, fluids, and thin emissive blocks.
 - Runtime-tune temporal blending/versioning for probe-page updates so dirty-page
   refreshes do not pop when a nearby torch or blocker changes.
-- Tune sparse hardware RT validation for high-error probe faces, important
-  nearby emitters, reflective/refraction paths, or pixels where debug mode `4`
-  shows repeatable leak categories.
+- Tune opt-in sparse hardware RT validation for high-error probe faces,
+  important nearby emitters, reflective/refraction paths, or pixels where debug
+  mode `4` shows repeatable leak categories. Keep it default-off until runtime
+  tests prove it improves leaks without introducing fake-light shimmer.
 - Continue tuning the per-face confidence term toward DDGI-style visibility
   semantics before increasing validation-ray cost.
 - Move probe regeneration out of the render-critical path or into compute once
@@ -832,8 +836,9 @@ Exit criteria:
 - Conservative DDA over-darkening is characterized and bounded.
 - Probe updates amortize over frames with no persistent stale pages after unloads
   or rebuilds.
-- Sparse RT validation has a fixed budget and improves the worst leak cases
-  without becoming default per-pixel blocklight tracing.
+- Opt-in sparse RT validation has a fixed budget and improves the worst leak
+  cases without becoming default per-pixel blocklight tracing or reintroducing
+  the old stochastic fake blocklight sampler.
 
 Current validation status for Phase 4 on 2026-06-18:
 
