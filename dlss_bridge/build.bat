@@ -4,8 +4,9 @@ setlocal enabledelayedexpansion
 :: =====================================================================
 :: CONFIGURACIÓN DE RUTAS (Edita esto si tus carpetas están en otro lugar)
 :: =====================================================================
-set SOURCE_FILE="C:\Users\PCGAMER\Documents\GitHub\vulkanite-1.20.1\dlss_bridge\dlss_wrapper.cpp"
-set OUTPUT_DIR=..\run
+set "SCRIPT_DIR=%~dp0"
+set "SOURCE_FILE=%SCRIPT_DIR%dlss_wrapper.cpp"
+set "OUTPUT_DIR=%SCRIPT_DIR%..\run"
 set OUTPUT_NAME=vulkanite_dlss_bridge.dll
 
 :: Rutas al SDK de Vulkan (VULKAN_SDK se define automáticamente al instalarlo)
@@ -13,9 +14,18 @@ set VULKAN_INCLUDE=%VULKAN_SDK%\Include
 set VULKAN_LIB=%VULKAN_SDK%\Lib
 
 :: Ruta al SDK de DLSS (Ajusta esto según dónde hayas extraído el SDK de NVIDIA)
-set DLSS_SDK_DIR=.\dlss_sdk
-set DLSS_INCLUDE="C:\Users\PCGAMER\Documents\GitHub\vulkanite-1.20.1\dlss_bridge\Include"
-set DLSS_LIB="C:\Users\PCGAMER\Documents\GitHub\vulkanite-1.20.1\dlss_bridge\Lib\x64"
+if "%DLSS_SDK_DIR%"=="" (
+    if exist "%SCRIPT_DIR%dlss_sdk\Include\nvsdk_ngx_vk.h" (
+        set "DLSS_SDK_DIR=%SCRIPT_DIR%dlss_sdk"
+    ) else if exist "%SCRIPT_DIR%Include\nvsdk_ngx_vk.h" (
+        set "DLSS_SDK_DIR=%SCRIPT_DIR%"
+    ) else (
+        set "DLSS_SDK_DIR=%SCRIPT_DIR%dlss_sdk"
+    )
+)
+set "DLSS_INCLUDE=%DLSS_SDK_DIR%\Include"
+set "DLSS_INC=%DLSS_SDK_DIR%\inc"
+set "DLSS_LIB=%DLSS_SDK_DIR%\Lib\x64"
 
 :: Ruta al bin de Java para que JNA lo encuentre si no lo hace en el working dir
 set JAVA_BIN_DIR="C:\Program Files\Java\jdk-21\bin"
@@ -60,6 +70,16 @@ if "%VULKAN_SDK%"=="" (
     echo [ADVERTENCIA] La variable de entorno VULKAN_SDK no esta definida.
     echo Asegurate de tener el Vulkan SDK instalado.
 )
+if not exist "%DLSS_INCLUDE%\nvsdk_ngx_vk.h" (
+    echo [ERROR] No se encontro el SDK de NVIDIA NGX/DLSS en: %DLSS_SDK_DIR%
+    echo Define DLSS_SDK_DIR o copia el SDK localmente a dlss_bridge\dlss_sdk.
+    exit /b 1
+)
+if not exist "%DLSS_LIB%\nvsdk_ngx_s.lib" (
+    echo [ERROR] No se encontro nvsdk_ngx_s.lib en: %DLSS_LIB%
+    echo Revisa que DLSS_SDK_DIR apunte a la raiz del SDK de NVIDIA NGX/DLSS.
+    exit /b 1
+)
 
 :: Ejecutar compilador cl.exe
 :: /LD = Crear DLL | /O2 = Optimizar | /MT = Usar MSVCRT estatico (Match nvsdk_ngx_s.lib) | /EHsc = Manejo de excepciones
@@ -68,6 +88,7 @@ if "%VULKAN_SDK%"=="" (
 cl.exe /nologo /O2 /LD /EHsc /MT /std:c++17 /DNV_WINDOWS ^
     /I"%VULKAN_INCLUDE%" ^
     /I"%DLSS_INCLUDE%" ^
+    /I"%DLSS_INC%" ^
     "%SOURCE_FILE%" ^
     /link /OUT:"%OUTPUT_DIR%\%OUTPUT_NAME%" ^
     /LIBPATH:"%VULKAN_LIB%" ^

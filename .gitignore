@@ -141,6 +141,11 @@ preprocessed_shaders/
 *.lib
 *.exp
 *.pdb
+*.obj
+dlss_bridge/Include/
+dlss_bridge/inc/
+dlss_bridge/Lib/
+dlss_bridge/dlss_sdk/
 
 # Local investigation/output artifacts
 temp/
