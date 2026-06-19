@@ -248,8 +248,13 @@ public class VulkanPipeline {
         PBRTextureManager.notifyPBRTexturesChanged();
 
         var in = ctx.sync.createSharedBinarySemaphore();
-        var outImgsGlIds = vgOutImgs.stream().mapToInt(i -> i.get().glId).toArray();
-        var outImgsGlLayouts = vgOutImgs.stream().mapToInt(i -> GL_LAYOUT_GENERAL_EXT).toArray();
+        // Use explicit arrays instead of Streams to avoid per-frame GC allocations and unboxing overhead
+        int[] outImgsGlIds = new int[vgOutImgs.size()];
+        int[] outImgsGlLayouts = new int[vgOutImgs.size()];
+        for (int i = 0; i < vgOutImgs.size(); i++) {
+            outImgsGlIds[i] = vgOutImgs.get(i).get().glId;
+            outImgsGlLayouts[i] = GL_LAYOUT_GENERAL_EXT;
+        }
         in.get().glSignal(new int[0], outImgsGlIds, outImgsGlLayouts);
 
         var cmdRef = ctx.cmd.getSingleUsePool().createCommandBuffer();
@@ -265,7 +270,11 @@ public class VulkanPipeline {
             return;
         }
 
-        var outImgs = vgOutImgs.stream().map(i -> new VRef<VImage>(i.get())).toList();
+        // Use explicit loop to avoid per-frame GC allocations
+        List<VRef<VImage>> outImgs = new ArrayList<>(vgOutImgs.size());
+        for (int i = 0; i < vgOutImgs.size(); i++) {
+            outImgs.add(new VRef<VImage>(vgOutImgs.get(i).get()));
+        }
 
         var out = ctx.sync.createSharedBinarySemaphore();
 
