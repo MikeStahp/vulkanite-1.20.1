@@ -5,6 +5,9 @@ import me.cortex.vulkanite.client.Vulkanite;
 import me.cortex.vulkanite.client.config.DLSSConfig;
 import me.cortex.vulkanite.client.config.VulkaniteConfig;
 import me.cortex.vulkanite.client.config.VulkaniteConfig.RtxCacheMode;
+import me.cortex.vulkanite.client.rendering.cache.CacheRequestBatch;
+import me.cortex.vulkanite.client.rendering.cache.CacheRequestQueue;
+import me.cortex.vulkanite.client.rendering.cache.CacheRequestStats;
 import me.cortex.vulkanite.compat.IVGImage;
 import me.cortex.vulkanite.compat.RaytracingShaderSet;
 import me.cortex.vulkanite.lib.base.VContext;
@@ -30,6 +33,8 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.Camera;
 import net.minecraft.client.texture.AbstractTexture;
 import net.minecraft.client.texture.SpriteAtlasTexture;
+import net.minecraft.util.math.ChunkSectionPos;
+import net.minecraft.util.math.Vec3d;
 import org.lwjgl.system.MemoryUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -64,6 +69,9 @@ public class VulkanPipeline {
     private static final int MAX_TRANSIENT_CAPTURE_THROTTLE = 8;
     private static final int MIN_ENTITY_CAPTURE_RADIUS = 8;
     private static final int[] EMPTY_GL_SEMAPHORE_IDS = new int[0];
+    private static final int MAX_CACHE_REQUEST_BACKLOG = 16_384;
+    private static final int MAX_CACHE_REQUESTS_PER_FRAME = 256;
+    private static final long CACHE_REQUEST_LOG_INTERVAL_NANOS = 5_000_000_000L;
 
     public record CustomTexture(String name, VRef<VGImage> image) {
     }
@@ -87,6 +95,7 @@ public class VulkanPipeline {
     private final PoolLinearAllocator uboAllocator;
     private final RenderPassExecutor renderPassExecutor;
     private final CacheResolvePass cacheResolvePass;
+    private final CacheRequestQueue cacheRequestQueue = new CacheRequestQueue(MAX_CACHE_REQUEST_BACKLOG);
     private final RtxFrameImages frameImages = new RtxFrameImages();
     private final DLSSDProcessor dlssdProcessor;
     private final PipelineRequirements pipelineRequirements;
@@ -102,6 +111,7 @@ public class VulkanPipeline {
     private int entityCaptureFrame;
     private int transientCaptureThrottle = 1;
     private RtxCacheMode lastLoggedRtxCacheMode;
+    private long lastCacheRequestLogNanos;
     private boolean destroyed;
 
     public VulkanPipeline(VContext ctx, AccelerationManager accelerationManager, RaytracingShaderSet[] passes,
@@ -452,6 +462,7 @@ public class VulkanPipeline {
         var sunPos = celestialUniforms.invokeGetSunPosition();
         int frameIndex = SystemTimeUniforms.COUNTER.getAsInt();
         int debugMode = mapDebugMode(dlssConfig.getDebugType());
+        collectCacheRequests(camera, frameIndex, rtxCacheMode);
         VRef<VBuffer> sectionLightBuffer = null;
         VRef<VBuffer> sectionLightProbeBuffer = null;
         VRef<VBuffer> sectionLightProbeFeedbackBuffer = null;
@@ -532,6 +543,66 @@ public class VulkanPipeline {
         transitionImages(cmd, gbufferImages, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
         closeAll(sampledImages);
         closeAll(gbufferImages);
+    }
+
+    private CacheRequestBatch collectCacheRequests(Camera camera, int frameIndex, RtxCacheMode rtxCacheMode) {
+        if (!rtxCacheMode.usesCacheResolvePass()) {
+            CacheRequestStats stats = cacheRequestQueue.snapshot();
+            return new CacheRequestBatch(List.of(), stats.backlog(), stats);
+        }
+
+        int sectionRequests = Vulkanite.INSTANCE.getSectionLightManager().drainPendingCacheRequests(
+                cacheRequestQueue,
+                cameraSection(camera),
+                frameIndex,
+                MAX_CACHE_REQUESTS_PER_FRAME);
+        CacheRequestBatch batch;
+        if (rtxCacheMode == RtxCacheMode.CACHE_FILL) {
+            batch = cacheRequestQueue.drainBatch(MAX_CACHE_REQUESTS_PER_FRAME, frameIndex);
+        } else {
+            CacheRequestStats stats = cacheRequestQueue.snapshot();
+            batch = new CacheRequestBatch(List.of(), stats.backlog(), stats);
+        }
+        logCacheRequestBatch(rtxCacheMode, batch, sectionRequests);
+        return batch;
+    }
+
+    private void logCacheRequestBatch(RtxCacheMode mode, CacheRequestBatch batch, int sectionRequests) {
+        CacheRequestStats stats = batch.stats();
+        boolean hasActivity = batch.hasWork()
+                || sectionRequests > 0
+                || stats.backlog() > 0
+                || stats.dropped() > 0;
+        if (!hasActivity) {
+            return;
+        }
+
+        long now = System.nanoTime();
+        if (LOGGER.isTraceEnabled()) {
+            LOGGER.trace("[Vulkanite] Cache requests: mode={}, batch={}, section={}, backlog={}, enqueued={}, merged={}, drained={}, dropped={}",
+                    mode.configValue(), batch.size(), sectionRequests, stats.backlog(),
+                    stats.enqueued(), stats.merged(), stats.drained(), stats.dropped());
+        } else if (now - lastCacheRequestLogNanos >= CACHE_REQUEST_LOG_INTERVAL_NANOS) {
+            lastCacheRequestLogNanos = now;
+            LOGGER.info("[Vulkanite] Cache requests: mode={}, batch={}, section={}, backlog={}, enqueued={}, merged={}, drained={}, dropped={}",
+                    mode.configValue(), batch.size(), sectionRequests, stats.backlog(),
+                    stats.enqueued(), stats.merged(), stats.drained(), stats.dropped());
+        }
+    }
+
+    private static ChunkSectionPos cameraSection(Camera camera) {
+        if (camera == null) {
+            return null;
+        }
+        Vec3d pos = camera.getPos();
+        return ChunkSectionPos.from(
+                floorToSection(pos.x),
+                floorToSection(pos.y),
+                floorToSection(pos.z));
+    }
+
+    private static int floorToSection(double coordinate) {
+        return (int) Math.floor(coordinate) >> 4;
     }
 
     private static AbstractTexture getBlockAtlasTexture() {
@@ -674,6 +745,8 @@ public class VulkanPipeline {
             lastWorld = mc.world;
             entityCaptureFrame = 0;
             accelerationManager.setEntityData(null);
+            cacheRequestQueue.clear();
+            Vulkanite.INSTANCE.getSectionLightManager().clearPendingCacheRequests();
             resetTemporalHistory();
         }
 
@@ -779,6 +852,7 @@ public class VulkanPipeline {
 
         frameImages.destroy();
         capture.close();
+        cacheRequestQueue.clear();
         uboAllocator.reset();
         uboAllocator.clearPool();
 

@@ -105,6 +105,27 @@ final class SectionDirectionalProbePage {
         return hasPackedRadiance;
     }
 
+    float probeLuma(int probeIndex) {
+        if (!hasPackedRadiance || probeIndex < 0 || probeIndex >= PROBE_COUNT) {
+            return 0.0f;
+        }
+
+        float weightedLuma = 0.0f;
+        float confidenceSum = 0.0f;
+        int firstFace = probeIndex * FACE_COUNT;
+        for (int face = 0; face < FACE_COUNT; face++) {
+            int faceIndex = firstFace + face;
+            int rgbIndex = faceIndex * 3;
+            float confidence = Math.max(0.0f, faceConfidence[faceIndex]);
+            float luma = faceRgb[rgbIndex] * 0.2126f
+                    + faceRgb[rgbIndex + 1] * 0.7152f
+                    + faceRgb[rgbIndex + 2] * 0.0722f;
+            weightedLuma += Math.max(0.0f, luma) * Math.max(confidence, 0.05f);
+            confidenceSum += Math.max(confidence, 0.05f);
+        }
+        return confidenceSum > 0.0f ? weightedLuma / confidenceSum : 0.0f;
+    }
+
     void copyTemporalHistoryFrom(SectionDirectionalProbePage previous) {
         if (previous == null || !previous.hasTemporalHistory) {
             return;

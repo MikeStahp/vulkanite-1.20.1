@@ -3,6 +3,10 @@ package me.cortex.vulkanite.client.lighting;
 import me.cortex.vulkanite.compat.ISectionLightBuildResult;
 import me.cortex.vulkanite.compat.SectionLight;
 import me.cortex.vulkanite.compat.SectionLightTable;
+import me.cortex.vulkanite.client.rendering.cache.CacheRequest;
+import me.cortex.vulkanite.client.rendering.cache.CacheRequestKey;
+import me.cortex.vulkanite.client.rendering.cache.CacheRequestQueue;
+import me.cortex.vulkanite.client.rendering.cache.CacheRequestSource;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.cmd.VCmdBuff;
@@ -92,6 +96,8 @@ public final class SectionLightManager {
     private final ArrayDeque<Integer> dirtyProbeFeedbackSlotQueue = new ArrayDeque<>();
     private final ArrayDeque<ChunkSectionPos> dirtyProbePageQueue = new ArrayDeque<>();
     private final Set<ChunkSectionPos> queuedDirtyProbePages = new HashSet<>();
+    private final ArrayDeque<ChunkSectionPos> dirtyProbeRtRequestPageQueue = new ArrayDeque<>();
+    private final Map<ChunkSectionPos, Integer> dirtyProbeRtRequestCursors = new HashMap<>();
     private final ArrayDeque<Integer> freeProbeSlots = new ArrayDeque<>();
     private final ArrayList<SectionLightTable> neighborTableScratch =
             new ArrayList<>(PROBE_LIGHT_CASCADE_SECTION_COUNT);
@@ -228,6 +234,7 @@ public final class SectionLightManager {
         ChunkSectionPos sectionPos = section.getPosition();
         activeSectionPositions.remove(sectionPos);
         removeQueuedProbePage(sectionPos);
+        removeQueuedProbeRtRequests(sectionPos);
         probeBuildVersions.remove(sectionPos);
 
         SectionLightTable removed = activeTables.remove(sectionPos);
@@ -453,6 +460,59 @@ public final class SectionLightManager {
         return activeLightCount;
     }
 
+    public synchronized int drainPendingCacheRequests(
+            CacheRequestQueue requests,
+            ChunkSectionPos cameraSection,
+            int frameIndex,
+            int maxRequests) {
+        if (destroyed || requests == null || maxRequests <= 0) {
+            return 0;
+        }
+
+        int emitted = 0;
+        int attempts = dirtyProbeRtRequestPageQueue.size();
+        while (emitted < maxRequests && attempts-- > 0 && !dirtyProbeRtRequestPageQueue.isEmpty()) {
+            ChunkSectionPos sectionPos = dirtyProbeRtRequestPageQueue.removeFirst();
+            Integer cursor = dirtyProbeRtRequestCursors.get(sectionPos);
+            if (cursor == null) {
+                continue;
+            }
+
+            SectionDirectionalProbePage page = activeProbePages.get(sectionPos);
+            if (page == null || !page.hasPackedRadiance()) {
+                dirtyProbeRtRequestCursors.remove(sectionPos);
+                continue;
+            }
+
+            int probeIndex = Math.max(0, cursor);
+            float distanceSquared = requestDistanceSquared(sectionPos, cameraSection);
+            while (probeIndex < SectionDirectionalProbePage.PROBE_COUNT && emitted < maxRequests) {
+                CacheRequestKey key = CacheRequestKey.sectionProbeCell(sectionPos, probeIndex);
+                requests.enqueue(CacheRequest.sectionProbeCell(
+                        key,
+                        CacheRequestSource.SECTION_DIRTY_QUEUE,
+                        frameIndex,
+                        page.probeLuma(probeIndex),
+                        distanceSquared));
+                probeIndex++;
+                emitted++;
+            }
+
+            if (probeIndex < SectionDirectionalProbePage.PROBE_COUNT) {
+                dirtyProbeRtRequestCursors.put(sectionPos, probeIndex);
+                dirtyProbeRtRequestPageQueue.addLast(sectionPos);
+            } else {
+                dirtyProbeRtRequestCursors.remove(sectionPos);
+            }
+        }
+        return emitted;
+    }
+
+    public synchronized void clearPendingCacheRequests() {
+        dirtyProbeRtRequestPageQueue.clear();
+        dirtyProbeRtRequestCursors.clear();
+    }
+
     public synchronized void clear() {
         activeSectionPositions.clear();
         activeTables.clear();
@@ -465,6 +525,8 @@ public final class SectionLightManager {
         dirtyProbeFeedbackSlotQueue.clear();
         dirtyProbePageQueue.clear();
         queuedDirtyProbePages.clear();
+        dirtyProbeRtRequestPageQueue.clear();
+        dirtyProbeRtRequestCursors.clear();
         freeProbeSlots.clear();
         completedProbeBuilds.clear();
         inFlightProbeBuilds.clear();
@@ -747,6 +809,7 @@ public final class SectionLightManager {
         if (page == null) {
             return false;
         }
+        removeQueuedProbeRtRequests(sectionPos);
         if (!activeSectionPositions.contains(sectionPos)) {
             retainedTables.remove(sectionPos);
         }
@@ -808,6 +871,7 @@ public final class SectionLightManager {
         activeProbePages.remove(victimSectionPos);
         retainedTables.remove(victimSectionPos);
         removeQueuedProbePage(victimSectionPos);
+        removeQueuedProbeRtRequests(victimSectionPos);
         probeSlots[slot] = null;
         victim.setSlot(-1);
         probeHeaderDirty = true;
@@ -847,6 +911,10 @@ public final class SectionLightManager {
     private void markProbeSlotDirty(int slot) {
         if (slot < 0 || slot >= MAX_GPU_PROBE_PAGES) {
             return;
+        }
+        SectionDirectionalProbePage page = probeSlots[slot];
+        if (page != null) {
+            queueProbeRtRequests(page.sectionPos());
         }
         probeGpuVersion++;
         if (probeGpuVersion <= 0) {
@@ -958,6 +1026,22 @@ public final class SectionLightManager {
     private void removeQueuedProbePage(ChunkSectionPos sectionPos) {
         if (queuedDirtyProbePages.remove(sectionPos)) {
             dirtyProbePageQueue.remove(sectionPos);
+        }
+    }
+
+    private void queueProbeRtRequests(ChunkSectionPos sectionPos) {
+        if (destroyed || sectionPos == null) {
+            return;
+        }
+        Integer previousCursor = dirtyProbeRtRequestCursors.put(sectionPos, 0);
+        if (previousCursor == null) {
+            dirtyProbeRtRequestPageQueue.addLast(sectionPos);
+        }
+    }
+
+    private void removeQueuedProbeRtRequests(ChunkSectionPos sectionPos) {
+        if (dirtyProbeRtRequestCursors.remove(sectionPos) != null) {
+            dirtyProbeRtRequestPageQueue.remove(sectionPos);
         }
     }
 
@@ -1331,6 +1415,13 @@ public final class SectionLightManager {
         long dy = (long) a.getSectionY() - b.getSectionY();
         long dz = (long) a.getSectionZ() - b.getSectionZ();
         return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static float requestDistanceSquared(ChunkSectionPos sectionPos, ChunkSectionPos cameraSection) {
+        if (sectionPos == null || cameraSection == null) {
+            return 0.0f;
+        }
+        return (float) Math.min(sectionDistanceSquared(sectionPos, cameraSection), (long) Float.MAX_VALUE);
     }
 
     private record DirtyProbeMarks(int total, int neighbor) {
