@@ -7,7 +7,7 @@ import java.util.Stack;
 
 import static org.lwjgl.vulkan.VK10.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-public class PoolLinearAllocator {
+public class PoolLinearAllocator implements AutoCloseable {
     private final int usage;
     private final int properties;
     private final int vmaFlags;
@@ -89,6 +89,16 @@ public class PoolLinearAllocator {
         while (!bufferPool.isEmpty()) {
             bufferPool.pop().close();
         }
+    }
+
+    @Override
+    public void close() {
+        if (buffer != null) {
+            buffer.close();
+            buffer = null;
+        }
+        clearPool();
+        currentOffset = 0;
     }
 
     public BufferRegion allocate(long size) {

@@ -38,6 +38,7 @@ import org.joml.Matrix4f;
  * @see DLSSRayReconstruction
  */
 public class JitterManager {
+private static final boolean DEBUG_JITTER_FRAMES = Boolean.getBoolean("vulkanite.debugJitterFrames");
 private static int frameIndex = 0;
 private static int frameCounter = 0;
 private static int sequenceIndex = 0;
@@ -109,7 +110,7 @@ firstFrameAfterActivation = false;
 	jitterY = Math.max(-0.5f, Math.min(0.5f, haltonY - 0.5f));
 
 // DIAGNOSTIC: Log jitter values every 300 frames to reduce spam
-if (frameCounter % 300 == 0) {
+if (DEBUG_JITTER_FRAMES && frameCounter % 300 == 0) {
 System.out.println("[JitterManager] frameIndex=" + frameIndex +
 ", jitter=(" + jitterX + ", " + jitterY + ")" +
 ", renderRes=" + currentRenderWidth + "x" + currentRenderHeight +
@@ -193,6 +194,9 @@ System.out.println("[JitterManager] frameIndex=" + frameIndex +
      * @param enabled true to enable, false to disable and reset
      */
     public static void setEnabled(boolean enabled) {
+        if (isEnabled == enabled) {
+            return;
+        }
         isEnabled = enabled;
         if (!enabled) {
             reset();
@@ -234,6 +238,8 @@ System.out.println("[JitterManager] frameIndex=" + frameIndex +
         if (active) {
             firstFrameAfterActivation = true;
         } else {
+            jitterX = 0;
+            jitterY = 0;
             prevJitterX = 0;
             prevJitterY = 0;
         }

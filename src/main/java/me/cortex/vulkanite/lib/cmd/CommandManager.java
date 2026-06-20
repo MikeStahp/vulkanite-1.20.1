@@ -49,6 +49,7 @@ public class CommandManager {
     private boolean framePacingEnabled = false;
     private final VkDevice device;
     private final Queue[] queues;
+    private final long[] observedExecutions;
     private final ThreadLocal<VRef<VCommandPool>> threadLocalPool = ThreadLocal.withInitial(() -> {
         var pool = createSingleUsePool();
         pool.get().setDebugUtilsObjectName("Thread-local single use pool");
@@ -58,6 +59,7 @@ public class CommandManager {
     public CommandManager(VkDevice device, int queues) {
         this.device = device;
         this.queues = new Queue[queues];
+        this.observedExecutions = new long[queues];
         for (int i = 0; i < queues; i++) {
             this.queues[i] = new Queue(i, device);
         }
@@ -265,7 +267,6 @@ public class CommandManager {
             return;
         }
 
-        long[] observedExecutions = new long[queues.length];
         Arrays.fill(observedExecutions, Long.MIN_VALUE);
 
         inFlightSubmissions.removeIf(submission -> {
@@ -443,8 +444,13 @@ public class CommandManager {
         public void waitForExecutions(int execQueue, List<Long> executions) {
             synchronized (waitingFor) {
                 long currentValue = waitingFor.getOrDefault(execQueue, 0);
-                long execMax = executions.stream().mapToLong(Long::longValue).max()
-                        .orElse(currentValue);
+                long execMax = currentValue;
+                for (int i = 0; i < executions.size(); i++) {
+                    long execution = executions.get(i);
+                    if (execution > execMax) {
+                        execMax = execution;
+                    }
+                }
                 LOGGER.trace("Queue.waitForExecutions: queueId={}, current={}, max_from_list={}, size={}, thread={}",
                         execQueue, currentValue, execMax, executions.size(), Thread.currentThread().getName());
                 waitingFor.put(execQueue, execMax);

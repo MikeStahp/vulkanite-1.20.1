@@ -247,8 +247,12 @@ public class ShaderpackSettingsHandler {
             LOGGER.info("[Vulkanite] {} RTX entity capture from {}", value ? "Enabled" : "Disabled", source);
         });
         applyBoolean(settings, source, "rtxParticleCaptureEnabled", "RTX_PARTICLE_CAPTURE", value -> {
-            config.rtxParticleCaptureEnabled = value;
-            LOGGER.info("[Vulkanite] {} RTX particle capture from {}", value ? "Enabled" : "Disabled", source);
+            config.rtxParticleCaptureEnabled = false;
+            if (value) {
+                LOGGER.info("[Vulkanite] Ignoring RTX particle capture from {}; using raster particles on top", source);
+            } else {
+                LOGGER.info("[Vulkanite] Disabled RTX particle capture from {}", source);
+            }
         });
         applyInt(settings, source, "rtxEntityCaptureInterval", "RTX_CAPTURE_INTERVAL", 1, 20,
                 value -> {

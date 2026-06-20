@@ -66,7 +66,7 @@ public class VCommandPool extends VObject {
     }
 
     @Override
-    public void free() {
+    public synchronized void free() {
         vkDestroyCommandPool(device, pool, null);
     }
 

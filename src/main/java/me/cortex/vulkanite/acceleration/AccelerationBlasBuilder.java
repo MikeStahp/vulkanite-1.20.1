@@ -4,6 +4,8 @@ package me.cortex.vulkanite.acceleration;
 // then memory copies over to main, while doing compaction
 
 import me.cortex.vulkanite.acceleration.blas.*;
+import me.cortex.vulkanite.compat.IAccelerationBuildResult;
+import me.cortex.vulkanite.lib.base.VRegistry;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.memory.AccelerationStructurePool;
@@ -28,6 +30,11 @@ import static org.lwjgl.vulkan.VK10.*;
  * a dedicated worker thread.
  */
 public class AccelerationBlasBuilder {
+    private static final org.slf4j.Logger LOGGER =
+            org.slf4j.LoggerFactory.getLogger(AccelerationBlasBuilder.class);
+    private static final long WORKER_JOIN_TIMEOUT_MS =
+            Long.getLong("vulkanite.blasShutdownJoinMs", 5_000L);
+
     private final VContext context;
     private final int asyncQueue;
     private final Consumer<BLASBatchResult> resultConsumer;
@@ -40,6 +47,9 @@ public class AccelerationBlasBuilder {
     private final ConcurrentLinkedDeque<List<BLASBuildJob>> batchedJobs = new ConcurrentLinkedDeque<>();
 
     private final BLASJobEnqueuer jobEnqueuer;
+    private final BLASBuildWorker worker;
+    private final Thread workerThread;
+    private boolean destroyed;
 
     public AccelerationBlasBuilder(VContext context, int asyncQueue, Consumer<BLASBatchResult> resultConsumer) {
         this.queryPool = VQueryPool.create(context.device, 10000,
@@ -60,7 +70,7 @@ public class AccelerationBlasBuilder {
         this.jobEnqueuer = new BLASJobEnqueuer(context, asyncQueue, awaitingJobBatches, batchedJobs);
 
         // Start worker thread
-        var worker = new BLASBuildWorker(
+        this.worker = new BLASBuildWorker(
                 context,
                 asyncQueue,
                 resultConsumer,
@@ -70,7 +80,7 @@ public class AccelerationBlasBuilder {
                 awaitingJobBatches,
                 batchedJobs);
         // Use 8MB stack size for the BLAS worker thread to prevent LWJGL MemoryStack overflow
-        Thread workerThread = new Thread(null, worker, "Acceleration blas worker", 8 * 1024 * 1024);
+        this.workerThread = new Thread(null, worker, "Acceleration blas worker", 8 * 1024 * 1024);
         workerThread.start();
     }
 
@@ -82,7 +92,74 @@ public class AccelerationBlasBuilder {
      * Enqueues jobs of section blas builds.
      * NOTE: This is called from a different thread!
      */
-    public void enqueue(List<ChunkBuildOutput> batch) {
+    public synchronized void enqueue(List<ChunkBuildOutput> batch) {
+        if (destroyed) {
+            discardAccelerationGeometry(batch);
+            return;
+        }
         jobEnqueuer.enqueue(batch);
+    }
+
+    public synchronized void destroy() {
+        if (destroyed) {
+            return;
+        }
+        destroyed = true;
+
+        worker.requestShutdown();
+        java.util.concurrent.locks.LockSupport.unpark(workerThread);
+        boolean workerStopped = joinWorker();
+        closeQueuedJobs();
+
+        if (!workerStopped) {
+            return;
+        }
+
+        context.cmd.waitQueueIdle(asyncQueue);
+        queryPool.close();
+        gpuVertexDecodePipeline.close();
+        accelerationStructurePool.destroy();
+        VRegistry.INSTANCE.threadLocalCollect();
+    }
+
+    private boolean joinWorker() {
+        long deadlineNanos = System.nanoTime() + WORKER_JOIN_TIMEOUT_MS * 1_000_000L;
+        boolean interrupted = false;
+        while (workerThread.isAlive() && System.nanoTime() < deadlineNanos) {
+            context.cmd.processPendingSubmissions();
+            context.cmd.waitQueueIdle(asyncQueue);
+            context.cmd.processPendingSubmissions();
+            try {
+                workerThread.join(50L);
+            } catch (InterruptedException e) {
+                interrupted = true;
+                break;
+            }
+        }
+
+        if (workerThread.isAlive()) {
+            LOGGER.warn("[BLAS Builder] Worker did not stop within {} ms; Vulkanite shutdown will continue with resources retained",
+                    WORKER_JOIN_TIMEOUT_MS);
+        } else {
+            LOGGER.info("[BLAS Builder] Worker stopped during shutdown");
+        }
+
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        return !workerThread.isAlive();
+    }
+
+    private void closeQueuedJobs() {
+        List<BLASBuildJob> batch;
+        while ((batch = batchedJobs.poll()) != null) {
+            BLASBuildWorker.closeJobs(batch);
+        }
+    }
+
+    private static void discardAccelerationGeometry(List<ChunkBuildOutput> batch) {
+        for (ChunkBuildOutput output : batch) {
+            ((IAccelerationBuildResult) output).setAccelerationGeometry(null);
+        }
     }
 }

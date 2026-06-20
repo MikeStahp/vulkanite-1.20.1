@@ -19,6 +19,8 @@ import static org.lwjgl.vulkan.VK10.*;
 
 public class VQueryPool extends VObject {
     private static final Logger LOGGER = LoggerFactory.getLogger(VQueryPool.class);
+    private static final long SLOW_QUERY_LOG_NANOS =
+            Long.getLong("vulkanite.querySlowLogMs", 10L) * 1_000_000L;
     
     public final long pool;
     private final VkDevice device;
@@ -51,59 +53,79 @@ public class VQueryPool extends VObject {
     }
 
     public long[] getResultsLong(int start, int count, int flags) {
-        LOGGER.info("=== VQueryPool.getResultsLong START ===");
-        LOGGER.info("Reading {} query results from query pool (start={}, flags=0x{}, wait={})",
-                count, start, Integer.toHexString(flags), (flags & VK_QUERY_RESULT_WAIT_BIT) != 0);
-        LOGGER.info("Using heap allocation (MemoryUtil.memAllocLong) to avoid MemoryStack overflow");
-
         long readStartTime = System.nanoTime();
         // Use heap allocation instead of stack allocation to prevent MemoryStack overflow
         // when dealing with large query counts in BLAS operations
         LongBuffer results = MemoryUtil.memAllocLong(count);
         try {
-            LOGGER.info("Heap LongBuffer allocated successfully, capacity: {}, remaining: {}", results.capacity(), results.remaining());
-
             // Try to get results - this will wait if VK_QUERY_RESULT_WAIT_BIT is set
-            LOGGER.info("About to call vkGetQueryPoolResults with count={}, start={}", count, start);
             int result = vkGetQueryPoolResults(device, pool, start, count, results, Long.BYTES,
                     VK_QUERY_RESULT_64_BIT | flags);
-            LOGGER.info("vkGetQueryPoolResults returned: 0x{} ({})", Integer.toHexString(result),
-                    result == 0 ? "VK_SUCCESS" : result == VK_NOT_READY ? "VK_NOT_READY" : "ERROR");
 
-            long readDuration = (System.nanoTime() - readStartTime) / 1_000_000;
+            long readDurationNanos = System.nanoTime() - readStartTime;
+            double readDurationMs = readDurationNanos / 1_000_000.0;
 
             if (result != VK_SUCCESS && result != VK_NOT_READY) {
                 LOGGER.error("Query pool read FAILED after {} ms: result=0x{} ({})",
-                        readDuration, Integer.toHexString(result), VUtil.getResultName(result));
+                        readDurationMs, Integer.toHexString(result), VUtil.getResultName(result));
                 _CHECK_(result);
             } else if (result == VK_NOT_READY) {
                 LOGGER.warn("Query pool results NOT READY after {} ms (start={}, count={})",
-                        readDuration, start, count);
+                        readDurationMs, start, count);
                 // Still check it to throw appropriate exception
                 _CHECK_(result);
-            } else {
-                LOGGER.info("Query pool read SUCCESS after {} ms", readDuration);
+            } else if (readDurationNanos >= SLOW_QUERY_LOG_NANOS) {
+                LOGGER.debug("Query pool read completed in {} ms (start={}, count={}, flags=0x{})",
+                        readDurationMs, start, count, Integer.toHexString(flags));
+            } else if (LOGGER.isTraceEnabled()) {
+                LOGGER.trace("Query pool read completed in {} ms (start={}, count={}, flags=0x{})",
+                        readDurationMs, start, count, Integer.toHexString(flags));
             }
 
-            LOGGER.info("About to create result array of size {} and copy from buffer", count);
             var res = new long[count];
             results.rewind();
-            LOGGER.info("Buffer rewound, position: {}, remaining: {}", results.position(), results.remaining());
             results.get(res);
-            LOGGER.info("Successfully copied {} elements to result array", res.length);
-            LOGGER.info("=== VQueryPool.getResultsLong END ===");
             return res;
         } catch (Exception e) {
-            long readDuration = (System.nanoTime() - readStartTime) / 1_000_000;
-            LOGGER.error("=== VQueryPool.getResultsLong EXCEPTION ===");
+            double readDurationMs = (System.nanoTime() - readStartTime) / 1_000_000.0;
             LOGGER.error("Exception reading query pool results after {} ms (start={}, count={}, flags=0x{})",
-                    readDuration, start, count, Integer.toHexString(flags), e);
-            LOGGER.error("=== VQueryPool.getResultsLong EXCEPTION END ===");
+                    readDurationMs, start, count, Integer.toHexString(flags), e);
             throw e;
         } finally {
             // Always free the heap-allocated buffer to prevent memory leaks
             MemoryUtil.memFree(results);
-            LOGGER.info("Heap LongBuffer freed in finally block");
+        }
+    }
+
+    public long[] getResultsLongIfAvailable(int start, int count) {
+        long readStartTime = System.nanoTime();
+        LongBuffer results = MemoryUtil.memAllocLong(count * 2);
+        try {
+            int result = vkGetQueryPoolResults(device, pool, start, count, results,
+                    Long.BYTES * 2L,
+                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            if (result == VK_NOT_READY) {
+                return null;
+            }
+            if (result != VK_SUCCESS) {
+                LOGGER.error("Query pool availability read FAILED after {} ms: result=0x{} ({})",
+                        (System.nanoTime() - readStartTime) / 1_000_000.0,
+                        Integer.toHexString(result), VUtil.getResultName(result));
+                _CHECK_(result);
+            }
+
+            long[] values = new long[count];
+            for (int i = 0; i < count; i++) {
+                long value = results.get(i * 2);
+                long available = results.get(i * 2 + 1);
+                if (available == 0L) {
+                    return null;
+                }
+                values[i] = value;
+            }
+            return values;
+        } finally {
+            MemoryUtil.memFree(results);
         }
     }
 

@@ -10,12 +10,14 @@ This document compares Vulkanite's current hybrid RTX path with Radiance's
 native Vulkan renderer and records the parts of Radiance that are practical to
 adopt without replacing Iris or Vulkanite's OpenGL/Vulkan interop model.
 
-Reference revisions inspected on June 15, 2026:
+Reference revisions inspected and updated through June 19, 2026:
 
 - [Radiance](https://github.com/Minecraft-Radiance/Radiance):
   `414d8e330a2fc6cb1e8630cc95f2302b2b97a0e8`
 - [MCVR](https://github.com/Minecraft-Radiance/MCVR):
   `9905c81b1999f5845bf66d13501d371c16adf561`
+- [Voxy](https://github.com/MCRcortex/voxy):
+  `581d48e22f913656c1b6532635dbf6a5f371952a`
 
 Radiance and Vulkanite solve related but different problems:
 
@@ -190,6 +192,81 @@ combined noisy radiance, motion, depth, and shared Iris G-buffers.
 | Synchronization | Manual transitions and shared semaphores | Resource-declared barriers inside Vulkan | Centralize resource state tracking |
 | Shader ownership | Tracked `shaderpacks/VulkaniteRT` synced into `run/` | Versioned built-in shaderpacks | Keep tracked source and runtime drift validation |
 
+## Voxy Reference Notes
+
+Voxy is a useful longer-term reference for voxel and LoD math, not for direct
+RT renderer structure. The current revision has both a production LoD renderer
+and an in-progress hierarchical node experiment, so the safe approach is to
+borrow the invariants and data layouts rather than transplanting the unfinished
+hierarchy.
+
+Performance-first pieces to steal:
+
+1. Voxel hierarchy for probe work, not surface shading. Vulkanite already scans
+   each Sodium section into emitter records plus a compact opacity mask, then
+   generates `8x8x8` six-face probe pages. Voxy's 16 -> 8 -> 4 -> 2 -> 1 voxel
+   mip idea should be applied here first: skip empty/unchanged probe cells,
+   cheaply reject light/probe pairs blocked by coarse occupancy, and avoid
+   per-probe traversal through every 16-block opacity cell when a coarser mask is
+   decisive.
+2. Section importance from projected bounds. Voxy's meshlet culler projects all
+   eight local AABB corners, computes a screen-space box, chooses a Hi-Z mip from
+   that footprint, and tests against the depth pyramid. Vulkanite can use the
+   same projected AABB score to prioritize BLAS result installation and decide
+   which TLAS terrain sections are worth carrying this frame.
+3. Hard budgets and adaptive degradation. Voxy avoids unbounded work with fixed
+   request queues, deduplicated build tasks, and cached section meshes. Vulkanite
+   should keep AS builds, BLAS result installation, and probe page regeneration
+   under explicit per-frame budgets, then degrade by using older BLAS/probe pages
+   instead of stalling the frame.
+4. Compact per-section metadata. Voxy carries position, a packed local AABB,
+   geometry pointer, and eight 16-bit geometry bucket counts in 32 bytes. For
+   Vulkanite, adding local section bounds and per-pass range counts beside
+   `JobPassThroughData` would make AS scheduling and shader indexing less blind.
+5. "Render what exists, request better data" fallback. The hierarchical comments
+   keep the invariant that a coarse mesh remains renderable while children or
+   replacement meshes are requested. For RT this means old section BLAS and old
+   probe pages should remain active until replacements are ready, avoiding holes
+   and stalls while async work catches up.
+
+Secondary pieces:
+
+1. Face/material buckets. Voxy stores translucent, double-sided, then six
+   directional opaque buckets. Vulkanite already separates geometry kinds for
+   solid, water, and translucent terrain; the next step is to keep opaque terrain
+   hot and any-hit-free while isolating alpha/translucent work into smaller
+   geometry ranges.
+2. Bounded worker queues with stale-result rejection. Voxy's render generation
+   service deduplicates section tasks by LoD key, checks whether a result is
+   still wanted before upload, and keeps a small mesh cache for requested
+   sections. Vulkanite's BLAS queues should do the same with screen priority and
+   hard per-frame AS budgets.
+3. Hi-Z informed AS budgeting. Voxy builds a depth pyramid and culls meshlets
+   with it. Vulkanite can reuse the raster depth/G-buffer depth to deprioritize
+   BLAS/TLAS updates for occluded terrain, especially when AS build time exceeds
+   the 2 ms target.
+4. Meshlet-sized RT ranges. Voxy's optional meshlet mode stores 62-quad chunks
+   with a local AABB. If full chunk BLAS becomes too coarse, Vulkanite could split
+   large terrain sections into bounded geometry ranges or multiple BLAS instances
+   using the same local-bounds idea.
+
+Avoid copying:
+
+- The current `lod/hierarchical/selector.comp`, `NodeManager`, and `NodeManager2`
+  are prototype-level and contain pseudocode/incomplete paths. Mine their
+  invariants, not their implementation.
+- Voxy's GL multi-draw/mesh-shader renderer does not map directly onto
+  Vulkanite's Vulkan RT path.
+- The current mipper picks the first non-air child in a fixed order. That is
+  acceptable for coarse LoD color continuity, but not for RT material identity,
+  alpha, emissive weighting, or physically meaningful lighting.
+
+For Vulkanite, the near-term application is AS work budgeting: prioritize BLAS
+builds and TLAS instances by projected screen importance, keep probe updates
+voxel-backed and budgeted, preserve old BLAS/probe data while replacements
+build, and avoid spending RT scene update time on sections that are too small,
+unchanged, or occluded to matter this frame.
+
 ## Improvements Applied
 
 ### Tracked bundled shader
@@ -219,21 +296,34 @@ combined noisy radiance, motion, depth, and shared Iris G-buffers.
   default instead of per-pixel RT blocklight probes;
 - looks up probe pages through a bounded hash directory and defaults to nearest
   probe-cell filtering, with trilinear filtering kept as an explicit quality
-  option.
+  option;
+- uses binding `24` as the hardware-RT radiance cache for six-face probe records.
+  A cache cell is filled only after an RT ray claims it, traces local section
+  light visibility, and publishes a versioned ready state. Final lighting hides
+  partial trilinear gathers until all eight required cache corners are ready;
+- treats cached RT radiance as the single final-light authority while
+  `SECTION_LIGHT_PROBE_RT_CACHE_ENABLE` is active. Legacy coverage
+  normalization, sparse per-pixel correction, and unoccluded table fallback are
+  fenced off from the final path;
+- defaults `INDIRECT_BOUNCES` to `3`, keeping the old secondary diffuse GI ray
+  and adding two lower-energy diffuse bounces before the specular reflection
+  path.
 
 ## Recommended Next Steps
 
 1. Introduce a small pass/resource declaration model for ray passes, compute
    reuse passes, and output images.
-2. Move section probe updates and future ReSTIR temporal/spatial reuse out of
-   `ray0.rgen` into explicit compute/pass-graph nodes.
+2. Move section probe updates, RT-cache refresh scheduling, and future ReSTIR
+   temporal/spatial reuse out of `ray0.rgen` into explicit compute/pass-graph
+   nodes.
 3. Store a compact first-hit cache with position, geometric normal, material ID,
    roughness, and validity.
 4. Add previous entity transforms/positions so DLSS and temporal reuse can
    distinguish object motion from camera motion.
-5. Add alpha-aware shadow visibility instead of forcing all shadow rays opaque.
-6. Split noisy diffuse and specular radiance and expose ray hit distance to
+5. Split noisy diffuse and specular radiance and expose ray hit distance to
    DLSS/RR or a future NRD path.
+6. Add a stale-cell refresh budget so cached RT probe cells are reused when
+   stable but periodically refreshed instead of becoming permanently frozen.
 
 The order matters. Tracking the runtime shaderpack and making pass resources
 declarative should happen before importing more Radiance algorithms; otherwise

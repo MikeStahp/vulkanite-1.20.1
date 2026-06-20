@@ -124,17 +124,74 @@ ray-traced occlusion checks, and sharp block-light shadows. The Modrinth notes
 also call out an important tradeoff: sudden brightness changes are part of the
 performance/sharp-shadow compromise.
 
+The current audit used Rethinking Voxels commit
+`1fd788f2c897169b7fc3375f0cb77526a2e65dc9` plus its smaller Voxel Base
+prototype commit `7e6f564523750b0b1ec119cdac2158318c53c9c8`.
+
+Performance-first pieces to steal:
+
+1. Build an influence grid, not only a section directory.
+   Rethinking extracts emissive voxels, scatters each light into affected coarse
+   cells, then bins and caps each cell to its best 64 candidates. Vulkanite's
+   current binding 22 grid only maps exact source sections to contiguous upload
+   ranges. The next version should add per-region candidate lists scored by
+   light radius, distance, luma, and optional normal-facing weight so table
+   fallback and sparse probe validation stop sampling irrelevant lights.
+
+2. Keep voxel metadata richer than binary opacity.
+   Rethinking stores material flags for emissive, alpha-test, cross-model, full
+   cube, cuboid, trace/no-trace, translucent conduction/tint, and cuboid bounds.
+   Vulkanite does not need the whole shaderpack material system, but probes
+   should eventually distinguish solid blockers, cutout/foliage, translucent
+   tinting blocks, partial cuboids, and no-trace decoration.
+
+3. Treat emitters as geometry, not just block centers.
+   Rethinking derives source position and size from cuboid bounds or model
+   mid-coordinates, then can clump same-material nearby emitters. Vulkanite
+   should add source size and local center to `SectionLight`, especially for
+   lava, redstone, lanterns, modded emissive blocks, and area-ish light strips.
+
+4. Use compact voxel occupancy for future GPU probe work.
+   Voxel Base packs a `2x2x2` group into one `r32ui` word with per-subvoxel face
+   occupancy plus an emissive bit. Vulkanite's CPU `SectionLightTable` opacity
+   mips are the right first step; if probe generation moves to compute, a
+   GPU-visible packed face mask is the better format than one full record per
+   block.
+
+5. Use temporal light retention before brute-force discovery.
+   Voxel Base keeps previously useful light candidates in a history image,
+   validates them with a hybrid screen/voxel ray, and only occasionally
+   discovers new emitters. This maps to Vulkanite's local-light reservoir work:
+   keep candidates that were visible/useful recently, age them out when section
+   versions change, and spend sparse RT rays on validation rather than global
+   light scans.
+
+6. Use hybrid visibility in this priority order:
+   existing screen/depth information first, voxel/probe visibility second, sparse
+   hardware RT only for suspicious or high-impact cases. That matches the
+   performance target better than defaulting local diffuse lighting back to
+   per-pixel RT.
+
+Things not to copy:
+
+- Rethinking's whole Complementary pass graph or gameplay shaderpack UI.
+- Per-pixel voxel RT as the default block-light path.
+- Irradiance-cache update code that relies on shader execution ordering during
+  camera motion. Vulkanite should keep versioned probe pages and explicit
+  upload/compute synchronization instead.
+
 The practical lesson is that Minecraft block lighting should be treated as a
 voxel/light-field problem first, then corrected with selective visibility rays.
-Vulkanite's section light tables, 8x8x8 directional probe pages, and opacity
-masks are on the right track for the cheap light field. The next step is not
-more per-pixel diffuse RT; it is sparse RT validation, better temporal blending,
-and better emitter identity for modded/PBR light sources.
+Vulkanite's section light tables, `8x8x8` directional probe pages, and opacity
+mips are on the right track for the cheap light field. The next step is not more
+per-pixel diffuse RT; it is an influence-sorted light grid, better emitter
+identity, material-aware probe visibility, and temporal candidate retention.
 
 Sources:
 
 - https://github.com/gri573/rethinking-voxels
 - https://modrinth.com/shader/rethinking-voxels
+- https://github.com/gri573/voxel-base
 
 ### Soft Voxels
 
@@ -404,6 +461,28 @@ Current prototype behavior:
   time, upload time, total probe-update time, and buffer size.
 - Hot command-submission and descriptor-binding diagnostics are trace-level so
   normal debug logging does not distort frame-time measurements.
+- Section opacity now carries a Voxy-style `16x16x16 -> 8x8x8 -> 4x4x4 ->
+  2x2x2 -> 1x1x1` mip pyramid. Probe visibility uses it to skip per-block voxel
+  traversal when a light/probe ray's block-space bounds contain no opaque cells,
+  and to hop across empty coarse mip cells during DDA traversal.
+
+Performance priority from Voxy:
+
+- Treat the probe cache as the primary voxel consumer. The current
+  `SectionLightTable` already stores a section-local `16x16x16` opacity mask and
+  explicit emitter records; `SectionDirectionalProbePage` already bakes an
+  `8x8x8` six-face light field from neighboring tables. Voxy's most useful
+  contribution here is a hierarchical section mip, not a new renderer.
+- Add coarse occupancy/light mips beside the opacity mask: 8x8x8, 4x4x4,
+  2x2x2, and 1x1x1. Use them to skip empty probe cells, reject light/probe pairs
+  blocked by fully opaque coarse cells, and avoid walking every individual
+  16-block voxel when the coarse mask is decisive.
+- Keep the default path budget-first: old probe pages remain valid while new
+  pages rebuild, probe generation stays capped per upload, and expensive sparse
+  RT validation stays opt-in for low-confidence/leaky cases.
+- Do not use Voxy's exact material mipper for probe radiance. For performance,
+  only the occupancy/emitter summary matters; material identity still belongs to
+  section light records, G-buffer surfaces, or explicit RT hits.
 
 Atlas ownership must be explicit from the start:
 
@@ -734,6 +813,9 @@ Current status:
 
 - Binding 23 is a packed GPU SSBO with a hashed probe-page directory and
   8x8x8 six-face RGB10 pages keyed by `ChunkSectionPos`.
+- Binding 24 is the persistent hardware-RT radiance cache for probe faces. The
+  raygen claims a whole probe cell, traces a stable local candidate set, writes
+  all six directional faces, and publishes a versioned ready state.
 - `ray0.rgen` samples binding 23 by bounded hash lookup. Trilinear probe
   sampling is the current visual-tuning default because nearest-cell sampling
   made the prototype radiance visibly blocky; nearest remains the performance
@@ -742,11 +824,15 @@ Current status:
   shading. The final contribution is diffuse-only and cosine-weighted; cached
   faces are not evaluated through `evaluatePBRSplit`.
 - Binding 22 remains a table/debug comparison path, not the default final-light
-  source.
+  source. While binding 24 is enabled, the shader fences off coverage
+  normalization, sparse per-pixel correction, and unoccluded table fallback from
+  the final path.
 - CPU regeneration is budgeted to 1 page per upload call and at most 48 selected
   emitters per page.
 - Scalar Minecraft blocklight diffuse/specular has been removed from final
   lighting; the G-buffer blocklight value remains a guide/debug signal.
+- `INDIRECT_BOUNCES` defaults to `3`, so the raygen now traces the old secondary
+  diffuse GI bounce plus two lower-energy follow-up bounces.
 
 Optimized work:
 
@@ -776,7 +862,7 @@ Exit criteria:
 - Debug modes identify missing pages, face weights, probe radiance, and
   probe/table mismatch clearly enough for runtime tuning.
 
-Current validation status for Phase 3 on 2026-06-18:
+Current validation status for Phase 3 on 2026-06-19:
 
 - `.\gradlew compileJava` passes.
 - `.\gradlew validateVulkaniteShaderpackDrift` passes.
@@ -785,8 +871,9 @@ Current validation status for Phase 3 on 2026-06-18:
 - A generated mode-4 preprocessed `ray0.rgen` also compiles after replacing
   `#define SECTION_LIGHT_PROBE_DEBUG_MODE 0` with `4`.
 - The cached-radiance correction is shader-validated: probe reconstruction uses
-  raw cosine-weighted incident radiance, applies diffuse response once, and uses
-  raw incident cache presence for table-fallback decisions.
+  raw cosine-weighted incident radiance, applies diffuse response once, hides
+  partial trilinear gathers until all RT-cache corners are ready, and keeps
+  table fallback out of the RT-cache final-light path.
 
 ### Phase 4: Voxel Occlusion And Sparse RT Correction
 
@@ -801,13 +888,14 @@ Current status:
   through the active 3x3x3 neighboring section masks.
 - Probe pages pack an energy-weighted per-face visibility confidence term. The
   shader applies that term when decoding probe radiance and exposes debug mode
-  `6` for confidence visualization.
+  `3` for confidence visualization.
 - Dirty probe-page regeneration blends against page history so torch/blocker
   changes are amortized instead of snapping every affected face to the newest
   CPU estimate immediately.
 - The sparse RT correction path is now opt-in through
   `SECTION_LIGHT_SPARSE_RT_CORRECTION`. The normal/default path stays on the
-  deterministic probe cache plus voxel confidence while Phase 4 is tuned.
+  deterministic RT probe cache plus voxel confidence while Phase 4 is tuned, and
+  the correction path is hard-disabled whenever binding 24 owns final radiance.
 - When sparse validation is enabled, it traces toward explicit uploaded
   section-light candidates instead of using the old hemispheric fake blocklight
   sampler. This keeps validation deterministic and avoids adding stochastic
@@ -840,14 +928,14 @@ Exit criteria:
   cases without becoming default per-pixel blocklight tracing or reintroducing
   the old stochastic fake blocklight sampler.
 
-Current validation status for Phase 4 on 2026-06-18:
+Current validation status for Phase 4 on 2026-06-19:
 
 - `.\gradlew compileJava --rerun-tasks` passes.
 - `.\gradlew syncVulkaniteShaderpacks validateVulkaniteShaderpackDrift` passes.
 - `ray0.rgen` preprocesses from `shaderpacks/VulkaniteRT/shaders` and compiles
   with `glslangValidator -V --target-env vulkan1.3 -S rgen`.
-- A generated mode-6 preprocessed `ray0.rgen` also compiles after replacing
-  `#define SECTION_LIGHT_PROBE_DEBUG_MODE 0` with `6`.
+- A generated confidence-mode preprocessed `ray0.rgen` should use
+  `SECTION_LIGHT_PROBE_DEBUG_MODE 3`; older notes that used mode `6` are stale.
 
 ### Phase 5: ReSTIR DI For Local Lights
 

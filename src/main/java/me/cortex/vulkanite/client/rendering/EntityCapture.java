@@ -3,6 +3,10 @@ package me.cortex.vulkanite.client.rendering;
 import me.cortex.vulkanite.compat.IVGImage;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.memory.VGImage;
+import me.cortex.vulkanite.mixin.minecraft.ParticleAccessor;
+import net.caffeinemc.mods.sodium.api.vertex.attributes.CommonVertexAttribute;
+import net.caffeinemc.mods.sodium.api.vertex.buffer.VertexBufferWriter;
+import net.caffeinemc.mods.sodium.api.vertex.format.VertexFormatDescription;
 import net.irisshaders.iris.mixin.LevelRendererAccessor;
 import me.cortex.vulkanite.mixin.minecraft.ParticleManagerAccessor;
 import net.minecraft.client.MinecraftClient;
@@ -13,6 +17,7 @@ import net.minecraft.client.render.RenderLayer;
 import net.minecraft.client.render.RenderPhase;
 import net.minecraft.client.render.VertexConsumer;
 import net.minecraft.client.render.VertexConsumerProvider;
+import net.minecraft.client.render.VertexFormat;
 import net.minecraft.client.texture.AbstractTexture;
 import net.minecraft.client.texture.MissingSprite;
 import net.minecraft.client.texture.SpriteAtlasTexture;
@@ -22,6 +27,8 @@ import net.minecraft.entity.Entity;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import org.lwjgl.system.MemoryStack;
+import org.lwjgl.system.MemoryUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,6 +36,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -47,8 +55,16 @@ public final class EntityCapture implements AutoCloseable {
     public static final int MAX_TEXTURES = 256;
 
     private static final int DISTANCE_CULL_DISABLED_RADIUS = 256;
+    private static final int CAPTURE_SUMMARY_INTERVAL_FRAMES = 120;
+    private static final int DEFAULT_PARTICLE_CLASS_CAPTURE_CAP = 48;
+    private static final List<ParticleTextureSheet> ORDERED_PARTICLE_SHEETS = List.of(
+            ParticleTextureSheet.TERRAIN_SHEET,
+            ParticleTextureSheet.PARTICLE_SHEET_OPAQUE,
+            ParticleTextureSheet.PARTICLE_SHEET_LIT,
+            ParticleTextureSheet.PARTICLE_SHEET_TRANSLUCENT);
     private static final Logger LOGGER = LoggerFactory.getLogger(EntityCapture.class);
     private final TextureRegistry textures = new TextureRegistry();
+    private int captureFrameCounter;
 
     public Frame capture(float tickDelta, ClientWorld world, Camera camera, int maxEntities,
             int maxParticles, boolean captureParticles, int maxEntityDistance) {
@@ -60,34 +76,49 @@ public final class EntityCapture implements AutoCloseable {
         LevelRendererAccessor renderer = (LevelRendererAccessor) client.worldRenderer;
         textures.beginFrame(client);
         List<EntityRenderData> entities = new ArrayList<>();
+        CaptureStats stats = new CaptureStats();
 
         if (maxEntities > 0) {
-            for (Entity entity : collectEntityCandidates(world, camera, maxEntityDistance)) {
+            List<Entity> candidates = collectEntityCandidates(world, camera, maxEntityDistance);
+            stats.entityCandidates = candidates.size();
+            for (Entity entity : candidates) {
                 if (entities.size() >= maxEntities) {
                     break;
                 }
-                CanonicalProvider provider = new CanonicalProvider(textures);
+                CanonicalProvider provider = new CanonicalProvider(textures, stats);
                 try {
-                    renderer.invokeRenderEntity(entity, 0.0, 0.0, 0.0, tickDelta,
+                    double x = MathHelper.lerp(tickDelta, entity.lastRenderX, entity.getX());
+                    double y = MathHelper.lerp(tickDelta, entity.lastRenderY, entity.getY());
+                    double z = MathHelper.lerp(tickDelta, entity.lastRenderZ, entity.getZ());
+                    stats.entitiesRendered++;
+                    renderer.invokeRenderEntity(entity, x, y, z, tickDelta,
                             new MatrixStack(), provider);
                     List<Geometry> geometries = provider.finish();
                     if (!geometries.isEmpty()) {
-                        entities.add(new EntityRenderData(
-                                MathHelper.lerp(tickDelta, entity.lastRenderX, entity.getX()),
-                                MathHelper.lerp(tickDelta, entity.lastRenderY, entity.getY()),
-                                MathHelper.lerp(tickDelta, entity.lastRenderZ, entity.getZ()),
-                                geometries,
-                                true));
+                        stats.entitiesCaptured++;
+                        for (Geometry geometry : geometries) {
+                            stats.entityGeometries++;
+                            stats.entityQuads += geometry.quadCount();
+                        }
+                        entities.add(new EntityRenderData(x, y, z, geometries, true));
+                    } else {
+                        stats.entitiesWithoutGeometry++;
                     }
                 } catch (Exception e) {
-                    LOGGER.debug("Skipping RTX entity capture for {}", entity.getType(), e);
+                    stats.entityErrors++;
+                    if (stats.entityErrors <= 2) {
+                        LOGGER.debug("Skipping RTX entity capture for {}", entity.getType(), e);
+                    }
                 }
             }
         }
 
         if (captureParticles && camera != null && maxParticles > 0) {
-            captureParticles(client, textures, entities, camera, tickDelta, maxParticles);
+            captureParticles(client, textures, entities, camera, tickDelta, maxParticles,
+                    maxEntityDistance, stats);
         }
+
+        logCaptureSummary(stats, entities);
 
         if (entities.isEmpty()) {
             return null;
@@ -273,7 +304,8 @@ public final class EntityCapture implements AutoCloseable {
     }
 
     private static void captureParticles(MinecraftClient client, TextureRegistry textures,
-            List<EntityRenderData> entities, Camera camera, float tickDelta, int maxParticles) {
+            List<EntityRenderData> entities, Camera camera, float tickDelta, int maxParticles,
+            int maxParticleDistance, CaptureStats stats) {
         if (client.particleManager == null) {
             return;
         }
@@ -284,15 +316,74 @@ public final class EntityCapture implements AutoCloseable {
             return;
         }
 
-        List<Geometry> geometries = new ArrayList<>();
+        Vec3d cameraPos = camera.getPos();
+        double maxDistanceSquared = maxDistanceSquared(maxParticleDistance);
+        List<ParticleCandidate> candidates = collectParticleCandidates(
+                particles, textures, cameraPos, maxDistanceSquared);
+        if (candidates.isEmpty()) {
+            return;
+        }
+
+        candidates.sort(Comparator.comparingDouble(ParticleCandidate::distanceSquared));
+
         int captured = 0;
-        for (var entry : particles.entrySet()) {
+        int perClassLimit = Math.max(8, Math.min(DEFAULT_PARTICLE_CLASS_CAPTURE_CAP, Math.max(1, maxParticles / 2)));
+        Map<Class<?>, Integer> capturedByClass = new HashMap<>();
+        Map<TextureBinding, CanonicalVertexConsumer> consumers = new LinkedHashMap<>();
+
+        for (ParticleCandidate candidate : candidates) {
             if (captured >= maxParticles) {
                 break;
             }
 
-            Identifier atlasId = atlasForParticleSheet(entry.getKey());
-            if (atlasId == null || entry.getValue() == null || entry.getValue().isEmpty()) {
+            Particle particle = candidate.particle();
+            Class<?> particleClass = particle.getClass();
+            int classCount = capturedByClass.getOrDefault(particleClass, 0);
+            if (classCount >= perClassLimit) {
+                continue;
+            }
+
+            CanonicalVertexConsumer consumer = consumers.computeIfAbsent(candidate.texture(),
+                    texture -> new CanonicalVertexConsumer(texture.index(), texture.id(), 2, 4));
+            try {
+                stats.particlesAttempted++;
+                particle.buildGeometry(consumer, camera, tickDelta);
+                captured++;
+                capturedByClass.put(particleClass, classCount + 1);
+                stats.particlesCaptured++;
+            } catch (Exception e) {
+                stats.particleErrors++;
+                if (stats.particleErrors <= 2) {
+                    LOGGER.trace("Skipping RTX particle capture for {}", particle, e);
+                }
+            }
+        }
+
+        List<Geometry> geometries = new ArrayList<>(consumers.size());
+        for (CanonicalVertexConsumer consumer : consumers.values()) {
+            Geometry geometry = consumer.finish();
+            if (geometry != null) {
+                stats.particleGeometries++;
+                stats.particleQuads += geometry.quadCount();
+                geometries.add(geometry);
+            }
+        }
+
+        if (!geometries.isEmpty()) {
+            entities.add(new EntityRenderData(cameraPos.x, cameraPos.y, cameraPos.z, geometries, false));
+        }
+    }
+
+    private static List<ParticleCandidate> collectParticleCandidates(
+            Map<ParticleTextureSheet, java.util.Queue<Particle>> particles,
+            TextureRegistry textures,
+            Vec3d cameraPos,
+            double maxDistanceSquared) {
+        List<ParticleCandidate> candidates = new ArrayList<>();
+        for (ParticleTextureSheet sheet : orderedParticleSheets(particles)) {
+            java.util.Queue<Particle> queue = particles.get(sheet);
+            Identifier atlasId = atlasForParticleSheet(sheet);
+            if (atlasId == null || queue == null || queue.isEmpty()) {
                 continue;
             }
 
@@ -301,32 +392,41 @@ public final class EntityCapture implements AutoCloseable {
                 continue;
             }
 
-            CanonicalVertexConsumer consumer = new CanonicalVertexConsumer(texture.index(), texture.id(), 2);
-            for (Particle particle : entry.getValue()) {
-                if (captured >= maxParticles) {
-                    break;
-                }
+            for (Particle particle : queue) {
                 if (particle == null || !particle.isAlive()) {
                     continue;
                 }
-                try {
-                    particle.buildGeometry(consumer, camera, tickDelta);
-                    captured++;
-                } catch (Exception e) {
-                    LOGGER.debug("Skipping RTX particle capture for {}", particle, e);
+                double distanceSquared = particleDistanceSquared(particle, cameraPos);
+                if (distanceSquared <= maxDistanceSquared) {
+                    candidates.add(new ParticleCandidate(particle, texture, distanceSquared));
                 }
             }
+        }
+        return candidates;
+    }
 
-            Geometry geometry = consumer.finish();
-            if (geometry != null) {
-                geometries.add(geometry);
+    private static List<ParticleTextureSheet> orderedParticleSheets(
+            Map<ParticleTextureSheet, java.util.Queue<Particle>> particles) {
+        List<ParticleTextureSheet> ordered = new ArrayList<>(particles.size());
+        for (ParticleTextureSheet sheet : ORDERED_PARTICLE_SHEETS) {
+            if (particles.containsKey(sheet)) {
+                ordered.add(sheet);
             }
         }
-
-        if (!geometries.isEmpty()) {
-            Vec3d cameraPos = camera.getPos();
-            entities.add(new EntityRenderData(cameraPos.x, cameraPos.y, cameraPos.z, geometries, false));
+        for (ParticleTextureSheet sheet : particles.keySet()) {
+            if (!ordered.contains(sheet)) {
+                ordered.add(sheet);
+            }
         }
+        return ordered;
+    }
+
+    private static double particleDistanceSquared(Particle particle, Vec3d cameraPos) {
+        ParticleAccessor accessor = (ParticleAccessor) particle;
+        double dx = accessor.vulkanite$getX() - cameraPos.x;
+        double dy = accessor.vulkanite$getY() - cameraPos.y;
+        double dz = accessor.vulkanite$getZ() - cameraPos.z;
+        return dx * dx + dy * dy + dz * dz;
     }
 
     private static Identifier atlasForParticleSheet(ParticleTextureSheet sheet) {
@@ -341,17 +441,24 @@ public final class EntityCapture implements AutoCloseable {
         return null;
     }
 
+    private record ParticleCandidate(Particle particle, TextureBinding texture, double distanceSquared) {
+    }
+
     private static final class CanonicalProvider implements VertexConsumerProvider {
         private final TextureRegistry textures;
+        private final CaptureStats stats;
         private final Map<RenderLayer, CanonicalVertexConsumer> consumers = new LinkedHashMap<>();
 
-        private CanonicalProvider(TextureRegistry textures) {
+        private CanonicalProvider(TextureRegistry textures, CaptureStats stats) {
             this.textures = textures;
+            this.stats = stats;
         }
 
         @Override
         public VertexConsumer getBuffer(RenderLayer layer) {
-            if (layer.getDrawMode() != net.minecraft.client.render.VertexFormat.DrawMode.QUADS) {
+            int verticesPerPrimitive = verticesPerPrimitive(layer.getDrawMode());
+            if (verticesPerPrimitive == 0) {
+                stats.unsupportedLayers++;
                 return DiscardingVertexConsumer.INSTANCE;
             }
             CanonicalVertexConsumer existing = consumers.get(layer);
@@ -361,10 +468,12 @@ public final class EntityCapture implements AutoCloseable {
 
             TextureBinding texture = textures.resolve(layer);
             if (texture == null) {
+                stats.textureMisses++;
                 return DiscardingVertexConsumer.INSTANCE;
             }
 
-            CanonicalVertexConsumer created = new CanonicalVertexConsumer(texture.index(), texture.id(), alphaMode(layer));
+            CanonicalVertexConsumer created = new CanonicalVertexConsumer(
+                    texture.index(), texture.id(), alphaMode(layer), verticesPerPrimitive);
             consumers.put(layer, created);
             return created;
         }
@@ -390,17 +499,28 @@ public final class EntityCapture implements AutoCloseable {
             }
             return 0;
         }
+
+        private static int verticesPerPrimitive(VertexFormat.DrawMode mode) {
+            if (mode == VertexFormat.DrawMode.QUADS) {
+                return 4;
+            }
+            if (mode == VertexFormat.DrawMode.TRIANGLES) {
+                return 3;
+            }
+            return 0;
+        }
     }
 
     private record TextureBinding(int index, Identifier id) {
     }
 
-    private static final class CanonicalVertexConsumer implements VertexConsumer {
+    private static final class CanonicalVertexConsumer implements VertexConsumer, VertexBufferWriter {
         private ByteBuffer buffer = ByteBuffer.allocateDirect(VERTEX_STRIDE * 256)
                 .order(ByteOrder.nativeOrder());
         private final int textureIndex;
         private final Identifier textureId;
         private final int alphaMode;
+        private final int verticesPerPrimitive;
 
         private float x;
         private float y;
@@ -419,10 +539,11 @@ public final class EntityCapture implements AutoCloseable {
         private boolean fixedColor;
         private int vertexCount;
 
-        private CanonicalVertexConsumer(int textureIndex, Identifier textureId, int alphaMode) {
+        private CanonicalVertexConsumer(int textureIndex, Identifier textureId, int alphaMode, int verticesPerPrimitive) {
             this.textureIndex = textureIndex;
             this.textureId = textureId;
             this.alphaMode = alphaMode;
+            this.verticesPerPrimitive = verticesPerPrimitive;
         }
 
         @Override
@@ -511,7 +632,53 @@ public final class EntityCapture implements AutoCloseable {
             red = green = blue = alpha = 255;
         }
 
+        @Override
+        public void push(MemoryStack stack, long ptr, int count, VertexFormatDescription format) {
+            int stride = format.stride();
+            int positionOffset = offset(format, CommonVertexAttribute.POSITION);
+            if (positionOffset < 0) {
+                return;
+            }
+            int textureOffset = offset(format, CommonVertexAttribute.TEXTURE);
+            int colorOffset = offset(format, CommonVertexAttribute.COLOR);
+            int lightOffset = offset(format, CommonVertexAttribute.LIGHT);
+            int normalOffset = offset(format, CommonVertexAttribute.NORMAL);
+
+            for (int i = 0; i < count; i++) {
+                long vertex = ptr + (long) i * stride;
+                x = MemoryUtil.memGetFloat(vertex + positionOffset);
+                y = MemoryUtil.memGetFloat(vertex + positionOffset + 4);
+                z = MemoryUtil.memGetFloat(vertex + positionOffset + 8);
+
+                if (textureOffset >= 0) {
+                    u = MemoryUtil.memGetFloat(vertex + textureOffset);
+                    v = MemoryUtil.memGetFloat(vertex + textureOffset + 4);
+                }
+                if (colorOffset >= 0 && !fixedColor) {
+                    int color = MemoryUtil.memGetInt(vertex + colorOffset);
+                    red = color & 0xFF;
+                    green = (color >>> 8) & 0xFF;
+                    blue = (color >>> 16) & 0xFF;
+                    alpha = (color >>> 24) & 0xFF;
+                }
+                if (lightOffset >= 0) {
+                    int light = MemoryUtil.memGetInt(vertex + lightOffset);
+                    lightU = light & 0xFFFF;
+                    lightV = (light >>> 16) & 0xFFFF;
+                }
+                if (normalOffset >= 0) {
+                    normalX = unpackNormal(MemoryUtil.memGetByte(vertex + normalOffset));
+                    normalY = unpackNormal(MemoryUtil.memGetByte(vertex + normalOffset + 1));
+                    normalZ = unpackNormal(MemoryUtil.memGetByte(vertex + normalOffset + 2));
+                }
+                next();
+            }
+        }
+
         private Geometry finish() {
+            if (verticesPerPrimitive == 3) {
+                return finishTrianglesAsQuads();
+            }
             int completeVertices = vertexCount - vertexCount % 4;
             if (completeVertices == 0) {
                 return null;
@@ -520,6 +687,27 @@ public final class EntityCapture implements AutoCloseable {
             result.position(0);
             result.limit(completeVertices * VERTEX_STRIDE);
             return new Geometry(result.slice().order(ByteOrder.nativeOrder()), completeVertices, textureId);
+        }
+
+        private Geometry finishTrianglesAsQuads() {
+            int triangleCount = vertexCount / 3;
+            if (triangleCount == 0) {
+                return null;
+            }
+            int quadVertices = triangleCount * 4;
+            ByteBuffer result = ByteBuffer.allocateDirect(quadVertices * VERTEX_STRIDE)
+                    .order(ByteOrder.nativeOrder());
+            long src = MemoryUtil.memAddress(buffer);
+            long dst = MemoryUtil.memAddress(result);
+            for (int triangle = 0; triangle < triangleCount; triangle++) {
+                long triangleSrc = src + (long) triangle * 3L * VERTEX_STRIDE;
+                long quadDst = dst + (long) triangle * 4L * VERTEX_STRIDE;
+                MemoryUtil.memCopy(triangleSrc, quadDst, 3L * VERTEX_STRIDE);
+                MemoryUtil.memCopy(triangleSrc + 2L * VERTEX_STRIDE, quadDst + 3L * VERTEX_STRIDE, VERTEX_STRIDE);
+            }
+            result.position(0);
+            result.limit(quadVertices * VERTEX_STRIDE);
+            return new Geometry(result.slice().order(ByteOrder.nativeOrder()), quadVertices, textureId);
         }
 
         private void ensureCapacity(int bytes) {
@@ -550,9 +738,17 @@ public final class EntityCapture implements AutoCloseable {
                     | ((blue & 0xFF) << 16)
                     | ((alpha & 0xFF) << 24);
         }
+
+        private static int offset(VertexFormatDescription format, CommonVertexAttribute attribute) {
+            return format.containsElement(attribute) ? format.getElementOffset(attribute) : -1;
+        }
+
+        private static float unpackNormal(byte value) {
+            return Math.max(-1.0f, value / 127.0f);
+        }
     }
 
-    private enum DiscardingVertexConsumer implements VertexConsumer {
+    private enum DiscardingVertexConsumer implements VertexConsumer, VertexBufferWriter {
         INSTANCE;
 
         @Override public VertexConsumer vertex(double x, double y, double z) { return this; }
@@ -564,5 +760,49 @@ public final class EntityCapture implements AutoCloseable {
         @Override public void next() { }
         @Override public void fixedColor(int red, int green, int blue, int alpha) { }
         @Override public void unfixColor() { }
+        @Override public void push(MemoryStack stack, long ptr, int count, VertexFormatDescription format) { }
+    }
+
+    private void logCaptureSummary(CaptureStats stats, List<EntityRenderData> entities) {
+        int frame = ++captureFrameCounter;
+        if (frame % CAPTURE_SUMMARY_INTERVAL_FRAMES != 0 && entities.isEmpty() && !stats.hasFailures()) {
+            return;
+        }
+        LOGGER.info("[Vulkanite] RTX capture: candidates={}, rendered={}, entityInstances={}, entityGeometries={}, entityQuads={}, particleAttempts={}, particleInstances={}, particleGeometries={}, particleQuads={}, unsupportedLayers={}, textureMisses={}, emptyEntities={}, entityErrors={}, particleErrors={}",
+                stats.entityCandidates,
+                stats.entitiesRendered,
+                stats.entitiesCaptured,
+                stats.entityGeometries,
+                stats.entityQuads,
+                stats.particlesAttempted,
+                stats.particlesCaptured,
+                stats.particleGeometries,
+                stats.particleQuads,
+                stats.unsupportedLayers,
+                stats.textureMisses,
+                stats.entitiesWithoutGeometry,
+                stats.entityErrors,
+                stats.particleErrors);
+    }
+
+    private static final class CaptureStats {
+        private int entityCandidates;
+        private int entitiesRendered;
+        private int entitiesCaptured;
+        private int entitiesWithoutGeometry;
+        private int entityGeometries;
+        private int entityQuads;
+        private int entityErrors;
+        private int unsupportedLayers;
+        private int textureMisses;
+        private int particlesAttempted;
+        private int particlesCaptured;
+        private int particleGeometries;
+        private int particleQuads;
+        private int particleErrors;
+
+        private boolean hasFailures() {
+            return entityErrors > 0 || particleErrors > 0;
+        }
     }
 }

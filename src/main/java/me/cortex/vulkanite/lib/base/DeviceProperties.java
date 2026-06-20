@@ -11,12 +11,16 @@ public class DeviceProperties {
     //Allocates with a calloc, TODO: add a destroy function for cleanup
 
     public final VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtPipelineProperties;
+    public final float timestampPeriodNanos;
+
     public DeviceProperties(VkDevice device) {
         rtPipelineProperties = VkPhysicalDeviceRayTracingPipelinePropertiesKHR.calloc().sType$Default();
         try (var stack = stackPush()) {
-            vkGetPhysicalDeviceProperties2(device.getPhysicalDevice(), VkPhysicalDeviceProperties2.calloc(stack)
+            VkPhysicalDeviceProperties2 properties = VkPhysicalDeviceProperties2.calloc(stack)
                     .sType$Default()
-                    .pNext(rtPipelineProperties));
+                    .pNext(rtPipelineProperties);
+            vkGetPhysicalDeviceProperties2(device.getPhysicalDevice(), properties);
+            timestampPeriodNanos = properties.properties().limits().timestampPeriod();
         }
     }
 }

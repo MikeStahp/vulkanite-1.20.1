@@ -9,6 +9,7 @@ import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.base.VRegistry;
 import me.cortex.vulkanite.lib.base.initalizer.VInitializer;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorPool;
+import me.cortex.vulkanite.lib.descriptors.VDescriptorSet;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorSetLayout;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSection;
 import me.jellysquid.mods.sodium.client.render.chunk.compile.ChunkBuildOutput;
@@ -54,6 +55,7 @@ public class Vulkanite {
     private final AccelerationManager accelerationManager;
     private final SectionLightManager sectionLightManager = new SectionLightManager();
     private final HashMap<VDescriptorSetLayout, VRef<VDescriptorPool>> descriptorPools = new HashMap<>();
+    private final HashMap<VDescriptorSetLayout, VRef<VDescriptorSet>> emptyDescriptorSets = new HashMap<>();
     private boolean destroyed;
 
     public Vulkanite() {
@@ -104,7 +106,43 @@ public class Vulkanite {
         }
     }
 
+    public VRef<VDescriptorSet> getEmptySet(VRef<VDescriptorSetLayout> layout) {
+        var key = layout.get();
+        synchronized (emptyDescriptorSets) {
+            VRef<VDescriptorSet> cached = emptyDescriptorSets.get(key);
+            if (cached != null) {
+                return cached.addRef();
+            }
+        }
+
+        VRef<VDescriptorPool> pool = getPoolByLayout(layout);
+        VRef<VDescriptorSet> created;
+        try {
+            created = pool.get().allocateSet();
+        } finally {
+            pool.close();
+        }
+
+        synchronized (emptyDescriptorSets) {
+            VRef<VDescriptorSet> cached = emptyDescriptorSets.get(key);
+            if (cached == null) {
+                emptyDescriptorSets.put(key, created);
+                return created.addRef();
+            }
+            created.close();
+            return cached.addRef();
+        }
+    }
+
     public void removePoolByLayout(VDescriptorSetLayout layout) {
+        VRef<VDescriptorSet> emptySet;
+        synchronized (emptyDescriptorSets) {
+            emptySet = emptyDescriptorSets.remove(layout);
+        }
+        if (emptySet != null) {
+            emptySet.close();
+        }
+
         synchronized (descriptorPools) {
             descriptorPools.remove(layout);
         }
@@ -141,8 +179,14 @@ public class Vulkanite {
 
         vkDeviceWaitIdle(ctx.device);
         DLSSBridge.shutdownNGX();
-        sectionLightManager.clear();
+        sectionLightManager.destroy();
         accelerationManager.destroy();
+        synchronized (emptyDescriptorSets) {
+            for (VRef<VDescriptorSet> emptySet : emptyDescriptorSets.values()) {
+                emptySet.close();
+            }
+            emptyDescriptorSets.clear();
+        }
         descriptorPools.clear();
     }
 

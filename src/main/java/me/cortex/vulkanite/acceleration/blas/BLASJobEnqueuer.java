@@ -29,7 +29,8 @@ import static org.lwjgl.vulkan.VK10.*;
 public class BLASJobEnqueuer {
     private static final Logger LOGGER = LoggerFactory.getLogger(BLASJobEnqueuer.class);
     private static final long INFO_LOG_INTERVAL_NANOS = 5_000_000_000L;
-    private static final long SLOW_ENQUEUE_LOG_NANOS = 2_000_000L;
+    private static final long SLOW_ENQUEUE_LOG_NANOS =
+            Long.getLong("vulkanite.blasSlowEnqueueLogMs", 8L) * 1_000_000L;
 
     private final VContext context;
     private final int queueId;
@@ -139,9 +140,9 @@ public class BLASJobEnqueuer {
     private void logEnqueue(int buildOutputs, int jobs, int geometryRanges, long geometryBytes, long uploadExecution,
             long uploadSubmitNanos, long totalNanos) {
         long now = System.nanoTime();
-        boolean info = jobs <= 4
-                || totalNanos >= SLOW_ENQUEUE_LOG_NANOS
-                || now - lastInfoLogNanos >= INFO_LOG_INTERVAL_NANOS;
+        boolean info = (totalNanos >= SLOW_ENQUEUE_LOG_NANOS
+                || now - lastInfoLogNanos >= INFO_LOG_INTERVAL_NANOS)
+                && now - lastInfoLogNanos >= INFO_LOG_INTERVAL_NANOS;
         if (info) {
             lastInfoLogNanos = now;
             LOGGER.info("[Vulkanite] BLAS enqueue: buildOutputs={}, jobs={}, geometryRanges={}, geometryBytes={}, uploadExecution={}, uploadSubmit={} ms, total={} ms",

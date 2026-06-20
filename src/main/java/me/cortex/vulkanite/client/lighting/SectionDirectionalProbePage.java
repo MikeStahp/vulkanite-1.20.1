@@ -26,12 +26,17 @@ final class SectionDirectionalProbePage {
     static final int PACKED_CONFIDENCE_RECORD_COUNT =
             (PACKED_CONFIDENCE_WORD_COUNT + PACKED_VALUES_PER_RECORD - 1) / PACKED_VALUES_PER_RECORD;
     static final int PACKED_RECORD_COUNT = PACKED_RADIANCE_RECORD_COUNT + PACKED_CONFIDENCE_RECORD_COUNT;
+    static final int PACKED_RECORD_BYTES = PACKED_VALUES_PER_RECORD * Integer.BYTES;
+    static final int PACKED_FACE_DATA_INT_COUNT = FACE_VALUE_COUNT + PACKED_CONFIDENCE_WORD_COUNT;
+    static final int PACKED_FACE_DATA_BYTES = PACKED_FACE_DATA_INT_COUNT * Integer.BYTES;
+    static final int PACKED_PAGE_BYTES = PACKED_RECORD_COUNT * PACKED_RECORD_BYTES;
 
     private static final float SECTION_SIZE = 16.0f;
     private static final float PROBE_SPACING = SECTION_SIZE / GRID_SIZE;
     private static final float INV_255 = 1.0f / 255.0f;
     private static final float INV_15 = 1.0f / 15.0f;
     private static final float RGB9E5_MAX_VALUE = 65408.0f;
+    private static final float FACE_RECEIVER_OFFSET = PROBE_SPACING * 0.45f;
     private static final int RGB9E5_MANTISSA_BITS = 9;
     private static final int RGB9E5_MANTISSA_MAX = (1 << RGB9E5_MANTISSA_BITS) - 1;
     private static final int RGB9E5_EXPONENT_BITS = 5;
@@ -43,7 +48,14 @@ final class SectionDirectionalProbePage {
     private static final float TEMPORAL_MISSING_ESTIMATE_WEIGHT = 0.35f;
     private static final float TEMPORAL_RESET_DELTA = 1.35f;
     private static final float TEMPORAL_EPSILON = 0.0005f;
+    private static final float RADIANCE_COMPRESSION_EPSILON = 0.0001f;
     private static final float VOXEL_TRAVERSAL_EPSILON = 0.00001f;
+    private static final float MIN_VISIBILITY_CONFIDENCE = 0.02f;
+    private static final float MIN_TRAVERSAL_CONFIDENCE = 0.08f;
+    private static final float GRAZING_VISIBILITY_CONFIDENCE = 0.45f;
+    private static final float LIGHT_SELECTION_CENTER_BIAS = 0.002f;
+    private static final float BLOCKLIGHT_CASCADE_DISTANCE_SCALE = 1.75f;
+    private static final float BLOCKLIGHT_CASCADE_MAX_DISTANCE = 40.0f;
     private static final int MAX_REUSABLE_SELECTED_LIGHTS = 64;
     private static final Comparator<SelectedLight> LOWEST_SCORE_FIRST =
             Comparator.comparingDouble(SelectedLight::score);
@@ -89,11 +101,34 @@ final class SectionDirectionalProbePage {
         return packedFaceRgb9E5[index];
     }
 
+    boolean hasPackedRadiance() {
+        return hasPackedRadiance;
+    }
+
+    void copyTemporalHistoryFrom(SectionDirectionalProbePage previous) {
+        if (previous == null || !previous.hasTemporalHistory) {
+            return;
+        }
+        System.arraycopy(previous.historyFaceRgb, 0, historyFaceRgb, 0, FACE_RGB_VALUE_COUNT);
+        System.arraycopy(previous.historyFaceConfidence, 0, historyFaceConfidence, 0, FACE_VALUE_COUNT);
+        hasTemporalHistory = true;
+    }
+
     void writePackedFaceData(ByteBuffer destination) {
+        int startPosition = destination.position();
         destination.asIntBuffer().put(packedFaceRgb9E5, 0, FACE_VALUE_COUNT);
         destination.position(destination.position() + FACE_VALUE_COUNT * Integer.BYTES);
         destination.asIntBuffer().put(packedFaceConfidence, 0, PACKED_CONFIDENCE_WORD_COUNT);
         destination.position(destination.position() + PACKED_CONFIDENCE_WORD_COUNT * Integer.BYTES);
+        if (destination.position() != startPosition + PACKED_FACE_DATA_BYTES) {
+            throw new IllegalStateException("Section probe packed face data size mismatch");
+        }
+        while (destination.position() < startPosition + PACKED_PAGE_BYTES) {
+            destination.putInt(0);
+        }
+        if (destination.position() != startPosition + PACKED_PAGE_BYTES) {
+            throw new IllegalStateException("Section probe packed page size mismatch");
+        }
     }
 
     boolean regenerateFrom(List<SectionLightTable> tables, int maxLights) {
@@ -173,12 +208,13 @@ final class SectionDirectionalProbePage {
             int originZ,
             SelectedLight light,
             SectionOpacityLookup opacityLookup) {
-        int minX = probeCoordMin(light.x(), originX, light.maxDistance());
-        int maxX = probeCoordMax(light.x(), originX, light.maxDistance());
-        int minY = probeCoordMin(light.y(), originY, light.maxDistance());
-        int maxY = probeCoordMax(light.y(), originY, light.maxDistance());
-        int minZ = probeCoordMin(light.z(), originZ, light.maxDistance());
-        int maxZ = probeCoordMax(light.z(), originZ, light.maxDistance());
+        float probeInfluenceDistance = light.maxDistance() + FACE_RECEIVER_OFFSET;
+        int minX = probeCoordMin(light.x(), originX, probeInfluenceDistance);
+        int maxX = probeCoordMax(light.x(), originX, probeInfluenceDistance);
+        int minY = probeCoordMin(light.y(), originY, probeInfluenceDistance);
+        int maxY = probeCoordMax(light.y(), originY, probeInfluenceDistance);
+        int minZ = probeCoordMin(light.z(), originZ, probeInfluenceDistance);
+        int maxZ = probeCoordMax(light.z(), originZ, probeInfluenceDistance);
         if (minX > GRID_SIZE - 1 || maxX < 0
                 || minY > GRID_SIZE - 1 || maxY < 0
                 || minZ > GRID_SIZE - 1 || maxZ < 0) {
@@ -221,9 +257,63 @@ final class SectionDirectionalProbePage {
             int originZ,
             SelectedLight selectedLight,
             SectionOpacityLookup opacityLookup) {
-        float dx = selectedLight.x() - probeX;
-        float dy = selectedLight.y() - probeY;
-        float dz = selectedLight.z() - probeZ;
+        int baseRgbIndex = probeIndex * FACE_COUNT * 3;
+        boolean hasOpaqueBlocks = opacityLookup.hasOpaqueBlocks();
+        float confidenceScale = hasOpaqueBlocks ? 1.0f : 0.7f;
+        if (!sourceInsidePage(selectedLight, originX, originY, originZ)) {
+            confidenceScale *= 0.82f;
+        }
+
+        boolean contributed = false;
+        contributed |= accumulateFace(rgb, confidence, confidenceWeight, baseRgbIndex, 0,
+                1.0f, 0.0f, 0.0f,
+                probeX, probeY, probeZ,
+                selectedLight, opacityLookup, hasOpaqueBlocks, confidenceScale);
+        contributed |= accumulateFace(rgb, confidence, confidenceWeight, baseRgbIndex, 1,
+                -1.0f, 0.0f, 0.0f,
+                probeX, probeY, probeZ,
+                selectedLight, opacityLookup, hasOpaqueBlocks, confidenceScale);
+        contributed |= accumulateFace(rgb, confidence, confidenceWeight, baseRgbIndex, 2,
+                0.0f, 1.0f, 0.0f,
+                probeX, probeY, probeZ,
+                selectedLight, opacityLookup, hasOpaqueBlocks, confidenceScale);
+        contributed |= accumulateFace(rgb, confidence, confidenceWeight, baseRgbIndex, 3,
+                0.0f, -1.0f, 0.0f,
+                probeX, probeY, probeZ,
+                selectedLight, opacityLookup, hasOpaqueBlocks, confidenceScale);
+        contributed |= accumulateFace(rgb, confidence, confidenceWeight, baseRgbIndex, 4,
+                0.0f, 0.0f, 1.0f,
+                probeX, probeY, probeZ,
+                selectedLight, opacityLookup, hasOpaqueBlocks, confidenceScale);
+        contributed |= accumulateFace(rgb, confidence, confidenceWeight, baseRgbIndex, 5,
+                0.0f, 0.0f, -1.0f,
+                probeX, probeY, probeZ,
+                selectedLight, opacityLookup, hasOpaqueBlocks, confidenceScale);
+        return contributed;
+    }
+
+    private static boolean accumulateFace(
+            float[] rgb,
+            float[] confidence,
+            float[] confidenceWeight,
+            int baseRgbIndex,
+            int face,
+            float faceDirectionX,
+            float faceDirectionY,
+            float faceDirectionZ,
+            float probeX,
+            float probeY,
+            float probeZ,
+            SelectedLight selectedLight,
+            SectionOpacityLookup opacityLookup,
+            boolean hasOpaqueBlocks,
+            float confidenceScale) {
+        float receiverX = probeX + faceDirectionX * FACE_RECEIVER_OFFSET;
+        float receiverY = probeY + faceDirectionY * FACE_RECEIVER_OFFSET;
+        float receiverZ = probeZ + faceDirectionZ * FACE_RECEIVER_OFFSET;
+        float dx = selectedLight.x() - receiverX;
+        float dy = selectedLight.y() - receiverY;
+        float dz = selectedLight.z() - receiverZ;
         float dist2 = dx * dx + dy * dy + dz * dz;
         if (dist2 <= 0.0001f || dist2 > selectedLight.maxDistanceSquared()) {
             return false;
@@ -231,59 +321,59 @@ final class SectionDirectionalProbePage {
 
         float distance = (float) Math.sqrt(dist2);
         float invDistance = 1.0f / distance;
-        float lx = dx * invDistance;
-        float ly = dy * invDistance;
-        float lz = dz * invDistance;
-        float attenuation = reverseSmoothstep(distance / selectedLight.maxDistance());
-        attenuation *= attenuation;
+        float directionX = dx * invDistance;
+        float directionY = dy * invDistance;
+        float directionZ = dz * invDistance;
+
+        float weight = directionX * faceDirectionX
+                + directionY * faceDirectionY
+                + directionZ * faceDirectionZ;
+        if (weight <= 0.0001f) {
+            return false;
+        }
+
+        float attenuation = attenuationAtDistance(distance, selectedLight.maxDistance());
         if (attenuation <= 0.0f) {
             return false;
         }
-        float visibility = opacityLookup.hasOpaqueBlocks()
-                ? probeVisibility(selectedLight, probeX, probeY, probeZ, opacityLookup)
+
+        float visibility = hasOpaqueBlocks
+                ? probeVisibility(selectedLight, receiverX, receiverY, receiverZ, opacityLookup)
                 : 1.0f;
-        if (visibility <= 0.02f) {
+        if (visibility <= MIN_VISIBILITY_CONFIDENCE) {
             return false;
         }
 
         float red = selectedLight.red() * attenuation;
         float green = selectedLight.green() * attenuation;
         float blue = selectedLight.blue() * attenuation;
-        float contributionConfidence = contributionConfidence(selectedLight, distance, originX, originY, originZ,
-                opacityLookup) * visibility;
-        int baseRgbIndex = probeIndex * FACE_COUNT * 3;
+        float compressionScale = radianceCompressionScale(red, green, blue);
+        float contributionConfidence = contributionConfidence(
+                selectedLight,
+                distance,
+                confidenceScale) * visibility;
+        return addFace(rgb, confidence, confidenceWeight, baseRgbIndex, face,
+                red * compressionScale,
+                green * compressionScale,
+                blue * compressionScale,
+                weight,
+                contributionConfidence);
+    }
 
-        boolean contributed = false;
-        contributed |= addFace(rgb, confidence, confidenceWeight, baseRgbIndex, 0,
-                red, green, blue, lx, contributionConfidence);
-        contributed |= addFace(rgb, confidence, confidenceWeight, baseRgbIndex, 1,
-                red, green, blue, -lx, contributionConfidence);
-        contributed |= addFace(rgb, confidence, confidenceWeight, baseRgbIndex, 2,
-                red, green, blue, ly, contributionConfidence);
-        contributed |= addFace(rgb, confidence, confidenceWeight, baseRgbIndex, 3,
-                red, green, blue, -ly, contributionConfidence);
-        contributed |= addFace(rgb, confidence, confidenceWeight, baseRgbIndex, 4,
-                red, green, blue, lz, contributionConfidence);
-        contributed |= addFace(rgb, confidence, confidenceWeight, baseRgbIndex, 5,
-                red, green, blue, -lz, contributionConfidence);
-        return contributed;
+    private static float radianceCompressionScale(float red, float green, float blue) {
+        float peakRadiance = Math.max(red, Math.max(green, blue));
+        if (peakRadiance <= RADIANCE_COMPRESSION_EPSILON) {
+            return 1.0f;
+        }
+        return (float) (3.0 * Math.log(peakRadiance / 3.0 + 1.0) / peakRadiance);
     }
 
     private static float contributionConfidence(
             SelectedLight selectedLight,
             float distance,
-            int originX,
-            int originY,
-            int originZ,
-            SectionOpacityLookup opacityLookup) {
+            float confidenceScale) {
         float normalizedDistance = Math.max(0.0f, Math.min(1.0f, distance / selectedLight.maxDistance()));
-        float confidence = 1.0f - normalizedDistance * 0.35f;
-        if (!opacityLookup.hasOpaqueBlocks()) {
-            confidence *= 0.7f;
-        }
-        if (!sourceInsidePage(selectedLight, originX, originY, originZ)) {
-            confidence *= 0.82f;
-        }
+        float confidence = (1.0f - normalizedDistance * 0.35f) * confidenceScale;
         return Math.max(0.25f, Math.min(1.0f, confidence));
     }
 
@@ -337,6 +427,19 @@ final class SectionDirectionalProbePage {
         int targetBlockX = fastFloor(probeX);
         int targetBlockY = fastFloor(probeY);
         int targetBlockZ = fastFloor(probeZ);
+        if (isBlockingCell(targetBlockX, targetBlockY, targetBlockZ,
+                sourceBlockX, sourceBlockY, sourceBlockZ, opacityLookup)) {
+            return 0.0f;
+        }
+        if (!opacityLookup.hasOpaqueInBox(
+                Math.min(sourceBlockX, targetBlockX),
+                Math.min(sourceBlockY, targetBlockY),
+                Math.min(sourceBlockZ, targetBlockZ),
+                Math.max(sourceBlockX, targetBlockX),
+                Math.max(sourceBlockY, targetBlockY),
+                Math.max(sourceBlockZ, targetBlockZ))) {
+            return 1.0f;
+        }
 
         int blockX = sourceBlockX;
         int blockY = sourceBlockY;
@@ -364,7 +467,55 @@ final class SectionDirectionalProbePage {
         float visibility = 1.0f;
         for (int step = 0; step < maxSteps; step++) {
             if (blockX == targetBlockX && blockY == targetBlockY && blockZ == targetBlockZ) {
-                return visibility;
+                return Math.max(0.0f, Math.min(1.0f, visibility));
+            }
+
+            int emptyMipLevel = opacityLookup.largestEmptyMipLevel(blockX, blockY, blockZ);
+            if (emptyMipLevel > 0) {
+                int cellSize = 1 << emptyMipLevel;
+                int cellMinX = mipCellMin(blockX, cellSize);
+                int cellMinY = mipCellMin(blockY, cellSize);
+                int cellMinZ = mipCellMin(blockZ, cellSize);
+                int cellMaxX = cellMinX + cellSize - 1;
+                int cellMaxY = cellMinY + cellSize - 1;
+                int cellMaxZ = cellMinZ + cellSize - 1;
+                if (targetBlockX >= cellMinX && targetBlockX <= cellMaxX
+                        && targetBlockY >= cellMinY && targetBlockY <= cellMaxY
+                        && targetBlockZ >= cellMinZ && targetBlockZ <= cellMaxZ) {
+                    return Math.max(0.0f, Math.min(1.0f, visibility));
+                }
+
+                int exitStepsX = mipExitSteps(blockX, cellMinX, cellMaxX, stepX);
+                int exitStepsY = mipExitSteps(blockY, cellMinY, cellMaxY, stepY);
+                int exitStepsZ = mipExitSteps(blockZ, cellMinZ, cellMaxZ, stepZ);
+                float exitT = Math.min(
+                        mipExitT(tMaxX, tDeltaX, exitStepsX),
+                        Math.min(
+                                mipExitT(tMaxY, tDeltaY, exitStepsY),
+                                mipExitT(tMaxZ, tDeltaZ, exitStepsZ)));
+                int advanceCountX = mipAdvanceCount(tMaxX, tDeltaX, exitT);
+                int advanceCountY = mipAdvanceCount(tMaxY, tDeltaY, exitT);
+                int advanceCountZ = mipAdvanceCount(tMaxZ, tDeltaZ, exitT);
+                if (advanceCountX + advanceCountY + advanceCountZ > 1) {
+                    if (advanceCountX > 0) {
+                        blockX += advanceCountX * stepX;
+                        tMaxX += advanceCountX * tDeltaX;
+                    }
+                    if (advanceCountY > 0) {
+                        blockY += advanceCountY * stepY;
+                        tMaxY += advanceCountY * tDeltaY;
+                    }
+                    if (advanceCountZ > 0) {
+                        blockZ += advanceCountZ * stepZ;
+                        tMaxZ += advanceCountZ * tDeltaZ;
+                    }
+
+                    if (isBlockingCell(blockX, blockY, blockZ,
+                            sourceBlockX, sourceBlockY, sourceBlockZ, opacityLookup)) {
+                        return 0.0f;
+                    }
+                    continue;
+                }
             }
 
             float nextT = Math.min(tMaxX, Math.min(tMaxY, tMaxZ));
@@ -398,14 +549,14 @@ final class SectionDirectionalProbePage {
                     advanceX, advanceY, advanceZ,
                     sourceBlockX, sourceBlockY, sourceBlockZ,
                     opacityLookup)) {
-                visibility *= 0.45f;
-                if (visibility <= 0.08f) {
+                visibility *= GRAZING_VISIBILITY_CONFIDENCE;
+                if (visibility <= MIN_TRAVERSAL_CONFIDENCE) {
                     return 0.0f;
                 }
             }
         }
 
-        return visibility;
+        return Math.max(0.0f, Math.min(1.0f, visibility));
     }
 
     private static boolean hasGrazingBlockingCrossedCells(
@@ -474,6 +625,34 @@ final class SectionDirectionalProbePage {
         return Math.abs(1.0f / delta);
     }
 
+    private static int mipCellMin(int block, int cellSize) {
+        return Math.floorDiv(block, cellSize) * cellSize;
+    }
+
+    private static int mipExitSteps(int block, int cellMin, int cellMax, int step) {
+        if (step > 0) {
+            return cellMax - block + 1;
+        }
+        if (step < 0) {
+            return block - cellMin + 1;
+        }
+        return Integer.MAX_VALUE;
+    }
+
+    private static float mipExitT(float tMax, float tDelta, int exitSteps) {
+        if (exitSteps == Integer.MAX_VALUE) {
+            return Float.POSITIVE_INFINITY;
+        }
+        return tMax + (exitSteps - 1) * tDelta;
+    }
+
+    private static int mipAdvanceCount(float tMax, float tDelta, float exitT) {
+        if (!Float.isFinite(tMax) || !Float.isFinite(tDelta) || tMax > exitT + VOXEL_TRAVERSAL_EPSILON) {
+            return 0;
+        }
+        return Math.max(1, (int) Math.floor((exitT - tMax) / tDelta + VOXEL_TRAVERSAL_EPSILON) + 1);
+    }
+
     private List<SelectedLight> collectSelectedLights(List<SectionLightTable> tables, int maxLights) {
         selectedLightQueue.clear();
         selectedLights.clear();
@@ -484,12 +663,12 @@ final class SectionDirectionalProbePage {
         float pageCenterX = sectionPos.getMinX() + SECTION_SIZE * 0.5f;
         float pageCenterY = sectionPos.getMinY() + SECTION_SIZE * 0.5f;
         float pageCenterZ = sectionPos.getMinZ() + SECTION_SIZE * 0.5f;
-        float probeMinX = probeCenter(sectionPos.getMinX(), 0);
-        float probeMinY = probeCenter(sectionPos.getMinY(), 0);
-        float probeMinZ = probeCenter(sectionPos.getMinZ(), 0);
-        float probeMaxX = probeCenter(sectionPos.getMinX(), GRID_SIZE - 1);
-        float probeMaxY = probeCenter(sectionPos.getMinY(), GRID_SIZE - 1);
-        float probeMaxZ = probeCenter(sectionPos.getMinZ(), GRID_SIZE - 1);
+        float probeMinX = probeCenter(sectionPos.getMinX(), 0) - FACE_RECEIVER_OFFSET;
+        float probeMinY = probeCenter(sectionPos.getMinY(), 0) - FACE_RECEIVER_OFFSET;
+        float probeMinZ = probeCenter(sectionPos.getMinZ(), 0) - FACE_RECEIVER_OFFSET;
+        float probeMaxX = probeCenter(sectionPos.getMinX(), GRID_SIZE - 1) + FACE_RECEIVER_OFFSET;
+        float probeMaxY = probeCenter(sectionPos.getMinY(), GRID_SIZE - 1) + FACE_RECEIVER_OFFSET;
+        float probeMaxZ = probeCenter(sectionPos.getMinZ(), GRID_SIZE - 1) + FACE_RECEIVER_OFFSET;
 
         for (SectionLightTable table : tables) {
             if (table == null || !table.hasLights()) {
@@ -519,17 +698,27 @@ final class SectionDirectionalProbePage {
                 if (luma <= 0.0f) {
                     continue;
                 }
-                float dx = lightX - pageCenterX;
-                float dy = lightY - pageCenterY;
-                float dz = lightZ - pageCenterZ;
                 float lightRadius = lightRadius(light);
                 float maxDistance = lightMaxDistance(lightRadius);
                 float maxDistanceSquared = maxDistance * maxDistance;
-                if (!canReachProbeGrid(lightX, lightY, lightZ, maxDistanceSquared,
-                        probeMinX, probeMinY, probeMinZ, probeMaxX, probeMaxY, probeMaxZ)) {
+                float nearestProbeDistanceSquared = squaredDistanceOutsideBox(
+                        lightX, lightY, lightZ,
+                        probeMinX, probeMinY, probeMinZ,
+                        probeMaxX, probeMaxY, probeMaxZ);
+                if (nearestProbeDistanceSquared > maxDistanceSquared) {
                     continue;
                 }
-                float score = lightScore(normalizedEmission, luma, lightRadius, dx * dx + dy * dy + dz * dz);
+                float centerDx = lightX - pageCenterX;
+                float centerDy = lightY - pageCenterY;
+                float centerDz = lightZ - pageCenterZ;
+                float centerDistanceSquared = centerDx * centerDx + centerDy * centerDy + centerDz * centerDz;
+                float score = lightScore(
+                        normalizedEmission,
+                        luma,
+                        lightRadius,
+                        maxDistance,
+                        nearestProbeDistanceSquared,
+                        centerDistanceSquared);
                 if (score <= 0.0f) {
                     continue;
                 }
@@ -590,8 +779,18 @@ final class SectionDirectionalProbePage {
                 score);
     }
 
-    private static float lightScore(float normalizedEmission, float luma, float radius, float dist2) {
-        return normalizedEmission * luma * (1.0f + radius * 0.08f) / (1.0f + dist2 * 0.035f);
+    private static float lightScore(
+            float normalizedEmission,
+            float luma,
+            float radius,
+            float maxDistance,
+            float nearestProbeDistanceSquared,
+            float centerDistanceSquared) {
+        float nearestDistance = (float) Math.sqrt(nearestProbeDistanceSquared);
+        float bestProbeAttenuation = attenuationAtDistance(nearestDistance, maxDistance);
+        float centerStability = 1.0f / (1.0f + centerDistanceSquared * LIGHT_SELECTION_CENTER_BIAS);
+        return normalizedEmission * luma * (1.0f + radius * 0.08f)
+                * bestProbeAttenuation * centerStability;
     }
 
     private static float lightRadius(SectionLight light) {
@@ -599,14 +798,20 @@ final class SectionDirectionalProbePage {
     }
 
     private static float lightMaxDistance(float radius) {
-        return radius + 1.0f;
+        return Math.min(
+                BLOCKLIGHT_CASCADE_MAX_DISTANCE,
+                Math.max(radius + 1.0f, radius * BLOCKLIGHT_CASCADE_DISTANCE_SCALE));
     }
 
-    private static boolean canReachProbeGrid(
+    private static float attenuationAtDistance(float distance, float maxDistance) {
+        float attenuation = reverseSmoothstep(distance / maxDistance);
+        return attenuation * attenuation;
+    }
+
+    private static float squaredDistanceOutsideBox(
             float lightX,
             float lightY,
             float lightZ,
-            float maxDistanceSquared,
             float minX,
             float minY,
             float minZ,
@@ -616,7 +821,7 @@ final class SectionDirectionalProbePage {
         float dx = distanceOutsideAxis(lightX, minX, maxX);
         float dy = distanceOutsideAxis(lightY, minY, maxY);
         float dz = distanceOutsideAxis(lightZ, minZ, maxZ);
-        return dx * dx + dy * dy + dz * dz <= maxDistanceSquared;
+        return dx * dx + dy * dy + dz * dz;
     }
 
     private static float distanceOutsideAxis(float value, float min, float max) {
@@ -819,7 +1024,7 @@ final class SectionDirectionalProbePage {
     }
 
     private static final class SectionOpacityLookup {
-        private static final int LOOKUP_RADIUS = 1;
+        private static final int LOOKUP_RADIUS = 2;
         private static final int LOOKUP_DIAMETER = LOOKUP_RADIUS * 2 + 1;
         private static final int LOCAL_BLOCK_MASK = 15;
         private final SectionLightTable[] tables = new SectionLightTable[LOOKUP_DIAMETER * LOOKUP_DIAMETER * LOOKUP_DIAMETER];
@@ -881,6 +1086,82 @@ final class SectionDirectionalProbePage {
             int index = ((localY * 16) + localZ) * 16 + localX;
             long[] opaqueBlocks = table.opaqueBlocks();
             return (opaqueBlocks[index >>> 6] & (1L << (index & 63))) != 0L;
+        }
+
+        private boolean hasOpaqueInBox(int minBlockX, int minBlockY, int minBlockZ,
+                int maxBlockX, int maxBlockY, int maxBlockZ) {
+            if (!hasOpaqueBlocks) {
+                return false;
+            }
+
+            int minSectionX = minBlockX >> 4;
+            int minSectionY = minBlockY >> 4;
+            int minSectionZ = minBlockZ >> 4;
+            int maxSectionX = maxBlockX >> 4;
+            int maxSectionY = maxBlockY >> 4;
+            int maxSectionZ = maxBlockZ >> 4;
+            for (int sectionZ = minSectionZ; sectionZ <= maxSectionZ; sectionZ++) {
+                int dz = sectionZ - centerSectionZ;
+                if (dz < -LOOKUP_RADIUS || dz > LOOKUP_RADIUS) {
+                    continue;
+                }
+                for (int sectionY = minSectionY; sectionY <= maxSectionY; sectionY++) {
+                    int dy = sectionY - centerSectionY;
+                    if (dy < -LOOKUP_RADIUS || dy > LOOKUP_RADIUS) {
+                        continue;
+                    }
+                    for (int sectionX = minSectionX; sectionX <= maxSectionX; sectionX++) {
+                        int dx = sectionX - centerSectionX;
+                        if (dx < -LOOKUP_RADIUS || dx > LOOKUP_RADIUS) {
+                            continue;
+                        }
+
+                        SectionLightTable table = tables[lookupIndex(dx, dy, dz)];
+                        if (table == null || !table.hasOpaqueBlocks()) {
+                            continue;
+                        }
+
+                        int localMinX = sectionX == minSectionX ? minBlockX & LOCAL_BLOCK_MASK : 0;
+                        int localMinY = sectionY == minSectionY ? minBlockY & LOCAL_BLOCK_MASK : 0;
+                        int localMinZ = sectionZ == minSectionZ ? minBlockZ & LOCAL_BLOCK_MASK : 0;
+                        int localMaxX = sectionX == maxSectionX ? maxBlockX & LOCAL_BLOCK_MASK : LOCAL_BLOCK_MASK;
+                        int localMaxY = sectionY == maxSectionY ? maxBlockY & LOCAL_BLOCK_MASK : LOCAL_BLOCK_MASK;
+                        int localMaxZ = sectionZ == maxSectionZ ? maxBlockZ & LOCAL_BLOCK_MASK : LOCAL_BLOCK_MASK;
+                        if (table.hasOpaqueInBox(localMinX, localMinY, localMinZ,
+                                localMaxX, localMaxY, localMaxZ)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        private int largestEmptyMipLevel(int blockX, int blockY, int blockZ) {
+            if (!hasOpaqueBlocks) {
+                return 4;
+            }
+
+            int sectionX = blockX >> 4;
+            int sectionY = blockY >> 4;
+            int sectionZ = blockZ >> 4;
+            int dx = sectionX - centerSectionX;
+            int dy = sectionY - centerSectionY;
+            int dz = sectionZ - centerSectionZ;
+            if (dx < -LOOKUP_RADIUS || dx > LOOKUP_RADIUS
+                    || dy < -LOOKUP_RADIUS || dy > LOOKUP_RADIUS
+                    || dz < -LOOKUP_RADIUS || dz > LOOKUP_RADIUS) {
+                return 4;
+            }
+
+            SectionLightTable table = tables[lookupIndex(dx, dy, dz)];
+            if (table == null || !table.hasOpaqueBlocks()) {
+                return 4;
+            }
+            return table.largestEmptyMipLevel(
+                    blockX & LOCAL_BLOCK_MASK,
+                    blockY & LOCAL_BLOCK_MASK,
+                    blockZ & LOCAL_BLOCK_MASK);
         }
 
         private static int lookupIndex(int dx, int dy, int dz) {

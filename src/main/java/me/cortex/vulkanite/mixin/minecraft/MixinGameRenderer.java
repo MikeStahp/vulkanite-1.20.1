@@ -22,17 +22,26 @@ public class MixinGameRenderer {
      */
     @Inject(method = "render", at = @At("HEAD"))
     private void onRenderUpdateJitter(float tickDelta, long startTime, boolean tick, CallbackInfo ci) {
-    	MinecraftClient client = MinecraftClient.getInstance();
-    	if (client.getWindow() != null) {
-            DLSSConfig config = DLSSConfig.load();
-            if (client.world == null || client.currentScreen != null || client.isPaused()
-                    || !config.isEnabled() || config.isDebugEnabled()) {
-                JitterManager.setDLSSActive(false);
-            }
-    		// Only update jitter values; activation state is managed by VulkanPipeline
-    		JitterManager.updateJitter(client.getWindow().getFramebufferWidth(),
-    			client.getWindow().getFramebufferHeight());
-    	}
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.getWindow() == null) {
+            return;
+        }
+
+        if (client.world == null || client.currentScreen != null || client.isPaused()) {
+            JitterManager.setDLSSActive(false);
+            return;
+        }
+
+        DLSSConfig config = DLSSConfig.load();
+        boolean jitterEnabled = config.isEnabled() && config.isJitterEnabled() && !config.isDebugEnabled();
+        JitterManager.setEnabled(jitterEnabled);
+        if (!jitterEnabled || !JitterManager.isDLSSActive()) {
+            return;
+        }
+
+        // Only update jitter values; activation state is managed by VulkanPipeline.
+        JitterManager.updateJitter(client.getWindow().getFramebufferWidth(),
+                client.getWindow().getFramebufferHeight());
     }
 
     /**

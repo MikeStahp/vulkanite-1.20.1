@@ -1,6 +1,7 @@
 package me.cortex.vulkanite.acceleration;
 
 import me.cortex.vulkanite.client.rendering.EntityCapture;
+import me.cortex.vulkanite.acceleration.blas.BLASBuildPolicy;
 import me.cortex.vulkanite.client.config.VulkaniteConfig;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
@@ -63,11 +64,24 @@ public final class EntityBlasBuilder {
     }
 
     private BLASResult buildEntity(EntityCapture.EntityRenderData entity, VCmdBuff cmd) {
-        List<EntityCapture.Geometry> geometries = entity.geometries().stream()
-                .filter(geometry -> geometry.quadCount() > 0)
-                .toList();
-        if (geometries.isEmpty()) {
+        List<EntityCapture.Geometry> sourceGeometries = entity.geometries();
+        int validGeometryCount = 0;
+        for (EntityCapture.Geometry geometry : sourceGeometries) {
+            if (geometry.quadCount() > 0) {
+                validGeometryCount++;
+            }
+        }
+        if (validGeometryCount == 0) {
             return null;
+        }
+        List<EntityCapture.Geometry> geometries = sourceGeometries;
+        if (validGeometryCount != sourceGeometries.size()) {
+            geometries = new ArrayList<>(validGeometryCount);
+            for (EntityCapture.Geometry geometry : sourceGeometries) {
+                if (geometry.quadCount() > 0) {
+                    geometries.add(geometry);
+                }
+            }
         }
 
         EntityGeometryKey key = null;
@@ -207,7 +221,7 @@ public final class EntityBlasBuilder {
         VkAccelerationStructureBuildGeometryInfoKHR buildInfo = buildInfos.get(0)
                 .sType$Default()
                 .type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
-                .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR)
+                .flags(BLASBuildPolicy.dynamicEntityBuildFlags())
                 .pGeometries(geometryInfos)
                 .geometryCount(geometryInfos.remaining());
 

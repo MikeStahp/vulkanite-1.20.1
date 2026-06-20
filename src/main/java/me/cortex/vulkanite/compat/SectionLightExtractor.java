@@ -90,31 +90,78 @@ public final class SectionLightExtractor {
 
     private static BlockScanProfile createProfile(BlockState state) {
         boolean isAir = state.isAir();
-        boolean fluidEmpty = true;
-        boolean opaqueForProbeVisibility = false;
-        if (!isAir) {
-            fluidEmpty = state.getFluidState().isEmpty();
-            opaqueForProbeVisibility = fluidEmpty && state.isOpaque();
-        }
+        boolean fluidEmpty = isAir || state.getFluidState().isEmpty();
+        Identifier id = Registries.BLOCK.getId(state.getBlock());
+        String namespace = id.getNamespace();
+        String path = id.getPath();
+        boolean opaqueForProbeVisibility = blocksProbeVisibility(state, path, isAir, fluidEmpty);
 
         int emission = state.getLuminance();
         if (emission <= 0) {
             return new BlockScanProfile(opaqueForProbeVisibility, 0, (short) 0, (short) 0);
         }
 
-        Identifier id = Registries.BLOCK.getId(state.getBlock());
-        String namespace = id.getNamespace();
-        String path = id.getPath();
         int rgb = colorFor(path, emission);
-        if (isAir) {
-            fluidEmpty = state.getFluidState().isEmpty();
-        }
         short flags = flagsFor(state, namespace, path, fluidEmpty);
         return new BlockScanProfile(
                 opaqueForProbeVisibility,
                 SectionLight.packRgbEmission(red(rgb), green(rgb), blue(rgb), emission),
                 (short) Math.max(1, Math.min(255, emission)),
                 flags);
+    }
+
+    private static boolean blocksProbeVisibility(BlockState state, String path, boolean isAir, boolean fluidEmpty) {
+        // Match the RTX visibility path more than vanilla light opacity: mesh blockers
+        // occlude probes, while transparent materials and tiny attachments do not.
+        if (isAir || !fluidEmpty || isProbeTransparent(path) || isTinyNonOccluder(path)) {
+            return false;
+        }
+        if (state.isOpaque()) {
+            return true;
+        }
+        return isConservativeMeshBlocker(path);
+    }
+
+    private static boolean isProbeTransparent(String path) {
+        return path.contains("glass")
+                || path.contains("ice")
+                || path.contains("water")
+                || path.contains("portal")
+                || path.contains("beacon");
+    }
+
+    private static boolean isTinyNonOccluder(String path) {
+        return path.contains("torch")
+                || path.contains("button")
+                || path.contains("lever")
+                || path.contains("pressure_plate")
+                || path.contains("tripwire")
+                || path.contains("rail")
+                || path.contains("ladder")
+                || path.contains("vine")
+                || path.contains("flower")
+                || path.contains("sapling")
+                || path.contains("mushroom")
+                || path.contains("banner")
+                || path.contains("carpet")
+                || path.contains("wire")
+                || path.contains("dust")
+                || path.contains("sign");
+    }
+
+    private static boolean isConservativeMeshBlocker(String path) {
+        return path.contains("door")
+                || path.contains("trapdoor")
+                || path.contains("slab")
+                || path.contains("stairs")
+                || path.contains("fence")
+                || path.contains("wall")
+                || path.contains("bars")
+                || path.contains("pane")
+                || path.contains("anvil")
+                || path.contains("chest")
+                || path.contains("shulker_box")
+                || path.contains("leaves");
     }
 
     private static short flagsFor(BlockState state, String namespace, String path, boolean fluidEmpty) {

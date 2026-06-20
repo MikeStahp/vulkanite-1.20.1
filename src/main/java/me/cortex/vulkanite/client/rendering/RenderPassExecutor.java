@@ -43,6 +43,10 @@ public final class RenderPassExecutor {
     private final List<VRef<VImageView>> outImgViewListCache = new ArrayList<>(16);
     // Reusable list for descriptor sets to avoid per-frame allocations
     private final List<VRef<VDescriptorSet>> setsCache = new ArrayList<>();
+    private final List<VRef<?>> resourcesToCloseCache = new ArrayList<>(32);
+    private final List<VRef<VImageView>> scaledViewListCache = new ArrayList<>(1);
+    private final List<VRef<VImageView>> entityTextureViewListCache = new ArrayList<>(EntityCapture.MAX_TEXTURES);
+    private final long[] pushConstantsCache = new long[6];
     private final Map<Long, VRef<VDescriptorPool>> entityTexturePools = new HashMap<>();
 
     public RenderPassExecutor(VContext ctx, AccelerationManager accelerationManager,
@@ -106,6 +110,7 @@ public final class RenderPassExecutor {
             VRef<VImage> blocklightDetailImage,
             VRef<VBuffer> sectionLightBuffer,
             VRef<VBuffer> sectionLightProbeBuffer,
+            VRef<VBuffer> sectionLightProbeFeedbackBuffer,
             VRef<VImage> scaledOutputImage, // DLSS: Scaled output image for binding 12 (or null to use Iris target)
             int renderWidth, // DLSS: Scaled render width (or full resolution if DLSS inactive)
             int renderHeight) { // DLSS: Scaled render height (or full resolution if DLSS inactive)
@@ -116,7 +121,8 @@ public final class RenderPassExecutor {
             return;
         }
 
-        List<VRef<?>> resourcesToClose = new ArrayList<>();
+        List<VRef<?>> resourcesToClose = resourcesToCloseCache;
+        resourcesToClose.clear();
         try {
             var pipeline = record.pipeline();
             var reflection = pipeline.get().reflection;
@@ -257,9 +263,9 @@ public final class RenderPassExecutor {
                         // Use the scaled output image for DLSS
                         var scaledView = VImageView.create(ctx, scaledOutputImage);
                         resourcesToClose.add(scaledView);
-                        List<VRef<VImageView>> scaledViewList = new ArrayList<>();
-                        scaledViewList.add(scaledView);
-                        updater.imageStore(12, 0, scaledViewList); // Scaled output for DLSS
+                        scaledViewListCache.clear();
+                        scaledViewListCache.add(scaledView);
+                        updater.imageStore(12, 0, scaledViewListCache); // Scaled output for DLSS
                         LOGGER.trace("Binding 12: Using scaled output image ({}x{}) for DLSS",
                                 scaledOutputImage.get().width, scaledOutputImage.get().height);
                     } else {
@@ -331,6 +337,8 @@ public final class RenderPassExecutor {
                         21, blocklightDetailImage, "BlocklightDetail");
                 bindOptionalStorageBuffer(updater, setReflection, 22, sectionLightBuffer, "SectionLights");
                 bindOptionalStorageBuffer(updater, setReflection, 23, sectionLightProbeBuffer, "SectionLightProbes");
+                bindOptionalStorageBuffer(updater, setReflection, 24, sectionLightProbeFeedbackBuffer,
+                        "SectionLightProbeFeedback");
 
                 updater.apply();
 
@@ -353,14 +361,20 @@ public final class RenderPassExecutor {
                         .set(entityTextureSet);
                 List<VRef<me.cortex.vulkanite.lib.memory.VGImage>> images =
                         accelerationManager.getEntityTextureImages();
-                List<VRef<VImageView>> views = new ArrayList<>(images.size());
+                List<VRef<VImageView>> views = entityTextureViewListCache;
+                views.clear();
                 try {
-                    for (VRef<me.cortex.vulkanite.lib.memory.VGImage> image : images) {
+                    int imageCount = Math.min(images.size(), EntityCapture.MAX_TEXTURES);
+                    for (int i = 0; i < imageCount; i++) {
+                        VRef<me.cortex.vulkanite.lib.memory.VGImage> image = images.get(i);
                         @SuppressWarnings({"rawtypes", "unchecked"})
                         VRef<VImage> imageRef = (VRef) image;
                         VRef<VImageView> view = VImageView.create(ctx, imageRef);
                         views.add(view);
                         resourcesToClose.add(view);
+                    }
+                    while (views.size() < EntityCapture.MAX_TEXTURES) {
+                        views.add(placeholderNormalsView);
                     }
                     updater.imageSampler(0, 0, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, views, ctexSampler);
                     updater.apply();
@@ -402,7 +416,7 @@ public final class RenderPassExecutor {
             // Fill gaps with empty descriptor sets
             for (int i = 0; i < layoutCount; i++) {
                 if (sets.get(i) == null) {
-                    sets.set(i, Vulkanite.INSTANCE.getPoolByLayout(layouts.get(i)).get().allocateSet());
+                    sets.set(i, Vulkanite.INSTANCE.getEmptySet(layouts.get(i)));
                 }
             }
 
@@ -414,7 +428,7 @@ public final class RenderPassExecutor {
             cmd.encodeMemoryBarrier();
 
             // Push constants for ray tracing shader.
-            long[] pushConstants = new long[6];
+            long[] pushConstants = pushConstantsCache;
             // Pack frameIndex (uint) and sampleIndex (uint) into first long
             pushConstants[0] = (long) frameIndex & 0xFFFFFFFFL | (((long) sampleIndex & 0xFFFFFFFFL) << 32);
             // Pack sunDirection (vec3)
@@ -436,26 +450,19 @@ public final class RenderPassExecutor {
             // Diagnostic logging (throttled to every 300 frames)
             if (frameIndex % 300 == 0) {
                 VImage boundOutput = scaledOutputImage != null ? scaledOutputImage.get() : outImgs.get(0).get();
-                LOGGER.info("[DLSS-RT] traceRays: {}x{} (output image: {}x{})",
-                        renderWidth, renderHeight, boundOutput.width, boundOutput.height);
-                // JITTER FRAME DIAG: Log viewport/scissor info for jitter frame/box investigation
-                LOGGER.info("[JITTER FRAME DIAG] traceRays dispatch: renderWidth={}, renderHeight={}",
-                        renderWidth, renderHeight);
-                LOGGER.info("[JITTER FRAME DIAG] Bound output image dimensions: {}x{}",
-                        boundOutput.width, boundOutput.height);
-                if (scaledOutputImage != null) {
-                    LOGGER.info("[JITTER FRAME DIAG] Scaled output image: {}x{}",
-                            scaledOutputImage.get().width, scaledOutputImage.get().height);
-                }
-                // Log if there's a dimension mismatch that could cause visible boundaries
                 if (renderWidth != boundOutput.width || renderHeight != boundOutput.height) {
                     LOGGER.warn(
                             "[JITTER FRAME DIAG] DIMENSION MISMATCH: traceRays {}x{} vs output {}x{} - may cause visible boundary!",
                             renderWidth, renderHeight, boundOutput.width, boundOutput.height);
+                } else if (LOGGER.isTraceEnabled()) {
+                    LOGGER.trace("[DLSS-RT] traceRays: {}x{} (output image: {}x{})",
+                            renderWidth, renderHeight, boundOutput.width, boundOutput.height);
                 }
             }
 
-            sets.forEach(VRef::close);
+            for (VRef<VDescriptorSet> set : sets) {
+                set.close();
+            }
 
             // No need for explicit barriers here since we're transitioning to the same
             // layout
@@ -466,7 +473,10 @@ public final class RenderPassExecutor {
                 if (ref != null)
                     ref.close();
             }
+            resourcesToClose.clear();
             outImgViewListCache.clear();
+            scaledViewListCache.clear();
+            entityTextureViewListCache.clear();
         }
     }
 

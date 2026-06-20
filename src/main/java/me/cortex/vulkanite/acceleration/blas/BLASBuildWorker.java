@@ -18,6 +18,7 @@ import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 
 /**
@@ -35,6 +36,17 @@ public class BLASBuildWorker implements Runnable {
     // Memory stack size: 16MB reduced from 64MB to prevent MemoryStack exhaustion
     // Large query results are now allocated on heap via MemoryUtil in VQueryPool
     private static final int MEMORY_STACK_SIZE = 16_000_000;
+    private static final long BLAS_BATCH_COOLDOWN_NANOS =
+            Long.getLong("vulkanite.blasCooldownMs", 2L) * 1_000_000L;
+    private static final long BLAS_SLOW_BATCH_COOLDOWN_NANOS =
+            Long.getLong("vulkanite.blasSlowCooldownMs", 6L) * 1_000_000L;
+    private static final long BLAS_SLOW_BATCH_NANOS =
+            Long.getLong("vulkanite.blasSlowBatchMs", 40L) * 1_000_000L;
+    private static final long MEMORY_PRESSURE_WARN_INTERVAL_NANOS = 10_000_000_000L;
+    private static final boolean FORCE_GC_ON_MEMORY_PRESSURE =
+            Boolean.getBoolean("vulkanite.blasForceGcOnMemoryPressure");
+    private static final double MEMORY_PRESSURE_WARN_PERCENT =
+            Double.parseDouble(System.getProperty("vulkanite.blasMemoryPressureWarnPercent", "8.0"));
     
     private final VContext context;
     private final int asyncQueue;
@@ -51,6 +63,8 @@ public class BLASBuildWorker implements Runnable {
     private final BLASBatchProcessor batchProcessor;
     
     private long totalBatchesProcessed = 0;
+    private long lastMemoryPressureWarnNanos;
+    private volatile boolean shutdownRequested;
     
     public BLASBuildWorker(
             VContext context,
@@ -87,50 +101,73 @@ public class BLASBuildWorker implements Runnable {
 
         LOGGER.info("[BLAS Worker] Starting worker thread");
 
-        while (true) {
-            try {
-                collectJobs(jobs);
-                VRegistry.INSTANCE.threadLocalCollect();
-                var singleUsePoolWorker = context.cmd.getSingleUsePool();
+        try {
+            while (true) {
+                try {
+                    if (!collectJobs(jobs)) {
+                        break;
+                    }
+                    VRegistry.INSTANCE.threadLocalCollect();
+                    var singleUsePoolWorker = context.cmd.getSingleUsePool();
 
-                // Log memory usage before processing
-                logMemoryUsage("before batch");
+                    // Log memory usage before processing
+                    logMemoryUsage("before batch");
 
-                try (var stack = bigStack.push()) {
-                    var buildContext = memoryManager.createBuildContext(jobs, stack);
-                    batchProcessor.processBatch(buildContext, singleUsePoolWorker, priorExecutions, stack);
-                    totalBatchesProcessed++;
+                    try (var stack = bigStack.push()) {
+                        var buildContext = memoryManager.createBuildContext(jobs, stack);
+                        long batchStartNanos = System.nanoTime();
+                        batchProcessor.processBatch(buildContext, singleUsePoolWorker, priorExecutions, stack);
+                        jobs.clear();
+                        totalBatchesProcessed++;
+                        throttleAfterBatch(System.nanoTime() - batchStartNanos);
+                    }
+
+                    // Reset allocators for next batch
+                    memoryManager.reset();
+
+                    // Log memory after processing
+                    logMemoryUsage("after batch");
+
+                    // Check and handle memory pressure
+                    checkAndHandleMemoryPressure();
+                } catch (Throwable t) {
+                    if (shutdownRequested && t instanceof InterruptedException) {
+                        break;
+                    }
+                    LOGGER.error("[BLAS Worker] Batch failed; dropping batch and keeping worker alive", t);
+                    memoryManager.reset();
+                    closeJobs(jobs);
+                    jobs.clear();
                 }
-
-                // Reset allocators for next batch
-                memoryManager.reset();
-
-                // Log memory after processing
-                logMemoryUsage("after batch");
-
-                // Check and handle memory pressure
-                checkAndHandleMemoryPressure();
-            } catch (Throwable t) {
-                LOGGER.error("[BLAS Worker] Batch failed; dropping batch and keeping worker alive", t);
-                memoryManager.reset();
-                for (BLASBuildJob job : jobs) {
-                    job.data().geometryBuffer().close();
-                }
-                jobs.clear();
             }
+        } finally {
+            closeQueuedJobs();
+            memoryManager.cleanup();
+            batchProcessor.cleanup();
+            VRegistry.INSTANCE.threadLocalCollect();
+            LOGGER.info("[BLAS Worker] Worker thread stopped after {} batches", totalBatchesProcessed);
         }
+    }
+
+    public void requestShutdown() {
+        shutdownRequested = true;
+        awaitingJobBatches.release();
     }
     
     /**
      * Collects jobs from the batched queue.
      * Blocks until at least one job is available, then tries to collect more.
      */
-    private void collectJobs(List<BLASBuildJob> jobs) {
+    private boolean collectJobs(List<BLASBuildJob> jobs) throws InterruptedException {
         jobs.clear();
-        try {
-            awaitingJobBatches.acquire();
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
+        if (shutdownRequested) {
+            closeQueuedJobs();
+            return false;
+        }
+        awaitingJobBatches.acquire();
+        if (shutdownRequested) {
+            closeQueuedJobs();
+            return false;
         }
         
         var batch = batchedJobs.poll();
@@ -153,6 +190,7 @@ public class BLASBuildWorker implements Runnable {
                 }
             }
         }
+        return !jobs.isEmpty();
     }
     
     /**
@@ -164,11 +202,32 @@ public class BLASBuildWorker implements Runnable {
         long maxMemory = Runtime.getRuntime().maxMemory();
         double freePercent = (freeMemory * 100.0) / maxMemory;
         
-        // Force cleanup if memory pressure is high (less than 15% free)
-        if (freePercent < 15.0) {
-            LOGGER.warn("[BLAS Worker] Memory pressure detected ({}% free), forcing cleanup",
-                    String.format("%.1f", freePercent));
-            System.gc();
+        if (freePercent < MEMORY_PRESSURE_WARN_PERCENT) {
+            long now = System.nanoTime();
+            if (now - lastMemoryPressureWarnNanos < MEMORY_PRESSURE_WARN_INTERVAL_NANOS) {
+                return;
+            }
+            lastMemoryPressureWarnNanos = now;
+            if (FORCE_GC_ON_MEMORY_PRESSURE) {
+                LOGGER.warn("[BLAS Worker] Memory pressure detected ({}% free), forcing cleanup",
+                        String.format("%.1f", freePercent));
+                System.gc();
+            } else {
+                LOGGER.warn("[BLAS Worker] Memory pressure detected ({}% free); automatic System.gc() is disabled",
+                        String.format("%.1f", freePercent));
+            }
+        }
+    }
+
+    private void throttleAfterBatch(long batchNanos) {
+        if (batchedJobs.isEmpty()) {
+            return;
+        }
+        long cooldownNanos = batchNanos >= BLAS_SLOW_BATCH_NANOS
+                ? BLAS_SLOW_BATCH_COOLDOWN_NANOS
+                : BLAS_BATCH_COOLDOWN_NANOS;
+        if (cooldownNanos > 0) {
+            LockSupport.parkNanos(cooldownNanos);
         }
     }
 
@@ -208,6 +267,19 @@ public class BLASBuildWorker implements Runnable {
      */
     public BLASMemoryManager getMemoryManager() {
         return memoryManager;
+    }
+
+    public static void closeJobs(List<BLASBuildJob> jobs) {
+        for (BLASBuildJob job : jobs) {
+            job.data().geometryBuffer().close();
+        }
+    }
+
+    private void closeQueuedJobs() {
+        List<BLASBuildJob> batch;
+        while ((batch = batchedJobs.poll()) != null) {
+            closeJobs(batch);
+        }
     }
     
     /**

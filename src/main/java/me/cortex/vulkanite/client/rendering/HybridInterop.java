@@ -46,7 +46,11 @@ final class HybridInterop {
             }
         }
 
-        int[] glIds = ids.stream().mapToInt(Integer::intValue).toArray();
+        int[] glIds = new int[ids.size()];
+        int index = 0;
+        for (Integer id : ids) {
+            glIds[index++] = id;
+        }
         int[] layouts = new int[glIds.length];
         Arrays.fill(layouts, GL_LAYOUT_GENERAL_EXT);
         return new ImageBatch(glIds, layouts);

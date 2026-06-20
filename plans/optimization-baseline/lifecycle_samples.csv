@@ -1,0 +1,1 @@
+capture_id,build_id,settings_hash,case_id,run,start_timestamp_ns,end_timestamp_ns,duration_ms,success,peak_heap_mib,peak_native_mib,peak_vram_mib,pending_submissions,pending_blas,errors,notes

@@ -45,7 +45,7 @@ public class AccelerationStructurePool {
             vacant.set(0, BLOCK_NUM_PAGES);
         }
 
-        private int allocate_n_pages(int count) {
+        private synchronized int allocate_n_pages(int count) {
             int pos = vacant.nextSetBit(0);
             while (pos != -1) {
                 int endPos = pos + count;
@@ -63,13 +63,13 @@ public class AccelerationStructurePool {
             return pos;
         }
 
-        public void free_n_pages(int pos, int count) {
+        public synchronized void free_n_pages(int pos, int count) {
             vacant.set(pos, pos + count);
 
             maxIndex = vacant.previousClearBit(maxIndex) + 1;
         }
 
-        public long allocate(long size) {
+        public synchronized long allocate(long size) {
             // Use size categories for more efficient allocation
             long alignedSize = size;
             for (int category : SIZE_CATEGORIES) {
@@ -88,7 +88,7 @@ public class AccelerationStructurePool {
             }
         }
 
-        public void free(long offset, long size) {
+        public synchronized void free(long offset, long size) {
             // Use size categories for consistent deallocation
             long alignedSize = size;
             for (int category : SIZE_CATEGORIES) {
@@ -133,7 +133,7 @@ public class AccelerationStructurePool {
         blocks.add(new Block(ctx.memory));
     }
 
-    public VRef<VAccelerationStructure> createAcceleration(long size, int type) {
+    public synchronized VRef<VAccelerationStructure> createAcceleration(long size, int type) {
         // Use size categories for more efficient allocation
         long alignedSize = size;
         for (int category : SIZE_CATEGORIES) {
@@ -190,4 +190,10 @@ public class AccelerationStructurePool {
         return new VRef<>(structure);
     }
 
+    public synchronized void destroy() {
+        for (Block block : blocks) {
+            block.buffer.close();
+        }
+        blocks.clear();
+    }
 }

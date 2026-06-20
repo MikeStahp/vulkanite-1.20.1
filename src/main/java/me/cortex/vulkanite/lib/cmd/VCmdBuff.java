@@ -35,7 +35,7 @@ public class VCmdBuff extends VObject {
     private VkCommandBuffer buffer;
 
     @SuppressWarnings("FieldCanBeLocal")
-    private final List<VRef<VObject>> refs = new ArrayList<>();
+    private final List<VRef<VObject>> refs = Collections.synchronizedList(new ArrayList<>());
 
     public void addBufferRef(final VRef<VBuffer> buffer) {
         refs.add(buffer.addRefGeneric());
@@ -139,15 +139,28 @@ public class VCmdBuff extends VObject {
     }
 
     public void bindDSet(VRef<VDescriptorSet>... sets) {
-        long[] vkSets = Arrays.stream(sets).mapToLong(s -> s.get().set).toArray();
-        vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
-        refs.addAll(Arrays.stream(sets).map(s -> new VRef<VObject>(s.get())).toList());
+        try (var stack = stackPush()) {
+            var vkSets = stack.mallocLong(sets.length);
+            for (VRef<VDescriptorSet> set : sets) {
+                vkSets.put(set.get().set);
+                refs.add(set.addRefGeneric());
+            }
+            vkSets.rewind();
+            vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
+        }
     }
 
     public void bindDSet(List<VRef<VDescriptorSet>> sets) {
-        long[] vkSets = sets.stream().mapToLong(s -> s.get().set).toArray();
-        vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
-        refs.addAll(sets.stream().map(s -> new VRef<VObject>(s.get())).toList());
+        try (var stack = stackPush()) {
+            var vkSets = stack.mallocLong(sets.size());
+            for (int i = 0; i < sets.size(); i++) {
+                VRef<VDescriptorSet> set = sets.get(i);
+                vkSets.put(set.get().set);
+                refs.add(set.addRefGeneric());
+            }
+            vkSets.rewind();
+            vkCmdBindDescriptorSets(buffer, currentPipelineBindPoint, currentPipelineLayout, 0, vkSets, null);
+        }
     }
 
     public void pushConstants(int offset, int size, long dataPtr) {
@@ -175,6 +188,11 @@ public class VCmdBuff extends VObject {
 
     public void resetQueryPool(final VRef<VQueryPool> queryPool, int first, int size) {
         vkCmdResetQueryPool(buffer, queryPool.get().pool, first, size);
+        refs.add(queryPool.addRefGeneric());
+    }
+
+    public void writeTimestamp(final VRef<VQueryPool> queryPool, int query, int pipelineStage) {
+        vkCmdWriteTimestamp(buffer, pipelineStage, queryPool.get().pool, query);
         refs.add(queryPool.addRefGeneric());
     }
 
@@ -250,6 +268,7 @@ public class VCmdBuff extends VObject {
 
     public static int dstStageToAccess(int dstStage) {
         return switch (dstStage) {
+            case VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT -> 0;
             case VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT -> VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
             case VK_PIPELINE_STAGE_VERTEX_INPUT_BIT -> VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
             case VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -268,6 +287,7 @@ public class VCmdBuff extends VObject {
 
     public static int srcStageToAccess(int srcStage) {
         return switch (srcStage) {
+            case VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT -> 0;
             case VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT -> VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
             case VK_PIPELINE_STAGE_VERTEX_INPUT_BIT -> VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
             case VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -290,10 +310,24 @@ public class VCmdBuff extends VObject {
     }
 
     public void encodeBufferBarrier(final VRef<VBuffer> buffer, long offset, long size, int srcStage, int dstStage) {
+        encodeBufferBarrier(buffer, offset, size, srcStage, dstStage,
+                srcStageToAccess(srcStage), dstStageToAccess(dstStage));
+    }
+
+    public void encodeBufferBarrier(
+            final VRef<VBuffer> buffer,
+            long offset,
+            long size,
+            int srcStage,
+            int dstStage,
+            int srcAccess,
+            int dstAccess) {
         try (var stack = stackPush()) {
             var barrier = VkBufferMemoryBarrier.calloc(1, stack);
-            barrier.get(0).sType$Default().srcAccessMask(srcStageToAccess(srcStage))
-                    .dstAccessMask(dstStageToAccess(dstStage)).buffer(buffer.get().buffer())
+            barrier.get(0).sType$Default().srcAccessMask(srcAccess)
+                    .dstAccessMask(dstAccess).buffer(buffer.get().buffer())
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
                     .offset(offset).size(size);
             vkCmdPipelineBarrier(this.buffer, srcStage, dstStage,
                     0, null, barrier, null);
@@ -416,9 +450,18 @@ public class VCmdBuff extends VObject {
     }
 
     protected void free() {
-        vkFreeCommandBuffers(pool.get().device, pool.get().pool, buffer == null ? finalizedBuffer : buffer);
-        refs.forEach(VRef::close);
-        refs.clear();
+        VCommandPool owner = pool.get();
+        synchronized (owner) {
+            vkFreeCommandBuffers(owner.device, owner.pool, buffer == null ? finalizedBuffer : buffer);
+        }
+        List<VRef<VObject>> refsToClose;
+        synchronized (refs) {
+            refsToClose = new ArrayList<>(refs);
+            refs.clear();
+        }
+        for (VRef<VObject> ref : refsToClose) {
+            ref.close();
+        }
     }
 
     public void setDebugUtilsObjectName(String name) {

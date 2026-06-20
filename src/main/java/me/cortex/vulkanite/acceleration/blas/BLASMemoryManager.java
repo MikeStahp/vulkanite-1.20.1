@@ -21,6 +21,7 @@ public class BLASMemoryManager {
     private static final long BUILD_BUFFER_SIZE = 0x400_0000L;  // 64MB
     private static final long SCRATCH_BUFFER_SIZE = 0x400_0000L; // 64MB
     private static final long AS_BUFFER_SIZE = 0x400_0000L;      // 64MB
+    private static final boolean COMPACT_BLAS = BLASBuildPolicy.compactStaticTerrainBlas();
     
     private final VContext context;
     private PoolLinearAllocator buildBufferAllocator;
@@ -50,10 +51,13 @@ public class BLASMemoryManager {
             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             SCRATCH_BUFFER_SIZE, 256);
         
-        // Initial AS buffer: AS storage + shader device address
-        initialASBufferAllocator = new PoolLinearAllocator(context,
-            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR,
-            AS_BUFFER_SIZE, 256);
+        // Initial AS buffer is only needed when a later compaction copy will
+        // move the built structure into the persistent AS pool.
+        if (COMPACT_BLAS) {
+            initialASBufferAllocator = new PoolLinearAllocator(context,
+                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR,
+                AS_BUFFER_SIZE, 256);
+        }
         
         LOGGER.info("[BLAS Memory] Buffer allocators initialized");
     }
@@ -104,8 +108,17 @@ public class BLASMemoryManager {
      */
     public void cleanup() {
         LOGGER.info("[BLAS Memory] Cleaning up buffer allocators");
-        if (buildBufferAllocator != null) buildBufferAllocator.clearPool();
-        if (scratchAllocator != null) scratchAllocator.clearPool();
-        if (initialASBufferAllocator != null) initialASBufferAllocator.clearPool();
+        if (buildBufferAllocator != null) {
+            buildBufferAllocator.close();
+            buildBufferAllocator = null;
+        }
+        if (scratchAllocator != null) {
+            scratchAllocator.close();
+            scratchAllocator = null;
+        }
+        if (initialASBufferAllocator != null) {
+            initialASBufferAllocator.close();
+            initialASBufferAllocator = null;
+        }
     }
 }

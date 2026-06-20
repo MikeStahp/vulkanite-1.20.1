@@ -192,7 +192,7 @@ public class MixinIrisRenderingPipeline {
                 return null;
             }
 
-            LOGGER.debug("G-buffer {} colortex{} bound: {}x{}",
+            LOGGER.trace("G-buffer {} colortex{} bound: {}x{}",
                     label, targetIndex, image.get().width, image.get().height);
             try (VRef<VImage> imageRef = new VRef<>(image.get())) {
                 return VImageView.create(Vulkanite.INSTANCE.getCtx(), imageRef);

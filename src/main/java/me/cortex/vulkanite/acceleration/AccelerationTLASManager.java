@@ -13,6 +13,7 @@ import me.cortex.vulkanite.lib.descriptors.*;
 import me.cortex.vulkanite.lib.memory.VAccelerationStructure;
 import me.cortex.vulkanite.lib.memory.VBuffer;
 import me.cortex.vulkanite.lib.memory.VGImage;
+import me.cortex.vulkanite.lib.other.VQueryPool;
 import me.cortex.vulkanite.acceleration.tlas.TLASSectionHolder;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSection;
 import org.joml.Matrix4x3f;
@@ -25,6 +26,7 @@ import java.util.*;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.*;
 import static org.lwjgl.vulkan.KHRBufferDeviceAddress.VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR;
+import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
 import static org.lwjgl.vulkan.VK10.*;
 
 /**
@@ -34,17 +36,24 @@ import static org.lwjgl.vulkan.VK10.*;
 public class AccelerationTLASManager {
     private static final Logger LOGGER = LoggerFactory.getLogger(AccelerationTLASManager.class);
     private static final int TLAS_BUILD_SLOTS = 3;
+    private static final int TLAS_TIMESTAMP_QUERIES_PER_SLOT = 2;
+    private static final int TLAS_TIMESTAMP_START = 0;
+    private static final int TLAS_TIMESTAMP_END = 1;
+    private static final long INFO_LOG_INTERVAL_NANOS = 5_000_000_000L;
+    private static final long SLOW_TLAS_ENCODE_LOG_NANOS = 2_000_000L;
 
     private final EntityBlasBuilder entityBlasBuilder;
     private final TLASSectionManager buildDataManager;
     private final VContext context;
     private final int queue;
     private final TlasBuildSlot[] tlasBuildSlots = new TlasBuildSlot[TLAS_BUILD_SLOTS];
+    private final VRef<VQueryPool> tlasTimestampQueryPool;
     private int tlasBuildCursor = 0;
     private EntityCapture.Frame entityData;
     private VRef<VAccelerationStructure> cachedTlas;
     private List<VRef<TLASSectionHolder>> cachedTransientHolders = List.of();
     private boolean tlasDirty = true;
+    private long lastTlasInfoLogNanos;
 
     public AccelerationTLASManager(VContext context, int queue) {
         this.context = context;
@@ -52,6 +61,8 @@ public class AccelerationTLASManager {
         this.buildDataManager = new TLASSectionManager(context);
         this.buildDataManager.resizeBindlessSet(0);
         this.entityBlasBuilder = new EntityBlasBuilder(context);
+        this.tlasTimestampQueryPool = VQueryPool.create(context.device,
+                TLAS_BUILD_SLOTS * TLAS_TIMESTAMP_QUERIES_PER_SLOT, VK_QUERY_TYPE_TIMESTAMP);
     }
 
     /**
@@ -81,7 +92,12 @@ public class AccelerationTLASManager {
         if (entityData == null) {
             return List.of();
         }
-        return entityData.textureRefs().stream().map(VRef::addRef).toList();
+        List<VRef<VGImage>> textures = entityData.textureRefs();
+        ArrayList<VRef<VGImage>> refs = new ArrayList<>(textures.size());
+        for (VRef<VGImage> texture : textures) {
+            refs.add(texture.addRef());
+        }
+        return refs;
     }
 
     public void removeSection(RenderSection section) {
@@ -143,8 +159,7 @@ public class AccelerationTLASManager {
                 replaceCachedTlas(cmd, null, List.of());
                 installedTransientHolders = true;
                 tlasDirty = false;
-                LOGGER.info("[Vulkanite] TLAS encode: no instances, activeSections={}, cpu={} ms",
-                        buildDataManager.activeSections.size(), formatMillis(System.nanoTime() - startNanos));
+                logTlasEncode("no instances", 0, 0, System.nanoTime() - startNanos);
                 return null;
             }
 
@@ -152,10 +167,6 @@ public class AccelerationTLASManager {
             for (var holderRef : buildDataManager.activeSections.values()) {
                 cmd.moveRefGeneric(holderRef.addRefGeneric());
             }
-
-            // Memory barrier: ensure instance buffer writes are visible before TLAS build
-            // reads
-            cmd.encodeMemoryBarrier();
 
             geometry.sType$Default()
                     .geometryType(VK_GEOMETRY_TYPE_INSTANCES_KHR)
@@ -195,6 +206,7 @@ public class AccelerationTLASManager {
             TlasBuildSlot slot = acquireTlasBuildSlot(
                     buildSizesInfo.accelerationStructureSize(),
                     buildSizesInfo.buildScratchSize());
+            logCompletedTlasGpuTiming(slot);
             var tlas = slot.tlas.addRef();
             var scratchBuffer = slot.scratch.addRef();
 
@@ -208,25 +220,31 @@ public class AccelerationTLASManager {
             }
             buildRanges.rewind();
 
-            cmd.encodeMemoryBarrier();
+            encodeInstanceBufferBuildBarrier(cmd, instanceBuffer,
+                    VkAccelerationStructureInstanceKHR.SIZEOF * (long) numInstances, stack);
 
+            int timestampBase = slot.index * TLAS_TIMESTAMP_QUERIES_PER_SLOT;
+            cmd.resetQueryPool(tlasTimestampQueryPool, timestampBase, TLAS_TIMESTAMP_QUERIES_PER_SLOT);
+            cmd.writeTimestamp(tlasTimestampQueryPool, timestampBase + TLAS_TIMESTAMP_START,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
             vkCmdBuildAccelerationStructuresKHR(cmd.buffer(),
                     buildInfo,
                     stack.pointers(buildRanges));
+            cmd.writeTimestamp(tlasTimestampQueryPool, timestampBase + TLAS_TIMESTAMP_END,
+                    VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
+            slot.timestampWritten = true;
             cmd.addBufferRef(instanceBuffer);
             cmd.addBufferRef(scratchBuffer);
             cmd.addAccelerationStructureRef(tlas);
             instanceBuffer.close();
             scratchBuffer.close();
 
-            cmd.encodeMemoryBarrier();
+            encodeTlasBuildShaderBarrier(cmd, stack);
 
             replaceCachedTlas(cmd, tlas.addRef(), transientHolders);
             installedTransientHolders = true;
             tlasDirty = false;
-            LOGGER.info("[Vulkanite] TLAS encode: instances={}, activeSections={}, transientInstances={}, cpu={} ms",
-                    numInstances, buildDataManager.activeSections.size(), transientHolders.size(),
-                    formatMillis(System.nanoTime() - startNanos));
+            logTlasEncode("build", numInstances, transientHolders.size(), System.nanoTime() - startNanos);
             return tlas;
         } finally {
             if (!installedTransientHolders) {
@@ -265,7 +283,7 @@ public class AccelerationTLASManager {
 
         TlasBuildSlot slot = tlasBuildSlots[slotIndex];
         if (slot == null) {
-            slot = new TlasBuildSlot();
+            slot = new TlasBuildSlot(slotIndex);
             tlasBuildSlots[slotIndex] = slot;
         }
 
@@ -304,11 +322,112 @@ public class AccelerationTLASManager {
         return highest << 1;
     }
 
+    private static void encodeInstanceBufferBuildBarrier(
+            VCmdBuff cmd,
+            VRef<VBuffer> instanceBuffer,
+            long size,
+            org.lwjgl.system.MemoryStack stack) {
+        var barrier = VkBufferMemoryBarrier.calloc(1, stack);
+        barrier.get(0)
+                .sType$Default()
+                .srcAccessMask(VK_ACCESS_HOST_WRITE_BIT)
+                .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR)
+                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .buffer(instanceBuffer.get().buffer())
+                .offset(0)
+                .size(size);
+
+        vkCmdPipelineBarrier(
+                cmd.buffer(),
+                VK_PIPELINE_STAGE_HOST_BIT,
+                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                0,
+                null,
+                barrier,
+                null);
+        cmd.addBufferRef(instanceBuffer);
+    }
+
+    private static void encodeTlasBuildShaderBarrier(VCmdBuff cmd, org.lwjgl.system.MemoryStack stack) {
+        var barrier = VkMemoryBarrier.calloc(1, stack);
+        barrier.get(0)
+                .sType$Default()
+                .srcAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
+                .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+
+        vkCmdPipelineBarrier(
+                cmd.buffer(),
+                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                0,
+                barrier,
+                null,
+                null);
+    }
+
+    private void logTlasEncode(String reason, int instances, int transientInstances, long cpuNanos) {
+        long now = System.nanoTime();
+        boolean info = cpuNanos >= SLOW_TLAS_ENCODE_LOG_NANOS
+                || now - lastTlasInfoLogNanos >= INFO_LOG_INTERVAL_NANOS;
+        if (info) {
+            lastTlasInfoLogNanos = now;
+            LOGGER.info("[Vulkanite] TLAS encode: reason={}, instances={}, activeSections={}, transientInstances={}, cpu={} ms",
+                    reason, instances, buildDataManager.activeSections.size(), transientInstances,
+                    formatMillis(cpuNanos));
+        } else {
+            LOGGER.debug("[Vulkanite] TLAS encode: reason={}, instances={}, activeSections={}, transientInstances={}, cpu={} ms",
+                    reason, instances, buildDataManager.activeSections.size(), transientInstances,
+                    formatMillis(cpuNanos));
+        }
+    }
+
+    private void logCompletedTlasGpuTiming(TlasBuildSlot slot) {
+        if (!slot.timestampWritten) {
+            return;
+        }
+
+        int timestampBase = slot.index * TLAS_TIMESTAMP_QUERIES_PER_SLOT;
+        long[] timestamps = tlasTimestampQueryPool.get().getResultsLongIfAvailable(
+                timestampBase, TLAS_TIMESTAMP_QUERIES_PER_SLOT);
+        if (timestamps == null) {
+            return;
+        }
+
+        long gpuNanos = timestampDeltaNanos(timestamps[TLAS_TIMESTAMP_START], timestamps[TLAS_TIMESTAMP_END]);
+        slot.timestampWritten = false;
+
+        long now = System.nanoTime();
+        boolean info = gpuNanos >= SLOW_TLAS_ENCODE_LOG_NANOS
+                || now - lastTlasInfoLogNanos >= INFO_LOG_INTERVAL_NANOS;
+        if (info) {
+            lastTlasInfoLogNanos = now;
+            LOGGER.info("[Vulkanite] TLAS gpu: slot={}, gpuBuild={} ms",
+                    slot.index, formatMillis(gpuNanos));
+        } else {
+            LOGGER.debug("[Vulkanite] TLAS gpu: slot={}, gpuBuild={} ms",
+                    slot.index, formatMillis(gpuNanos));
+        }
+    }
+
+    private long timestampDeltaNanos(long start, long end) {
+        if (end <= start) {
+            return 0L;
+        }
+        return Math.round((end - start) * (double) context.properties.timestampPeriodNanos);
+    }
+
     private static class TlasBuildSlot {
+        private final int index;
         private VRef<VAccelerationStructure> tlas;
         private long tlasCapacity;
         private VRef<VBuffer> scratch;
         private long scratchCapacity;
+        private boolean timestampWritten;
+
+        private TlasBuildSlot(int index) {
+            this.index = index;
+        }
     }
 
     public VRef<VDescriptorSet> getGeometrySet() {
@@ -332,6 +451,7 @@ public class AccelerationTLASManager {
         }
         entityBlasBuilder.clearCache();
         buildDataManager.destroy();
+        tlasTimestampQueryPool.close();
         for (TlasBuildSlot slot : tlasBuildSlots) {
             if (slot == null) {
                 continue;

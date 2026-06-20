@@ -26,7 +26,6 @@ public abstract class MixinRenderSectionManager {
         for (var section : sectionByPosition.values()) {
             Vulkanite.INSTANCE.sectionRemove(section);
         }
-        Vulkanite.INSTANCE.destroy();
     }
 
     @Redirect(method = "destroy", at = @At(value = "INVOKE", target = "Lme/jellysquid/mods/sodium/client/render/chunk/compile/ChunkBuildOutput;delete()V"))

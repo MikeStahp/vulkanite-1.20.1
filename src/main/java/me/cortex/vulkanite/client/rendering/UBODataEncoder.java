@@ -36,6 +36,8 @@ import java.nio.ByteBuffer;
  */
 public final class UBODataEncoder {
 
+    private static final boolean DEBUG_JITTER_FRAMES = Boolean.getBoolean("vulkanite.debugJitterFrames");
+
     // Thread-local reusable objects to avoid per-frame allocations
     private static final ThreadLocal<Vector3f> TL_VECTOR = ThreadLocal.withInitial(Vector3f::new);
     private static final ThreadLocal<Matrix4f> TL_INV_PROJ = ThreadLocal.withInitial(Matrix4f::new);
@@ -151,7 +153,7 @@ Vector3f corner3 = invProjMatrix.transformProject(ndcMaxX, ndcMaxY, 0, 1, new Ve
 
 // Log corner vector info every 300 frames
 int frameCounterDiag = SystemTimeUniforms.COUNTER.getAsInt();
-if (frameCounterDiag % 300 == 0) {
+if (DEBUG_JITTER_FRAMES && frameCounterDiag % 300 == 0) {
 System.out.println("[UBODataEncoder] Frame " + frameCounterDiag
 + ": Using full NDC range [-1, 1]"
 + ", render=" + renderWidth + "x" + renderHeight
@@ -208,7 +210,7 @@ System.out.println("[JITTER FRAME DIAG] Jitter: cur=(" + curJitterX + ", " + cur
         // DIAGNOSTIC: Log jitter values every 300 frames to reduce spam
         // Note: scaleManager is already declared above for corner vector scaling
         int frameCounterLog = SystemTimeUniforms.COUNTER.getAsInt();
-        if (frameCounterLog % 300 == 0) {
+        if (DEBUG_JITTER_FRAMES && frameCounterLog % 300 == 0) {
         	System.out.println("[UBODataEncoder] Frame " + frameCounterLog +
         	": jitter=(" + curJitterX + ", " + curJitterY + ")" +
         	", renderRes=" + renderWidth + "x" + renderHeight +

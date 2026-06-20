@@ -74,6 +74,7 @@ final class RtxPassGraph {
                     frame.blocklightDetail(),
                     frame.sectionLightBuffer(),
                     frame.sectionLightProbeBuffer(),
+                    frame.sectionLightProbeFeedbackBuffer(),
                     frame.noisyOutput(),
                     frame.renderWidth(),
                     frame.renderHeight());
@@ -120,6 +121,7 @@ final class RtxPassGraph {
             VRef<VImage> blocklightDetail,
             VRef<VBuffer> sectionLightBuffer,
             VRef<VBuffer> sectionLightProbeBuffer,
+            VRef<VBuffer> sectionLightProbeFeedbackBuffer,
             VRef<VImage> noisyOutput,
             int renderWidth,
             int renderHeight) {

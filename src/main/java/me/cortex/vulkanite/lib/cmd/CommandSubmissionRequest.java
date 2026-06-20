@@ -5,6 +5,7 @@ import me.cortex.vulkanite.lib.other.sync.VFence;
 import me.cortex.vulkanite.lib.other.sync.VSemaphore;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
@@ -20,6 +21,7 @@ public class CommandSubmissionRequest {
     private final List<VRef<VSemaphore>> signalSemaphores;
     private final VFence fence;
     private final CompletableFuture<Long> completionFuture;
+    private boolean released;
 
     /**
      * Creates a new command submission request.
@@ -37,9 +39,9 @@ public class CommandSubmissionRequest {
             @Nullable List<VRef<VSemaphore>> signalSemaphores,
             @Nullable VFence fence) {
         this.queueIndex = queueIndex;
-        this.commandBuffer = commandBuffer;
-        this.waitSemaphores = waitSemaphores;
-        this.signalSemaphores = signalSemaphores;
+        this.commandBuffer = commandBuffer.addRef();
+        this.waitSemaphores = retainSemaphores(waitSemaphores);
+        this.signalSemaphores = retainSemaphores(signalSemaphores);
         this.fence = fence;
         this.completionFuture = new CompletableFuture<>();
     }
@@ -96,6 +98,7 @@ public class CommandSubmissionRequest {
      * @param timelineValue The timeline value assigned to this submission
      */
     void complete(long timelineValue) {
+        release();
         completionFuture.complete(timelineValue);
     }
 
@@ -106,6 +109,39 @@ public class CommandSubmissionRequest {
      * @param throwable The exception that caused the failure
      */
     void completeExceptionally(Throwable throwable) {
+        release();
         completionFuture.completeExceptionally(throwable);
+    }
+
+    private static List<VRef<VSemaphore>> retainSemaphores(@Nullable List<VRef<VSemaphore>> semaphores) {
+        if (semaphores == null) {
+            return null;
+        }
+
+        ArrayList<VRef<VSemaphore>> retained = new ArrayList<>(semaphores.size());
+        for (VRef<VSemaphore> semaphore : semaphores) {
+            retained.add(semaphore.addRef());
+        }
+        return retained;
+    }
+
+    private void release() {
+        if (released) {
+            return;
+        }
+        released = true;
+
+        commandBuffer.close();
+        closeSemaphores(waitSemaphores);
+        closeSemaphores(signalSemaphores);
+    }
+
+    private static void closeSemaphores(@Nullable List<VRef<VSemaphore>> semaphores) {
+        if (semaphores == null) {
+            return;
+        }
+        for (VRef<VSemaphore> semaphore : semaphores) {
+            semaphore.close();
+        }
     }
 }

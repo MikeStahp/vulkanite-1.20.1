@@ -136,7 +136,7 @@ public class BLASQueryBuilder {
             }
         }
         
-        LOGGER.info("[BLAS Query] Batch #{} Total compacted size: {} bytes ({} MB)",
+        LOGGER.debug("[BLAS Query] Batch #{} Total compacted size: {} bytes ({} MB)",
             batchNumber, totalCompactedSize, totalCompactedSize / (1024 * 1024));
     }
     

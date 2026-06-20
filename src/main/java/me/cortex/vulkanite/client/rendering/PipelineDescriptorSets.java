@@ -59,6 +59,7 @@ public final class PipelineDescriptorSets {
                     new ShaderReflection.Binding("", 21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
                     new ShaderReflection.Binding("", 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
             });
 
     // Cache for base common set without G-buffer bindings (for full path tracers)
@@ -76,6 +77,7 @@ public final class PipelineDescriptorSets {
                     // No G-buffer bindings (7-11) for full path tracers
                     // Binding 12: Final output target
                     new ShaderReflection.Binding("", 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
+                    new ShaderReflection.Binding("", 24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
             });
 
     // Cache for VulkaniteRT hybrid set - matches actual bindings used by PBR
@@ -112,6 +114,7 @@ public final class PipelineDescriptorSets {
                     new ShaderReflection.Binding("", 21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
                     new ShaderReflection.Binding("", 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
             });
 
     private PipelineDescriptorSets() {
@@ -157,6 +160,7 @@ public final class PipelineDescriptorSets {
                 new ShaderReflection.Binding("", 21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
                 new ShaderReflection.Binding("", 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                 new ShaderReflection.Binding("", 23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                new ShaderReflection.Binding("", 24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
         });
     }
 

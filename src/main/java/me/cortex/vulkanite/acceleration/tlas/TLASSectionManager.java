@@ -30,6 +30,8 @@ import static org.lwjgl.vulkan.VK12.*;
  */
 public class TLASSectionManager extends TLASInstanceBuffer {
     private static final Logger LOGGER = LoggerFactory.getLogger(TLASSectionManager.class);
+    private static final long INFO_LOG_INTERVAL_NANOS = 5_000_000_000L;
+    private static final long SLOW_SECTION_TABLE_LOG_NANOS = 2_000_000L;
 
     private final TlasPointerArena arena = new TlasPointerArena(30000);
     private final ConcurrentLinkedDeque<BLASBuildResult> sectionUpdates = new ConcurrentLinkedDeque<>();
@@ -40,6 +42,7 @@ public class TLASSectionManager extends TLASInstanceBuffer {
     private VRef<VDescriptorSetLayout> geometryBufferSetLayout;
     public VRef<VDescriptorSet> geometryBufferDescSet = null;
     private int setCapacity = 0;
+    private long lastSectionTableInfoLogNanos;
 
     public TLASSectionManager(VContext context) {
         super(context);
@@ -78,8 +81,8 @@ public class TLASSectionManager extends TLASInstanceBuffer {
                     VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT, newCapacity);
             var newGeometryBufferDescSet = geometryBufferDescPool.get().allocateSet(newCapacity);
 
-            System.out.println("New geometry desc set: " + Long.toHexString(newGeometryBufferDescSet.get().set)
-                    + " with capacity " + newCapacity);
+            LOGGER.debug("New geometry desc set: {} with capacity {}",
+                    Long.toHexString(newGeometryBufferDescSet.get().set), newCapacity);
 
             if (geometryBufferDescSet != null) {
                 newGeometryBufferDescSet.get().copyFrom(context, geometryBufferDescSet, setCapacity);
@@ -203,9 +206,20 @@ public class TLASSectionManager extends TLASInstanceBuffer {
 
         Pair<VRef<VBuffer>, Integer> instanceBuffer = super.getInstanceBuffer();
         if (updateCount > 0 || removalCount > 0) {
-            LOGGER.info("[Vulkanite] TLAS section table: updates={}, removals={}, newGeometryRanges={}, activeSections={}, instances={}, cpu={} ms",
-                    updateCount, removalCount, newGeoms, activeSections.size(), instanceBuffer.getRight(),
-                    formatMillis(System.nanoTime() - startNanos));
+            long cpuNanos = System.nanoTime() - startNanos;
+            long now = System.nanoTime();
+            boolean info = cpuNanos >= SLOW_SECTION_TABLE_LOG_NANOS
+                    || now - lastSectionTableInfoLogNanos >= INFO_LOG_INTERVAL_NANOS;
+            if (info) {
+                lastSectionTableInfoLogNanos = now;
+                LOGGER.info("[Vulkanite] TLAS section table: updates={}, removals={}, newGeometryRanges={}, activeSections={}, instances={}, cpu={} ms",
+                        updateCount, removalCount, newGeoms, activeSections.size(), instanceBuffer.getRight(),
+                        formatMillis(cpuNanos));
+            } else {
+                LOGGER.debug("[Vulkanite] TLAS section table: updates={}, removals={}, newGeometryRanges={}, activeSections={}, instances={}, cpu={} ms",
+                        updateCount, removalCount, newGeoms, activeSections.size(), instanceBuffer.getRight(),
+                        formatMillis(cpuNanos));
+            }
         }
         return instanceBuffer;
     }

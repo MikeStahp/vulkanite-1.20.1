@@ -25,6 +25,7 @@
     "minecraft.MixinMinecraftClient",
     "minecraft.MixinResourceTexture",
     "minecraft.MixinSpriteAtlasTexture",
+    "minecraft.ParticleAccessor",
     "minecraft.ParticleManagerAccessor",
     "sodium.MixinRenderSection",
     "sodium.MixinRenderSectionManager",

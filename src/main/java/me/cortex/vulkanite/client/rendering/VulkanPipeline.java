@@ -59,12 +59,10 @@ public class VulkanPipeline {
     private static final int MAX_IRIS_RENDER_TARGETS = 16;
     private static final int UBO_SIZE = 1024;
     private static final int RUNTIME_ENTITY_CAPTURE_CAP = 48;
-    private static final int RUNTIME_PARTICLE_CAPTURE_CAP = 128;
     private static final long TRANSIENT_CAPTURE_BUDGET_NS = 4_000_000L;
-    private static final long TRANSIENT_CAPTURE_PARTICLE_BUDGET_NS = 8_000_000L;
     private static final int MAX_TRANSIENT_CAPTURE_THROTTLE = 8;
     private static final int MIN_ENTITY_CAPTURE_RADIUS = 8;
-    private static final int PARTICLE_CAPTURE_SUSPEND_FRAMES = 240;
+    private static final int[] EMPTY_GL_SEMAPHORE_IDS = new int[0];
 
     public record CustomTexture(String name, VRef<VGImage> image) {
     }
@@ -101,7 +99,6 @@ public class VulkanPipeline {
     private long lastDlssFrameTimeNs = -1L;
     private int entityCaptureFrame;
     private int transientCaptureThrottle = 1;
-    private int transientParticleSuspendFrames;
     private boolean destroyed;
 
     public VulkanPipeline(VContext ctx, AccelerationManager accelerationManager, RaytracingShaderSet[] passes,
@@ -298,7 +295,7 @@ public class VulkanPipeline {
                 outImgs.add(new VRef<>(image.get()));
             }
 
-            glReady.get().glSignal(new int[0], imageBatch.glIds(), imageBatch.glLayouts());
+            glReady.get().glSignal(EMPTY_GL_SEMAPHORE_IDS, imageBatch.glIds(), imageBatch.glLayouts());
 
             var cmdPool = ctx.cmd.createSingleUsePool(0);
             try {
@@ -324,7 +321,7 @@ public class VulkanPipeline {
             glReadySemaphore = new VRef<>(glReady.get());
             vulkanDoneSemaphore = new VRef<>(vulkanDone.get());
             ctx.cmd.submit(0, cmdRef, Arrays.asList(glReadySemaphore), Arrays.asList(vulkanDoneSemaphore), null);
-            vulkanDone.get().glWait(new int[0], imageBatch.glIds(), imageBatch.glLayouts());
+            vulkanDone.get().glWait(EMPTY_GL_SEMAPHORE_IDS, imageBatch.glIds(), imageBatch.glLayouts());
         } catch (DeviceLostException e) {
             LOGGER.error("Device lost during hybrid RTX frame", e);
             Vulkanite.IS_ENABLED = false;
@@ -358,14 +355,10 @@ public class VulkanPipeline {
         ctx.cmd.processPendingSubmissions();
         ctx.cmd.newFrame();
         VulkaniteConfig config = VulkaniteConfig.getInstance();
-        boolean captureTransientGeometry = config.rtxEntityCaptureEnabled || config.rtxParticleCaptureEnabled;
-        if (transientParticleSuspendFrames > 0) {
-            transientParticleSuspendFrames--;
-        }
+        boolean captureTransientGeometry = config.rtxEntityCaptureEnabled;
         if (captureEntityGeometry && supportsEntities && captureTransientGeometry) {
             int interval = Math.max(1, config.rtxEntityCaptureInterval) * transientCaptureThrottle;
             if ((entityCaptureFrame++ % interval) == 0) {
-                boolean captureParticles = config.rtxParticleCaptureEnabled && transientParticleSuspendFrames == 0;
                 long start = System.nanoTime();
                 accelerationManager.setEntityData(capture.capture(
                         CapturedRenderingState.INSTANCE.getTickDelta(),
@@ -373,10 +366,8 @@ public class VulkanPipeline {
                         camera,
                         config.rtxEntityCaptureEnabled ? captureLimit(config.rtxMaxCapturedEntities,
                                 RUNTIME_ENTITY_CAPTURE_CAP) : 0,
-                        captureParticles
-                                ? captureLimit(config.rtxMaxCapturedParticles, RUNTIME_PARTICLE_CAPTURE_CAP)
-                                : 0,
-                        captureParticles,
+                        0,
+                        false,
                         Math.max(MIN_ENTITY_CAPTURE_RADIUS, config.rtxEntityCaptureRadius)));
                 long duration = System.nanoTime() - start;
                 if (duration > TRANSIENT_CAPTURE_BUDGET_NS) {
@@ -384,14 +375,10 @@ public class VulkanPipeline {
                 } else if (duration < TRANSIENT_CAPTURE_BUDGET_NS / 2 && transientCaptureThrottle > 1) {
                     transientCaptureThrottle--;
                 }
-                if (captureParticles && duration > TRANSIENT_CAPTURE_PARTICLE_BUDGET_NS) {
-                    transientParticleSuspendFrames = PARTICLE_CAPTURE_SUSPEND_FRAMES;
-                }
             }
         } else {
             entityCaptureFrame = 0;
             transientCaptureThrottle = 1;
-            transientParticleSuspendFrames = 0;
             accelerationManager.setEntityData(null);
         }
     }
@@ -458,9 +445,12 @@ public class VulkanPipeline {
         int debugMode = mapDebugMode(dlssConfig.getDebugType());
         VRef<VBuffer> sectionLightBuffer = null;
         VRef<VBuffer> sectionLightProbeBuffer = null;
+        VRef<VBuffer> sectionLightProbeFeedbackBuffer = null;
         try {
             sectionLightBuffer = Vulkanite.INSTANCE.getSectionLightManager().ensureGpuBuffer(ctx, cmd);
             sectionLightProbeBuffer = Vulkanite.INSTANCE.getSectionLightManager().ensureProbeGpuBuffer(ctx, cmd);
+            sectionLightProbeFeedbackBuffer =
+                    Vulkanite.INSTANCE.getSectionLightManager().ensureProbeFeedbackGpuBuffer(ctx, cmd);
             passGraph.execute(new RtxPassGraph.Frame(
                     cmd,
                     ubo.buffer(),
@@ -501,10 +491,14 @@ public class VulkanPipeline {
                     frameImages.blocklightDetail(),
                     sectionLightBuffer,
                     sectionLightProbeBuffer,
+                    sectionLightProbeFeedbackBuffer,
                     frameImages.radiance(),
                     renderWidth,
                     renderHeight));
         } finally {
+            if (sectionLightProbeFeedbackBuffer != null) {
+                sectionLightProbeFeedbackBuffer.close();
+            }
             if (sectionLightProbeBuffer != null) {
                 sectionLightProbeBuffer.close();
             }

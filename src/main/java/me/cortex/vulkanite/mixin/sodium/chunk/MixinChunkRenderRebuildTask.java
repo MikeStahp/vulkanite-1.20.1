@@ -27,7 +27,8 @@ public class MixinChunkRenderRebuildTask {
     @Unique
     private static final long VULKANITE_INFO_LOG_INTERVAL_NANOS = 5_000_000_000L;
     @Unique
-    private static final long VULKANITE_SLOW_CAPTURE_LOG_NANOS = 2_000_000L;
+    private static final long VULKANITE_SLOW_CAPTURE_LOG_NANOS =
+            Long.getLong("vulkanite.sodiumRebuildSlowLogMs", 8L) * 1_000_000L;
     @Unique
     private static long vulkanite$lastBuildTimingLogNanos;
 
@@ -61,17 +62,16 @@ public class MixinChunkRenderRebuildTask {
         int lightCount = sectionLights == null ? 0 : sectionLights.size();
         boolean hasOpaque = sectionLights != null && sectionLights.hasOpaqueBlocks();
         long now = System.nanoTime();
-        boolean info = lightCount > 0
-                || totalNanos >= VULKANITE_SLOW_CAPTURE_LOG_NANOS
-                || now - vulkanite$lastBuildTimingLogNanos >= VULKANITE_INFO_LOG_INTERVAL_NANOS;
+        boolean info = now - vulkanite$lastBuildTimingLogNanos >= VULKANITE_INFO_LOG_INTERVAL_NANOS
+                && (lightCount > 0 || totalNanos >= VULKANITE_SLOW_CAPTURE_LOG_NANOS);
         if (info) {
             vulkanite$lastBuildTimingLogNanos = now;
             VULKANITE_LOGGER.info("[Vulkanite] Sodium rebuild tail: section={}, geometryRanges={}, geometryBytes={}, lights={}, opacity={}, capture={} ms, lightScan={} ms, total={} ms",
                     buildResult.render.getPosition(), geometryRanges, geometryBytes, lightCount, hasOpaque,
                     vulkanite$formatMillis(geometryNanos), vulkanite$formatMillis(lightNanos),
                     vulkanite$formatMillis(totalNanos));
-        } else {
-            VULKANITE_LOGGER.debug("[Vulkanite] Sodium rebuild tail: section={}, geometryRanges={}, geometryBytes={}, lights={}, opacity={}, capture={} ms, lightScan={} ms, total={} ms",
+        } else if (VULKANITE_LOGGER.isTraceEnabled()) {
+            VULKANITE_LOGGER.trace("[Vulkanite] Sodium rebuild tail: section={}, geometryRanges={}, geometryBytes={}, lights={}, opacity={}, capture={} ms, lightScan={} ms, total={} ms",
                     buildResult.render.getPosition(), geometryRanges, geometryBytes, lightCount, hasOpaque,
                     vulkanite$formatMillis(geometryNanos), vulkanite$formatMillis(lightNanos),
                     vulkanite$formatMillis(totalNanos));

@@ -83,6 +83,7 @@ public class VComputePipeline extends VObject {
     @Override
     public void free() {
         vkDestroyPipeline(context.device, pipeline, null);
+        vkDestroyPipelineLayout(context.device, layout, null);
     }
 
     @Override

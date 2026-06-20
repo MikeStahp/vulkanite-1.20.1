@@ -4,13 +4,16 @@ import me.cortex.vulkanite.acceleration.SharedQuadVkIndexBuffer;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.cmd.VCmdBuff;
+import me.cortex.vulkanite.lib.memory.AccelerationStructurePool;
 import me.cortex.vulkanite.lib.memory.VAccelerationStructure;
 import org.lwjgl.PointerBuffer;
+import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.LongBuffer;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.lwjgl.vulkan.KHRAccelerationStructure.*;
@@ -27,13 +30,21 @@ public class BLASGeometryProcessor {
         private final VContext context;
         private final BLASBuildWorker.BLASBuildContext buildCtx;
         private final VCmdBuff uploadBuildCmd;
+        private final AccelerationStructurePool accelerationStructurePool;
+        private final boolean compactBlas;
+        private final List<BuildInputBarrier> buildInputBarriers = new ArrayList<>();
+        private final long[] decodePushConstants = new long[3];
 
         public BLASGeometryProcessor(VContext context,
                         BLASBuildWorker.BLASBuildContext buildCtx,
-                        VCmdBuff uploadBuildCmd) {
+                        VCmdBuff uploadBuildCmd,
+                        AccelerationStructurePool accelerationStructurePool,
+                        boolean compactBlas) {
                 this.context = context;
                 this.buildCtx = buildCtx;
                 this.uploadBuildCmd = uploadBuildCmd;
+                this.accelerationStructurePool = accelerationStructurePool;
+                this.compactBlas = compactBlas;
         }
 
         public void processJob(BLASBuildJob job, int jobIndex,
@@ -57,8 +68,7 @@ public class BLASGeometryProcessor {
                 var bi = buildInfos.get()
                                 .sType$Default()
                                 .type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
-                                .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
-                                                | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR)
+                                .flags(buildFlags())
                                 .pGeometries(geometryInfos)
                                 .geometryCount(job.geometries().size());
 
@@ -73,10 +83,17 @@ public class BLASGeometryProcessor {
                                 maxPrims,
                                 buildSizesInfo);
 
-                var backingBuffer = buildCtx.initialASBufferAllocator
-                                .allocate(buildSizesInfo.accelerationStructureSize());
-                var structure = context.memory.createAcceleration(backingBuffer.buffer(), backingBuffer.offset(),
-                                backingBuffer.size(), VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+                VRef<VAccelerationStructure> structure;
+                if (compactBlas) {
+                        var backingBuffer = buildCtx.initialASBufferAllocator
+                                        .allocate(buildSizesInfo.accelerationStructureSize());
+                        structure = context.memory.createAcceleration(backingBuffer.buffer(), backingBuffer.offset(),
+                                        backingBuffer.size(), VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+                } else {
+                        structure = accelerationStructurePool.createAcceleration(
+                                        buildSizesInfo.accelerationStructureSize(),
+                                        VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+                }
 
                 var scratch = buildCtx.scratchAllocator.allocate(buildSizesInfo.buildScratchSize());
                 uploadBuildCmd.addBufferRef(scratch.buffer());
@@ -124,39 +141,32 @@ public class BLASGeometryProcessor {
                 long buildBufferSize = geometry.quadCount() * 4L * VERTEX_STRIDE;
                 var buildBuffer = buildCtx.buildBufferAllocator.allocate(buildBufferSize);
 
-                // Barrier: ensure build buffer is ready for compute shader write
-                uploadBuildCmd.encodeBufferBarrier(buildBuffer.buffer(), buildBuffer.offset(), buildBuffer.size(),
-                                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-
                 if (buildBuffer.deviceAddress() == 0) {
                         LOGGER.error("[Job {}][Geo {}] NULL build buffer device address!", jobIndex, geoIdx);
                         throw new IllegalStateException("NULL build buffer device address");
                 }
 
                 // Decode vertex data via compute shader
-                var pushConstant = new long[3];
-                pushConstant[0] = geometry.quadCount() * 4L;
-                pushConstant[1] = inputAddress;
-                pushConstant[2] = buildBuffer.deviceAddress();
+                decodePushConstants[0] = geometry.quadCount() * 4L;
+                decodePushConstants[1] = inputAddress;
+                decodePushConstants[2] = buildBuffer.deviceAddress();
         
-                LOGGER.debug("[Job {}][Geo {}] Dispatching compute shader: vertices={}, inputAddr=0x{}, outputAddr=0x{}",
-                    jobIndex, geoIdx, pushConstant[0], Long.toHexString(pushConstant[1]), Long.toHexString(pushConstant[2]));
+                LOGGER.trace("[Job {}][Geo {}] Dispatching compute shader: vertices={}, inputAddr=0x{}, outputAddr=0x{}",
+                    jobIndex, geoIdx, decodePushConstants[0], Long.toHexString(decodePushConstants[1]), Long.toHexString(decodePushConstants[2]));
 
                 // Barrier: ensure input geometry buffer is visible to compute shader
                 uploadBuildCmd.encodeBufferBarrier(geometryInputBuffer, 0, VK_WHOLE_SIZE,
-                                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
                 // Use VK_SHADER_STAGE_COMPUTE_BIT for more specific push constant range
-                uploadBuildCmd.pushConstants(0, pushConstant, VK_SHADER_STAGE_COMPUTE_BIT);
+                uploadBuildCmd.pushConstants(0, decodePushConstants, VK_SHADER_STAGE_COMPUTE_BIT);
                 uploadBuildCmd.dispatch((geometry.quadCount() * 4 + 255) / 256, 1, 1);
 
-                // CRITICAL: Barrier from COMPUTE_SHADER_BIT to ACCELERATION_STRUCTURE_BUILD_BIT
-                // The compute shader writes the build buffer; AS build must wait for it
-                uploadBuildCmd.encodeBufferBarrier(buildBuffer.buffer(), buildBuffer.offset(), buildBuffer.size(),
-                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
+                buildInputBarriers.add(new BuildInputBarrier(
+                                buildBuffer.buffer().addRef(),
+                                buildBuffer.offset(),
+                                buildBuffer.size()));
 
                 // Setup index buffer
                 var indexBuffer = SharedQuadVkIndexBuffer.getIndexBuffer(context, uploadBuildCmd,
@@ -178,16 +188,55 @@ public class BLASGeometryProcessor {
                                 .vertexData(vertexData)
                                 .vertexFormat(vertexFormat)
                                 .vertexStride(VERTEX_STRIDE)
-                                .maxVertex(geometry.quadCount() * 4)
+                                .maxVertex(geometry.quadCount() * 4 - 1)
                                 .indexData(indexData)
                                 .indexType(indexType)))
                         .geometryType(VK_GEOMETRY_TYPE_TRIANGLES_KHR)
                         .flags(geometry.geometryFlags());
         
-                LOGGER.debug("[Job {}][Geo {}] AS geometry setup: vertices={}, primitives={}",
+                LOGGER.trace("[Job {}][Geo {}] AS geometry setup: vertices={}, primitives={}",
                         jobIndex, geoIdx, geometry.quadCount() * 4, geometry.quadCount() * 2);
         
                 maxPrims.put(geometry.quadCount() * 2);
                 br.primitiveCount(geometry.quadCount() * 2);
+        }
+
+        public void flushBuildInputBarriers(MemoryStack stack) {
+                if (buildInputBarriers.isEmpty()) {
+                        return;
+                }
+
+                var barriers = VkBufferMemoryBarrier.calloc(buildInputBarriers.size(), stack);
+                for (int i = 0; i < buildInputBarriers.size(); i++) {
+                        BuildInputBarrier pending = buildInputBarriers.get(i);
+                        barriers.get(i)
+                                        .sType$Default()
+                                        .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
+                                        .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR)
+                                        .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                                        .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                                        .buffer(pending.buffer().get().buffer())
+                                        .offset(pending.offset())
+                                        .size(pending.size());
+                        uploadBuildCmd.addBufferRef(pending.buffer());
+                        pending.buffer().close();
+                }
+
+                vkCmdPipelineBarrier(
+                                uploadBuildCmd.buffer(),
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                                0,
+                                null,
+                                barriers,
+                                null);
+                buildInputBarriers.clear();
+        }
+
+        private record BuildInputBarrier(VRef<me.cortex.vulkanite.lib.memory.VBuffer> buffer, long offset, long size) {
+        }
+
+        private int buildFlags() {
+                return BLASBuildPolicy.staticTerrainBuildFlags(compactBlas);
         }
 }

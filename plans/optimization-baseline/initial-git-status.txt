@@ -1,0 +1,53 @@
+ M build.gradle
+ M gradle.properties
+ M plans/DIRECTIONAL_LIGHTING_RESOURCE_PLAN.md
+ M plans/RADIANCE_RTX_FLOW.md
+ M shaderpacks/VulkaniteRT/shaders/lang/en_us.lang
+ M shaderpacks/VulkaniteRT/shaders/lib/rt/settings.glsl
+ M shaderpacks/VulkaniteRT/shaders/ray0.rgen
+ M shaderpacks/VulkaniteRT/shaders/shaders.properties
+ M src/main/java/me/cortex/vulkanite/acceleration/AccelerationManager.java
+ M src/main/java/me/cortex/vulkanite/acceleration/AccelerationTLASManager.java
+ M src/main/java/me/cortex/vulkanite/acceleration/EntityBlasBuilder.java
+ M src/main/java/me/cortex/vulkanite/acceleration/blas/BLASBatchProcessor.java
+ M src/main/java/me/cortex/vulkanite/acceleration/blas/BLASBuildWorker.java
+ M src/main/java/me/cortex/vulkanite/acceleration/blas/BLASCompactor.java
+ M src/main/java/me/cortex/vulkanite/acceleration/blas/BLASGeometryProcessor.java
+ M src/main/java/me/cortex/vulkanite/acceleration/blas/BLASJobEnqueuer.java
+ M src/main/java/me/cortex/vulkanite/acceleration/blas/BLASMemoryManager.java
+ M src/main/java/me/cortex/vulkanite/acceleration/blas/BLASQueryBuilder.java
+ M src/main/java/me/cortex/vulkanite/acceleration/tlas/TLASInstanceBuffer.java
+ M src/main/java/me/cortex/vulkanite/acceleration/tlas/TLASSectionManager.java
+ M src/main/java/me/cortex/vulkanite/client/ShaderpackSettingsHandler.java
+ M src/main/java/me/cortex/vulkanite/client/Vulkanite.java
+ M src/main/java/me/cortex/vulkanite/client/lighting/SectionDirectionalProbePage.java
+ M src/main/java/me/cortex/vulkanite/client/lighting/SectionLightManager.java
+ M src/main/java/me/cortex/vulkanite/client/rendering/EntityCapture.java
+ M src/main/java/me/cortex/vulkanite/client/rendering/HybridInterop.java
+ D src/main/java/me/cortex/vulkanite/client/rendering/ImageOverflowManager.java
+ M src/main/java/me/cortex/vulkanite/client/rendering/JitterManager.java
+ M src/main/java/me/cortex/vulkanite/client/rendering/PipelineDescriptorSets.java
+ M src/main/java/me/cortex/vulkanite/client/rendering/RenderPassExecutor.java
+ M src/main/java/me/cortex/vulkanite/client/rendering/RtxPassGraph.java
+ D src/main/java/me/cortex/vulkanite/client/rendering/RtxResourceManager.java
+ M src/main/java/me/cortex/vulkanite/client/rendering/UBODataEncoder.java
+ M src/main/java/me/cortex/vulkanite/client/rendering/VulkanPipeline.java
+ M src/main/java/me/cortex/vulkanite/compat/SectionLightExtractor.java
+ M src/main/java/me/cortex/vulkanite/compat/SectionLightTable.java
+ M src/main/java/me/cortex/vulkanite/lib/base/DeviceProperties.java
+ M src/main/java/me/cortex/vulkanite/lib/cmd/CommandManager.java
+ M src/main/java/me/cortex/vulkanite/lib/cmd/CommandSubmissionRequest.java
+ M src/main/java/me/cortex/vulkanite/lib/cmd/VCmdBuff.java
+ M src/main/java/me/cortex/vulkanite/lib/cmd/VCommandPool.java
+ M src/main/java/me/cortex/vulkanite/lib/memory/AccelerationStructurePool.java
+ M src/main/java/me/cortex/vulkanite/lib/other/VQueryPool.java
+ M src/main/java/me/cortex/vulkanite/mixin/iris/MixinIrisRenderingPipeline.java
+ M src/main/java/me/cortex/vulkanite/mixin/minecraft/MixinGameRenderer.java
+ M src/main/java/me/cortex/vulkanite/mixin/sodium/MixinRenderSectionManager.java
+ M src/main/java/me/cortex/vulkanite/mixin/sodium/chunk/MixinChunkRenderRebuildTask.java
+ M src/main/resources/vulkanite.mixins.json
+?? plans/LUMEN_APPLIED_INVESTIGATION.md
+?? plans/MEGALIGHTS_APPLIED_INVESTIGATION.md
+?? plans/OPTIMIZATION_AGENT_FLOW.md
+?? src/main/java/me/cortex/vulkanite/acceleration/blas/BLASBuildPolicy.java
+?? src/main/java/me/cortex/vulkanite/mixin/minecraft/ParticleAccessor.java
