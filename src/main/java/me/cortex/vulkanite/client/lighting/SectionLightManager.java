@@ -32,6 +32,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
@@ -77,6 +78,8 @@ public final class SectionLightManager {
             + (long) MAX_GPU_PROBE_PAGES * PROBE_PAGE_BYTES;
     private static final long PROBE_FEEDBACK_BUFFER_BYTES = PROBE_FEEDBACK_HEADER_BYTES
             + (long) PROBE_FEEDBACK_RECORD_COUNT * PROBE_FEEDBACK_RECORD_BYTES;
+    private static final long PROBE_SHUTDOWN_JOIN_MS =
+            Math.max(0L, Long.getLong("vulkanite.probeShutdownJoinMs", 2_000L));
 
     private final Set<ChunkSectionPos> activeSectionPositions = new HashSet<>();
     private final Map<ChunkSectionPos, SectionLightTable> activeTables = new HashMap<>();
@@ -126,6 +129,7 @@ public final class SectionLightManager {
     private ByteBuffer probePageScratch;
     private ByteBuffer probeFeedbackHeaderScratch;
     private ByteBuffer probeFeedbackClearScratch;
+    private volatile boolean destroyed;
 
     public SectionLightManager() {
         LOGGER.info("[Vulkanite] Section light probe workers: {} of {} available processors",
@@ -133,6 +137,10 @@ public final class SectionLightManager {
     }
 
     public synchronized void updateFromBuildResults(List<ChunkBuildOutput> results) {
+        if (destroyed) {
+            return;
+        }
+
         int processedSections = 0;
         int changedTables = 0;
         int batchLights = 0;
@@ -214,7 +222,7 @@ public final class SectionLightManager {
     }
 
     public synchronized void removeSection(RenderSection section) {
-        if (section == null) {
+        if (destroyed || section == null) {
             return;
         }
         ChunkSectionPos sectionPos = section.getPosition();
@@ -491,9 +499,36 @@ public final class SectionLightManager {
         freeUploadScratchBuffers();
     }
 
-    public synchronized void destroy() {
-        clear();
-        probeBuildExecutor.shutdownNow();
+    public void destroy() {
+        int dirtyQueueCount;
+        int inFlightCount;
+        synchronized (this) {
+            if (destroyed) {
+                return;
+            }
+            destroyed = true;
+            dirtyQueueCount = dirtyProbePageQueue.size();
+            inFlightCount = inFlightProbeBuilds.size();
+            dirtyProbePageQueue.clear();
+            queuedDirtyProbePages.clear();
+        }
+
+        int cancelledQueuedTasks = probeBuildExecutor.shutdownNow().size();
+        boolean stopped = awaitProbeExecutorStop();
+
+        synchronized (this) {
+            int discardedResults = completedProbeBuilds.size();
+            int abandonedInFlight = inFlightProbeBuilds.size();
+            clear();
+            if (stopped) {
+                LOGGER.info("[Vulkanite] Section probe workers stopped during shutdown; dirtyQueue={}, inFlight={}, cancelledTasks={}, discardedResults={}",
+                        dirtyQueueCount, inFlightCount, cancelledQueuedTasks, discardedResults);
+            } else {
+                LOGGER.warn("[Vulkanite] Section probe workers did not stop within {} ms; abandonedInFlight={}, dirtyQueue={}, cancelledTasks={}, discardedResults={}",
+                        PROBE_SHUTDOWN_JOIN_MS, abandonedInFlight, dirtyQueueCount, cancelledQueuedTasks,
+                        discardedResults);
+            }
+        }
     }
 
     private void ensureCapacity(VContext ctx, int requiredBytes) {
@@ -546,6 +581,11 @@ public final class SectionLightManager {
     }
 
     private int processDirtyProbePages(int maxPages) {
+        if (destroyed) {
+            completedProbeBuilds.clear();
+            return 0;
+        }
+
         int completed = applyCompletedProbeBuilds();
         int scheduledOrApplied = completed;
         int processed = 0;
@@ -568,6 +608,9 @@ public final class SectionLightManager {
     }
 
     private boolean scheduleProbePageBuild(ChunkSectionPos sectionPos) {
+        if (destroyed || probeBuildExecutor.isShutdown()) {
+            return false;
+        }
         if (!activeSectionPositions.contains(sectionPos)) {
             return removeProbePage(sectionPos);
         }
@@ -583,13 +626,18 @@ public final class SectionLightManager {
         inFlightProbeBuilds.add(sectionPos);
         try {
             CompletableFuture.runAsync(() -> {
+                if (destroyed || Thread.currentThread().isInterrupted()) {
+                    return;
+                }
                 Throwable failure = null;
                 try {
                     page.regenerateFrom(neighborTables, MAX_LIGHTS_PER_PROBE_PAGE);
                 } catch (Throwable throwable) {
                     failure = throwable;
                 }
-                completedProbeBuilds.add(new ProbeBuildResult(sectionPos, buildVersion, page, failure));
+                if (!destroyed) {
+                    completedProbeBuilds.add(new ProbeBuildResult(sectionPos, buildVersion, page, failure));
+                }
             }, probeBuildExecutor);
         } catch (RejectedExecutionException e) {
             inFlightProbeBuilds.remove(sectionPos);
@@ -601,6 +649,11 @@ public final class SectionLightManager {
     }
 
     private int applyCompletedProbeBuilds() {
+        if (destroyed) {
+            completedProbeBuilds.clear();
+            return 0;
+        }
+
         int applied = 0;
         ProbeBuildResult result;
         while ((result = completedProbeBuilds.poll()) != null) {
@@ -880,6 +933,10 @@ public final class SectionLightManager {
             ChunkSectionPos sectionPos,
             boolean neighborInfluence,
             boolean invalidateInactive) {
+        if (destroyed) {
+            return false;
+        }
+
         if (!activeSectionPositions.contains(sectionPos)) {
             if (invalidateInactive) {
                 removeProbePage(sectionPos);
@@ -1039,6 +1096,28 @@ public final class SectionLightManager {
             MemoryUtil.memFree(scratch);
         }
         return null;
+    }
+
+    private boolean awaitProbeExecutorStop() {
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(PROBE_SHUTDOWN_JOIN_MS);
+        boolean interrupted = false;
+        while (!probeBuildExecutor.isTerminated() && System.nanoTime() < deadlineNanos) {
+            long remainingNanos = Math.max(1L, deadlineNanos - System.nanoTime());
+            long waitMillis = Math.max(1L, Math.min(50L, TimeUnit.NANOSECONDS.toMillis(remainingNanos)));
+            try {
+                if (probeBuildExecutor.awaitTermination(waitMillis, TimeUnit.MILLISECONDS)) {
+                    break;
+                }
+            } catch (InterruptedException e) {
+                interrupted = true;
+                break;
+            }
+        }
+
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        return probeBuildExecutor.isTerminated();
     }
 
     private void logProbeUpload(

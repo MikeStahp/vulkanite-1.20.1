@@ -32,6 +32,46 @@ public class VulkaniteConfig {
     private static final int MIN_RTX_ENTITY_BLAS_CACHE_SIZE = 32;
     private static final int MAX_RTX_ENTITY_BLAS_CACHE_SIZE = 2048;
 
+    public enum RtxCacheMode {
+        FULL_RT_REFERENCE("full_rt_reference"),
+        CACHE_FILL("cache_fill"),
+        CACHE_RESOLVE_ONLY("cache_resolve_only");
+
+        private final String configValue;
+
+        RtxCacheMode(String configValue) {
+            this.configValue = configValue;
+        }
+
+        public String configValue() {
+            return configValue;
+        }
+
+        public static RtxCacheMode parse(String value) {
+            if (value == null || value.isBlank()) {
+                return FULL_RT_REFERENCE;
+            }
+            for (RtxCacheMode mode : values()) {
+                if (mode.configValue.equalsIgnoreCase(value) || mode.name().equalsIgnoreCase(value)) {
+                    return mode;
+                }
+            }
+            return FULL_RT_REFERENCE;
+        }
+
+        public boolean usesFullRtPass() {
+            return this == FULL_RT_REFERENCE || this == CACHE_FILL;
+        }
+
+        public boolean usesCacheResolvePass() {
+            return this == CACHE_FILL || this == CACHE_RESOLVE_ONLY;
+        }
+
+        public boolean requiresTlas() {
+            return usesFullRtPass();
+        }
+    }
+
     // ReSTIR/DIRT RT settings
     public boolean enableDirtRt = false;
     public int restirReservoirWidth = 1280;
@@ -60,6 +100,7 @@ public class VulkaniteConfig {
     public int rtxMaxCapturedParticles = DEFAULT_RTX_MAX_CAPTURED_PARTICLES;
     public int rtxEntityCaptureRadius = DEFAULT_RTX_ENTITY_CAPTURE_RADIUS;
     public int rtxEntityBlasCacheSize = DEFAULT_RTX_ENTITY_BLAS_CACHE_SIZE;
+    public RtxCacheMode rtxCacheMode = RtxCacheMode.FULL_RT_REFERENCE;
 
     private static VulkaniteConfig INSTANCE;
 
@@ -112,6 +153,8 @@ public class VulkaniteConfig {
             rtxEntityBlasCacheSize = parseBoundedInt(props.getProperty("rtxEntityBlasCacheSize",
                     String.valueOf(DEFAULT_RTX_ENTITY_BLAS_CACHE_SIZE)), DEFAULT_RTX_ENTITY_BLAS_CACHE_SIZE,
                     MIN_RTX_ENTITY_BLAS_CACHE_SIZE, MAX_RTX_ENTITY_BLAS_CACHE_SIZE);
+            rtxCacheMode = RtxCacheMode.parse(props.getProperty("rtxCacheMode",
+                    RtxCacheMode.FULL_RT_REFERENCE.configValue()));
 
         } catch (IOException e) {
             System.err.println("[Vulkanite] Failed to load config: " + e.getMessage());
@@ -146,6 +189,7 @@ public class VulkaniteConfig {
         props.setProperty("rtxMaxCapturedParticles", String.valueOf(rtxMaxCapturedParticles));
         props.setProperty("rtxEntityCaptureRadius", String.valueOf(rtxEntityCaptureRadius));
         props.setProperty("rtxEntityBlasCacheSize", String.valueOf(rtxEntityBlasCacheSize));
+        props.setProperty("rtxCacheMode", rtxCacheMode.configValue());
 
         try (FileWriter writer = new FileWriter(configFile)) {
             props.store(writer, "Vulkanite Configuration");
@@ -185,6 +229,14 @@ public class VulkaniteConfig {
         return shouldUseDeferredRendering(shaderpackName)
                 && deferredComputeEnabled
                 && deferredComputeExperimental;
+    }
+
+    /**
+     * Temporary RTX/cache split switch for validating the cache-first render flow.
+     * Can be overridden at launch with -Dvulkanite.rtxCacheMode=cache_resolve_only.
+     */
+    public RtxCacheMode getRtxCacheMode() {
+        return RtxCacheMode.parse(System.getProperty("vulkanite.rtxCacheMode", rtxCacheMode.configValue()));
     }
     
     /**

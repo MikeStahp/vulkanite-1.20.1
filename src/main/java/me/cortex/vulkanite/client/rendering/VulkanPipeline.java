@@ -4,6 +4,7 @@ import me.cortex.vulkanite.acceleration.AccelerationManager;
 import me.cortex.vulkanite.client.Vulkanite;
 import me.cortex.vulkanite.client.config.DLSSConfig;
 import me.cortex.vulkanite.client.config.VulkaniteConfig;
+import me.cortex.vulkanite.client.config.VulkaniteConfig.RtxCacheMode;
 import me.cortex.vulkanite.compat.IVGImage;
 import me.cortex.vulkanite.compat.RaytracingShaderSet;
 import me.cortex.vulkanite.lib.base.VContext;
@@ -85,6 +86,7 @@ public class VulkanPipeline {
     private final VRef<VImageView> placeholderNormalsView;
     private final PoolLinearAllocator uboAllocator;
     private final RenderPassExecutor renderPassExecutor;
+    private final CacheResolvePass cacheResolvePass;
     private final RtxFrameImages frameImages = new RtxFrameImages();
     private final DLSSDProcessor dlssdProcessor;
     private final PipelineRequirements pipelineRequirements;
@@ -99,6 +101,7 @@ public class VulkanPipeline {
     private long lastDlssFrameTimeNs = -1L;
     private int entityCaptureFrame;
     private int transientCaptureThrottle = 1;
+    private RtxCacheMode lastLoggedRtxCacheMode;
     private boolean destroyed;
 
     public VulkanPipeline(VContext ctx, AccelerationManager accelerationManager, RaytracingShaderSet[] passes,
@@ -170,6 +173,7 @@ public class VulkanPipeline {
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                 VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
         renderPassExecutor = new RenderPassExecutor(ctx, accelerationManager, sampler, customTextureSampler);
+        cacheResolvePass = new CacheResolvePass(ctx, sampler);
         dlssdProcessor = new DLSSDProcessor(ctx);
 
         if (passes != null) {
@@ -283,7 +287,9 @@ public class VulkanPipeline {
         VRef<me.cortex.vulkanite.lib.cmd.VCmdBuff> cmdRef = null;
 
         try {
-            beginCompatibilityFrame(true, camera);
+            RtxCacheMode rtxCacheMode = VulkaniteConfig.getInstance().getRtxCacheMode();
+            logRtxCacheMode(rtxCacheMode);
+            beginCompatibilityFrame(rtxCacheMode.requiresTlas(), camera);
             List<VRef<VGImage>> entityTextureImages = accelerationManager.getEntityTextureImages();
             HybridInterop.ImageBatch imageBatch;
             try {
@@ -305,14 +311,16 @@ public class VulkanPipeline {
             }
             var cmd = cmdRef.get();
 
-            profiler.push("build_tlas");
-            tlas = accelerationManager.buildTLAS(0, cmd);
-            profiler.pop();
+            if (rtxCacheMode.requiresTlas()) {
+                profiler.push("build_tlas");
+                tlas = accelerationManager.buildTLAS(0, cmd);
+                profiler.pop();
+            }
 
-            if (tlas != null) {
+            if (tlas != null || !rtxCacheMode.usesFullRtPass()) {
                 profiler.push("encode_rtx");
                 encodeRtxFrame(cmd, tlas, vgOutImgs, outImgs, camera, ssbos, celestialUniforms,
-                        gbufferViews, renderWidth, renderHeight);
+                        gbufferViews, renderWidth, renderHeight, rtxCacheMode);
                 profiler.pop();
             } else {
                 updateTemporalPathState(false);
@@ -416,7 +424,8 @@ public class VulkanPipeline {
             MixinCelestialUniforms celestialUniforms,
             VRef<VImageView>[] gbufferViews,
             int renderWidth,
-            int renderHeight) {
+            int renderHeight,
+            RtxCacheMode rtxCacheMode) {
         DLSSConfig dlssConfig = DLSSConfig.load();
         boolean dlssFrameActive = dlssdProcessor.prepareForFrame(
                 MinecraftClient.getInstance(), dlssConfig, frameImages, outImgs);
@@ -447,11 +456,14 @@ public class VulkanPipeline {
         VRef<VBuffer> sectionLightProbeBuffer = null;
         VRef<VBuffer> sectionLightProbeFeedbackBuffer = null;
         try {
-            sectionLightBuffer = Vulkanite.INSTANCE.getSectionLightManager().ensureGpuBuffer(ctx, cmd);
-            sectionLightProbeBuffer = Vulkanite.INSTANCE.getSectionLightManager().ensureProbeGpuBuffer(ctx, cmd);
-            sectionLightProbeFeedbackBuffer =
-                    Vulkanite.INSTANCE.getSectionLightManager().ensureProbeFeedbackGpuBuffer(ctx, cmd);
-            passGraph.execute(new RtxPassGraph.Frame(
+            if (rtxCacheMode.usesFullRtPass()) {
+                sectionLightBuffer = Vulkanite.INSTANCE.getSectionLightManager().ensureGpuBuffer(ctx, cmd);
+                sectionLightProbeBuffer = Vulkanite.INSTANCE.getSectionLightManager().ensureProbeGpuBuffer(ctx, cmd);
+                sectionLightProbeFeedbackBuffer =
+                        Vulkanite.INSTANCE.getSectionLightManager().ensureProbeFeedbackGpuBuffer(ctx, cmd);
+            }
+
+            RtxPassGraph.Frame frame = new RtxPassGraph.Frame(
                     cmd,
                     ubo.buffer(),
                     ubo.offset(),
@@ -494,7 +506,13 @@ public class VulkanPipeline {
                     sectionLightProbeFeedbackBuffer,
                     frameImages.radiance(),
                     renderWidth,
-                    renderHeight));
+                    renderHeight);
+            if (rtxCacheMode.usesFullRtPass()) {
+                passGraph.execute(frame);
+            }
+            if (rtxCacheMode.usesCacheResolvePass()) {
+                cacheResolvePass.execute(frame, rtxCacheMode == RtxCacheMode.CACHE_RESOLVE_ONLY);
+            }
         } finally {
             if (sectionLightProbeFeedbackBuffer != null) {
                 sectionLightProbeFeedbackBuffer.close();
@@ -558,6 +576,14 @@ public class VulkanPipeline {
         if (image != null) {
             images.add(image);
         }
+    }
+
+    private void logRtxCacheMode(RtxCacheMode mode) {
+        if (mode == lastLoggedRtxCacheMode) {
+            return;
+        }
+        lastLoggedRtxCacheMode = mode;
+        LOGGER.info("RTX cache mode: {}", mode.configValue());
     }
 
     private static int captureLimit(int configuredLimit, int runtimeCap) {
@@ -731,6 +757,7 @@ public class VulkanPipeline {
         ctx.cmd.waitQueueIdle(0);
 
         dlssdProcessor.cleanup();
+        cacheResolvePass.destroy();
         renderPassExecutor.destroy();
         for (RtPipeline pipeline : raytracePipelines) {
             pipeline.pipeline().close();
