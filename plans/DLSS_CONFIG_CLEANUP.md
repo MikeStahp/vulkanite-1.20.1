@@ -420,10 +420,10 @@ Ensure native bridge ([`dlss_wrapper.cpp`](dlss_bridge/dlss_wrapper.cpp)) qualit
 - [ ] Verify native bridge quality mapping
 
 ### Phase 3: Cleanup
-- [ ] Remove duplicate scale factor constants from `ResolutionScaleManager`
-- [ ] Consolidate FSR quality preset handling
-- [ ] Add validation for configuration values
-- [ ] Add logging for configuration changes
+- [x] Remove duplicate scale factor constants from `ResolutionScaleManager`
+- [x] Consolidate FSR quality preset handling
+- [x] Add validation for configuration values
+- [x] Add logging for configuration changes
 
 ---
 

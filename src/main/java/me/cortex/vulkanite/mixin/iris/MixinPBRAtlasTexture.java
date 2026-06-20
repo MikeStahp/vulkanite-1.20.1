@@ -2,6 +2,7 @@ package me.cortex.vulkanite.mixin.iris;
 
 import com.mojang.blaze3d.platform.GlStateManager;
 import me.cortex.vulkanite.client.Vulkanite;
+import me.cortex.vulkanite.client.rendering.cache.CacheInvalidationTracker;
 import me.cortex.vulkanite.compat.IVGImage;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.memory.VImage;
@@ -23,6 +24,7 @@ public abstract class MixinPBRAtlasTexture extends AbstractTexture implements IV
 
     @Redirect(method = "upload", at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/platform/TextureUtil;prepareImage(IIII)V"))
     private void redirect(int id, int maxLevel, int width, int height) {
+        CacheInvalidationTracker.global().recordMaterialAtlasChanged("pbr_atlas_upload");
         var existingImage = getVGImage();
         if (existingImage != null) {
             LOGGER.warn("Vulkan image already allocated for PBR atlas, releasing it");

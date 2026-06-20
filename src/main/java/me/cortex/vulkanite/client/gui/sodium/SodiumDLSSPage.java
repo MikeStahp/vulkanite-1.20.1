@@ -53,11 +53,11 @@ public class SodiumDLSSPage {
                         .build())
                 .build());
 
-	// DLSS Quality Settings
+	// Upscaler Quality Settings
 	groups.add(OptionGroup.createBuilder()
 		.add(OptionImpl.createBuilder(DLSSConfig.QualityPreset.class, STORAGE)
-			.setName(Text.of("DLSS Quality"))
-			.setTooltip(Text.of("Performance/Quality trade-off for DLSS. Performance: 50%, Balanced: 58%, Quality: 67%, Ultra Quality: 77%, Ultra Performance: 33%, DLAA: 100% (no upscaling)."))
+			.setName(Text.of("Upscaler Quality"))
+			.setTooltip(Text.of("Performance/Quality trade-off for DLSS and FSR. Performance: 50%, Balanced: 58%, Quality: 67%, Ultra Quality: 77%, Ultra Performance: 33%, DLAA: 100% (no upscaling)."))
 			.setControl((opt) -> new CyclingControl<>(opt, DLSSConfig.QualityPreset.class, new Text[] {
 				Text.of("Performance"),
 				Text.of("Balanced"),
@@ -82,19 +82,6 @@ public class SodiumDLSSPage {
 
         // FSR Settings
         groups.add(OptionGroup.createBuilder()
-                .add(OptionImpl.createBuilder(DLSSConfig.FSRQualityPreset.class, STORAGE)
-                        .setName(Text.of("FSR Quality"))
-                        .setTooltip(Text.of("Performance/Quality trade-off for FSR."))
-                        .setControl((opt) -> new CyclingControl<>(opt, DLSSConfig.FSRQualityPreset.class, new Text[] {
-                                Text.of("Quality"),
-                                Text.of("Balanced"),
-                                Text.of("Performance"),
-                                Text.of("Ultra Performance")
-                        }))
-                        .setBinding(
-                                (opts, value) -> STORAGE.getConfig().setFSRQuality(value.ordinal()),
-                                (opts) -> STORAGE.getConfig().getFSRQualityPreset())
-                        .build())
                 .add(OptionImpl.createBuilder(Integer.class, STORAGE)
                         .setName(Text.of("FSR Sharpness"))
                         .setTooltip(Text.of("Apply sharpening to the FSR upscaled image."))

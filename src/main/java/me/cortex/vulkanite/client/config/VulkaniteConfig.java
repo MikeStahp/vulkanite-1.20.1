@@ -64,6 +64,10 @@ public class VulkaniteConfig {
         }
 
         public boolean usesCacheResolvePass() {
+            return this == CACHE_RESOLVE_ONLY;
+        }
+
+        public boolean collectsCacheRequests() {
             return this == CACHE_FILL || this == CACHE_RESOLVE_ONLY;
         }
 

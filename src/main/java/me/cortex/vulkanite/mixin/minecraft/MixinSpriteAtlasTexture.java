@@ -2,6 +2,7 @@ package me.cortex.vulkanite.mixin.minecraft;
 
 import com.mojang.blaze3d.platform.GlStateManager;
 import me.cortex.vulkanite.client.Vulkanite;
+import me.cortex.vulkanite.client.rendering.cache.CacheInvalidationTracker;
 import me.cortex.vulkanite.compat.IVGImage;
 import me.cortex.vulkanite.lib.base.VRef;
 import net.minecraft.client.texture.AbstractTexture;
@@ -18,6 +19,7 @@ import static org.lwjgl.vulkan.VK10.*;
 public abstract class MixinSpriteAtlasTexture extends AbstractTexture implements IVGImage  {
     @Redirect(method = "upload", at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/platform/TextureUtil;prepareImage(IIII)V"))
     private void redirect(int id, int maxLevel, int width, int height) {
+        CacheInvalidationTracker.global().recordMaterialAtlasChanged("sprite_atlas_upload");
         var existingImage = getVGImage();
         if (existingImage != null) {
             System.err.println("Vulkan image already allocated, releasing");

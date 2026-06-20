@@ -167,7 +167,7 @@ layout(push_constant) uniform PushConstants {
 #define SECTION_LIGHT_PROBE_RT_CACHE_ONLY 1
 #endif
 #ifndef SECTION_LIGHT_PROBE_RT_SURFACE_CACHE
-#define SECTION_LIGHT_PROBE_RT_SURFACE_CACHE 1
+#define SECTION_LIGHT_PROBE_RT_SURFACE_CACHE 0
 #endif
 #ifndef SECTION_LIGHT_PROBE_SURFACE_CACHE_OFFSET
 #define SECTION_LIGHT_PROBE_SURFACE_CACHE_OFFSET 0.05
@@ -316,12 +316,32 @@ struct SectionLightProbeRtCacheCell {
 };
 
 #define SECTION_LIGHT_PROBE_RT_CACHE_EMPTY 0u
-#define SECTION_LIGHT_PROBE_RT_CACHE_REVISION 12u
+#define SECTION_LIGHT_PROBE_RT_CACHE_REVISION 14u
 #define SECTION_LIGHT_PROBE_RT_CACHE_ALL_FACE_READY_MASK ((1u << uint(SECTION_LIGHT_PROBE_FACE_COUNT)) - 1u)
 
 layout(binding = 24, std430) coherent buffer SectionLightProbeRtCacheBuffer {
     uvec4 sectionLightProbeRtCacheHeader; // x=active pages, y=slot limit, z=probe version, w=cell count
     SectionLightProbeRtCacheCell sectionLightProbeRtCacheCells[];
+};
+
+layout(binding = 25, std430) readonly buffer SectionLightProbeFillRequestBuffer {
+    uvec4 sectionLightProbeFillRequestHeader; // x=request count, y=probe version, z=capacity
+    ivec4 sectionLightProbeFillRequests[]; // xyz=section origin, w=probe index
+};
+
+struct DiffuseRadianceCacheEntry {
+    ivec4 key; // xyz=two-block world cell, w=dominant normal axis
+    uvec4 payload; // x=RGB9E5 incident radiance, y=state, z=sample count, w=hit distance
+};
+
+layout(binding = 26, std430) coherent buffer DiffuseRadianceCacheBuffer {
+    uvec4 diffuseRadianceCacheHeader; // x=entry count, y=generation, z=hash probes
+    DiffuseRadianceCacheEntry diffuseRadianceCacheEntries[];
+};
+
+layout(binding = 27, std430) readonly buffer DiffuseRadianceFillRequestBuffer {
+    uvec4 diffuseRadianceFillRequestHeader; // x=request count, y=generation, z=capacity
+    ivec4 diffuseRadianceFillRequests[];
 };
 
 #if ENABLE_DLSS_RR
@@ -2182,107 +2202,6 @@ void completeSectionLightProbeRtCacheCell(
 #endif
 }
 
-bool prepareSectionLightProbeRtCacheCellForSurface(int cellIndex) {
-#if SECTION_LIGHT_PROBE_RT_CACHE_ENABLE == 0
-    return false;
-#else
-    if (cellIndex < 0 || cellIndex >= int(sectionLightProbeRtCacheHeader.w)) {
-        return false;
-    }
-
-    uint readyState = sectionLightProbeRtCacheReadyState();
-    uint currentState = readSectionLightProbeRtCacheState(cellIndex);
-    if (currentState == readyState) {
-        return true;
-    }
-    if (currentState == sectionLightProbeRtCacheInFlightState()) {
-        return false;
-    }
-    if (atomicCompSwap(
-            sectionLightProbeRtCacheCells[cellIndex].packedRadiance45State.z,
-            currentState,
-            sectionLightProbeRtCacheInFlightState()) != currentState) {
-        return false;
-    }
-
-    sectionLightProbeRtCacheCells[cellIndex].packedRadiance0123 = uvec4(0u);
-    sectionLightProbeRtCacheCells[cellIndex].packedRadiance45State.x = 0u;
-    sectionLightProbeRtCacheCells[cellIndex].packedRadiance45State.y = 0u;
-    sectionLightProbeRtCacheCells[cellIndex].packedRadiance45State.w = 0u;
-    memoryBarrierBuffer();
-    atomicExchange(sectionLightProbeRtCacheCells[cellIndex].packedRadiance45State.z, readyState);
-    return true;
-#endif
-}
-
-bool claimSectionLightProbeRtCacheFace(int cellIndex, int face) {
-#if SECTION_LIGHT_PROBE_RT_CACHE_ENABLE == 0
-    return false;
-#else
-    if (!prepareSectionLightProbeRtCacheCellForSurface(cellIndex)) {
-        return false;
-    }
-
-    uint readyBit = sectionLightProbeRtCacheFaceReadyBit(face);
-    uint inFlightBit = sectionLightProbeRtCacheFaceInFlightBit(face);
-    for (int attempt = 0; attempt < 4; attempt++) {
-        uint currentMask = atomicAdd(
-            sectionLightProbeRtCacheCells[cellIndex].packedRadiance45State.w,
-            0u);
-        if ((currentMask & readyBit) != 0u || (currentMask & inFlightBit) != 0u) {
-            return false;
-        }
-        if (atomicCompSwap(
-                sectionLightProbeRtCacheCells[cellIndex].packedRadiance45State.w,
-                currentMask,
-                currentMask | inFlightBit) == currentMask) {
-            return true;
-        }
-    }
-    return false;
-#endif
-}
-
-void writeSectionLightProbeRtCacheFaceRadiance(int cellIndex, int face, vec3 radiance) {
-#if SECTION_LIGHT_PROBE_RT_CACHE_ENABLE != 0
-    uint packedRadiance = packSectionLightProbeRgb9E5(max(radiance, vec3(0.0)));
-    if (cellIndex < 0 || cellIndex >= int(sectionLightProbeRtCacheHeader.w)) {
-        return;
-    }
-
-    if (face == 0) {
-        sectionLightProbeRtCacheCells[cellIndex].packedRadiance0123.x = packedRadiance;
-    } else if (face == 1) {
-        sectionLightProbeRtCacheCells[cellIndex].packedRadiance0123.y = packedRadiance;
-    } else if (face == 2) {
-        sectionLightProbeRtCacheCells[cellIndex].packedRadiance0123.z = packedRadiance;
-    } else if (face == 3) {
-        sectionLightProbeRtCacheCells[cellIndex].packedRadiance0123.w = packedRadiance;
-    } else if (face == 4) {
-        sectionLightProbeRtCacheCells[cellIndex].packedRadiance45State.x = packedRadiance;
-    } else {
-        sectionLightProbeRtCacheCells[cellIndex].packedRadiance45State.y = packedRadiance;
-    }
-#endif
-}
-
-void completeSectionLightProbeRtCacheFace(int cellIndex, int face, vec3 radiance) {
-#if SECTION_LIGHT_PROBE_RT_CACHE_ENABLE != 0
-    if (cellIndex < 0 || cellIndex >= int(sectionLightProbeRtCacheHeader.w)) {
-        return;
-    }
-
-    writeSectionLightProbeRtCacheFaceRadiance(cellIndex, face, radiance);
-    memoryBarrierBuffer();
-    atomicOr(
-        sectionLightProbeRtCacheCells[cellIndex].packedRadiance45State.w,
-        sectionLightProbeRtCacheFaceReadyBit(face));
-    atomicAnd(
-        sectionLightProbeRtCacheCells[cellIndex].packedRadiance45State.w,
-        ~sectionLightProbeRtCacheFaceInFlightBit(face));
-#endif
-}
-
 bool sectionLightSurfaceRtCacheAddress(
     vec3 worldPos,
     vec3 normal,
@@ -2302,40 +2221,6 @@ bool sectionLightSurfaceRtCacheAddress(
         probeCoord,
         ignoredProbeCenter);
     return cellIndex >= 0;
-#endif
-}
-
-bool readSectionLightSurfaceRtCache(
-    vec3 worldPos,
-    vec3 normal,
-    out vec3 incidentRadiance
-) {
-    incidentRadiance = vec3(0.0);
-#if SECTION_LIGHT_PROBE_RT_CACHE_ENABLE == 0
-    return false;
-#else
-    int cellIndex;
-    int face;
-    if (!sectionLightSurfaceRtCacheAddress(worldPos, normal, cellIndex, face)) {
-        return false;
-    }
-    return readSectionLightProbeRtCacheFaceRadiance(cellIndex, face, incidentRadiance);
-#endif
-}
-
-bool claimSectionLightSurfaceRtCache(
-    vec3 worldPos,
-    vec3 normal,
-    out int cellIndex,
-    out int face
-) {
-    cellIndex = -1;
-    face = sectionLightProbeDominantNormalFace(normal);
-#if SECTION_LIGHT_PROBE_RT_CACHE_ENABLE == 0
-    return false;
-#else
-    return sectionLightSurfaceRtCacheAddress(worldPos, normal, cellIndex, face)
-        && claimSectionLightProbeRtCacheFace(cellIndex, face);
 #endif
 }
 
@@ -2392,6 +2277,32 @@ void populateSectionLightProbeRtCacheCell(ivec3 sectionOrigin, ivec3 probeCoord)
         face3,
         face4,
         face5);
+#endif
+}
+
+void populateRequestedSectionLightProbeRtCacheCell() {
+#if SECTION_LIGHT_PROBE_RT_CACHE_ENABLE != 0
+    uint requestIndex = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
+    uint requestCount = min(
+        sectionLightProbeFillRequestHeader.x,
+        sectionLightProbeFillRequestHeader.z);
+    if (sectionLightProbeFillRequestHeader.y != sectionLightProbeRtCacheHeader.z
+            || requestIndex >= requestCount) {
+        return;
+    }
+
+    ivec4 request = sectionLightProbeFillRequests[requestIndex];
+    int probeIndex = request.w;
+    if (probeIndex < 0 || probeIndex >= SECTION_LIGHT_PROBE_CELL_COUNT) {
+        return;
+    }
+    int probeX = probeIndex % SECTION_LIGHT_PROBE_GRID_SIZE;
+    int probeY = (probeIndex / SECTION_LIGHT_PROBE_GRID_SIZE) % SECTION_LIGHT_PROBE_GRID_SIZE;
+    int probeZ = probeIndex
+        / (SECTION_LIGHT_PROBE_GRID_SIZE * SECTION_LIGHT_PROBE_GRID_SIZE);
+    populateSectionLightProbeRtCacheCell(
+        request.xyz,
+        ivec3(probeX, probeY, probeZ));
 #endif
 }
 
@@ -2873,6 +2784,33 @@ vec3 sampleSectionLightProbeVolume(
 }
 
 #if SECTION_LIGHT_PROBE_DEBUG_MODE != 0
+vec3 debugSectionLightProbeRtCacheState(vec3 worldPos, vec3 normal) {
+    int cellIndex;
+    int face;
+    if (!sectionLightSurfaceRtCacheAddress(worldPos, normal, cellIndex, face)) {
+        return vec3(1.0, 0.24, 0.02);
+    }
+
+    uint state = readSectionLightProbeRtCacheState(cellIndex);
+    uint faceMask = atomicAdd(
+        sectionLightProbeRtCacheCells[cellIndex].packedRadiance45State.w,
+        0u);
+    if (state == sectionLightProbeRtCacheInFlightState()
+            || (faceMask & sectionLightProbeRtCacheFaceInFlightBit(face)) != 0u) {
+        return vec3(1.0, 0.82, 0.05);
+    }
+    if (state == sectionLightProbeRtCacheReadyState()) {
+        if ((faceMask & sectionLightProbeRtCacheFaceReadyBit(face)) != 0u) {
+            return vec3(0.05, 0.95, 0.28);
+        }
+        return vec3(0.08, 0.38, 1.0);
+    }
+    if (state == SECTION_LIGHT_PROBE_RT_CACHE_EMPTY) {
+        return vec3(1.0, 0.24, 0.02);
+    }
+    return vec3(0.95, 0.02, 0.82);
+}
+
 vec3 sectionLightProbeDebugMissingPage(vec3 worldPos) {
     float checker = mod(floor(worldPos.x) + floor(worldPos.y) + floor(worldPos.z), 2.0);
     return mix(vec3(0.08, 0.0, 0.12), vec3(1.0, 0.0, 0.85), checker);
@@ -3069,6 +3007,8 @@ vec3 debugSectionLightProbeVolume(
     if (slot < 0) {
 #if SECTION_LIGHT_PROBE_DEBUG_MODE == 5
         return sectionLightDebugSourceMarker(worldPos, 0.0);
+#elif SECTION_LIGHT_PROBE_DEBUG_MODE == 6
+        return vec3(1.0, 0.24, 0.02);
 #else
         return sectionLightProbeDebugMissingPage(worldPos);
 #endif
@@ -3148,6 +3088,11 @@ vec3 debugSectionLightProbeVolume(
     return sectionLightProbeDebugCompare(probeLighting, tableLighting, lattice, blocklightRaw);
 #elif SECTION_LIGHT_PROBE_DEBUG_MODE == 5
     return sectionLightDebugSourceMarker(worldPos, lattice);
+#elif SECTION_LIGHT_PROBE_DEBUG_MODE == 6
+    return mix(
+        debugSectionLightProbeRtCacheState(worldPos, normal),
+        vec3(0.92),
+        lattice * 0.14);
 #else
     return vec3(1.0, 0.0, 1.0);
 #endif
@@ -3210,6 +3155,101 @@ vec3 traceSimpleRadiance(
         + surfaceColor * sunRadiance * nDotL * visibility * 0.55
         + ambient,
         vec3(0.0));
+}
+
+uint diffuseRadianceHashMix(uint value) {
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    return value ^ (value >> 16u);
+}
+
+uint diffuseRadianceCacheHash(ivec4 key) {
+    uint value = uint(key.x) * 0x9e3779b9u;
+    value ^= uint(key.y) * 0x85ebca6bu;
+    value ^= uint(key.z) * 0xc2b2ae35u;
+    value ^= uint(key.w) * 0x27d4eb2du;
+    return diffuseRadianceHashMix(value);
+}
+
+vec3 diffuseRadianceNormal(int bucket) {
+    if (bucket == 0) return vec3(1.0, 0.0, 0.0);
+    if (bucket == 1) return vec3(-1.0, 0.0, 0.0);
+    if (bucket == 2) return vec3(0.0, 1.0, 0.0);
+    if (bucket == 3) return vec3(0.0, -1.0, 0.0);
+    if (bucket == 4) return vec3(0.0, 0.0, 1.0);
+    return vec3(0.0, 0.0, -1.0);
+}
+
+int claimDiffuseRadianceCacheEntry(ivec4 key) {
+    uint entryCount = diffuseRadianceCacheHeader.x;
+    uint probeCount = min(diffuseRadianceCacheHeader.z, 8u);
+    if (entryCount == 0u || probeCount == 0u) {
+        return -1;
+    }
+
+    uint readyState = 0x80000000u | (diffuseRadianceCacheHeader.y & 0x3fffffffu);
+    uint fillState = 0x40000000u | (diffuseRadianceCacheHeader.y & 0x3fffffffu);
+    uint slot = diffuseRadianceCacheHash(key) % entryCount;
+    for (uint probe = 0u; probe < 8u; probe++) {
+        if (probe >= probeCount) break;
+        uint index = (slot + probe) % entryCount;
+        uint state = atomicAdd(diffuseRadianceCacheEntries[index].payload.y, 0u);
+        if (state == readyState && all(equal(diffuseRadianceCacheEntries[index].key, key))) {
+            return -1;
+        }
+        if (state == readyState || state == fillState) {
+            continue;
+        }
+        if (atomicCompSwap(diffuseRadianceCacheEntries[index].payload.y, state, fillState) == state) {
+            diffuseRadianceCacheEntries[index].key = key;
+            diffuseRadianceCacheEntries[index].payload.x = 0u;
+            diffuseRadianceCacheEntries[index].payload.z = 0u;
+            diffuseRadianceCacheEntries[index].payload.w = 0u;
+            return int(index);
+        }
+    }
+    return -1;
+}
+
+void populateRequestedDiffuseRadianceCache(vec3 sunDirection, vec3 sunRadiance) {
+    uint requestIndex = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
+    uint requestCount = min(diffuseRadianceFillRequestHeader.x, diffuseRadianceFillRequestHeader.z);
+    if (requestIndex >= requestCount
+            || diffuseRadianceFillRequestHeader.y != diffuseRadianceCacheHeader.y) {
+        return;
+    }
+
+    ivec4 key = diffuseRadianceFillRequests[requestIndex];
+    if (key.w < 0 || key.w > 5) {
+        return;
+    }
+    int entryIndex = claimDiffuseRadianceCacheEntry(key);
+    if (entryIndex < 0) {
+        return;
+    }
+
+    vec3 normal = diffuseRadianceNormal(key.w);
+    vec3 cellCenter = (vec3(key.xyz) + vec3(0.5)) * 2.0;
+    vec3 rayOrigin = cellCenter + normal * 0.94;
+    uint seed = diffuseRadianceCacheHash(key) ^ 0xa511e9b3u;
+    vec3 rayDirection = cosineWeightedHemisphere(normal, seed);
+    float hitDistance;
+    vec3 radiance = traceSimpleRadiance(
+        rayOrigin,
+        rayDirection,
+        sunDirection,
+        sunRadiance,
+        0.0,
+        hitDistance);
+
+    diffuseRadianceCacheEntries[entryIndex].payload.x = packSectionLightProbeRgb9E5(radiance);
+    diffuseRadianceCacheEntries[entryIndex].payload.z = 1u;
+    diffuseRadianceCacheEntries[entryIndex].payload.w = floatBitsToUint(hitDistance);
+    memoryBarrierBuffer();
+    uint readyState = 0x80000000u | (diffuseRadianceCacheHeader.y & 0x3fffffffu);
+    atomicExchange(diffuseRadianceCacheEntries[entryIndex].payload.y, readyState);
 }
 
 // ============================================================================
@@ -3313,6 +3353,12 @@ vec4 getDLSSDebugCellContent(int cellIndex, bool hit, vec3 albedo, vec3 normal, 
 }
 
 #if ENABLE_DLSS_RR
+// Vulkanite's DLSS/RR guide contract stores normalized world-space normals in
+// UNORM-style [0, 1] RGB even though the backing image is floating point.
+vec3 encodeDlssNormalGuide(vec3 worldNormal) {
+    return normalize(worldNormal) * 0.5 + 0.5;
+}
+
 void writeRadianceDlssSidecars(
     ivec2 pixel,
     vec3 diffuseAlbedo,
@@ -3328,7 +3374,7 @@ void writeRadianceDlssSidecars(
     imageStore(SpecularAlbedo, pixel,
         vec4(clamp(specularAlbedo, vec3(0.0), vec3(1.0)), 1.0));
     imageStore(NormalRoughness, pixel,
-        vec4(normalize(normal) * 0.5 + 0.5, clamp(roughness, 0.04, 1.0)));
+        vec4(encodeDlssNormalGuide(normal), clamp(roughness, 0.04, 1.0)));
     imageStore(FirstHitDepth, pixel, vec4(max(firstHitDepth, 0.0)));
     imageStore(SpecularHitDepth, pixel, vec4(max(specularHitDepth, 0.0)));
 }
@@ -3347,6 +3393,7 @@ void writeSkyDlssSidecars(ivec2 pixel) {
 // ============================================================================
 
 void main() {
+populateRequestedSectionLightProbeRtCacheCell();
 vec2 launchSize = vec2(gl_LaunchSizeEXT.xy);
 ivec2 screenCoord = ivec2(gl_LaunchIDEXT.xy);
 imageStore(blocklightDetailImage, screenCoord, vec4(0.0));
@@ -3533,6 +3580,7 @@ if (pc.debugMode == 1) {
   // Low sun = warm orange (sunset/sunrise), high sun = neutral white
   vec3 baseSunColor = vec3(pc.sunColorR, pc.sunColorG, pc.sunColorB) * SUN_INTENSITY;
   vec3 sunColor = getSunColorFromElevation(lightDir, baseSunColor);
+  populateRequestedDiffuseRadianceCache(lightDir, sunColor);
 
   vec4 color;
   vec2 motionVec = vec2(0.0);

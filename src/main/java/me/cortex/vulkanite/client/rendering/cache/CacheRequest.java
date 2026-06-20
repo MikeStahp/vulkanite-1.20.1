@@ -11,7 +11,8 @@ public record CacheRequest(
         float visibility,
         float error,
         float luma,
-        float distanceSquared) {
+        float distanceSquared,
+        CacheEntryVersionStamp versionStamp) {
     public CacheRequest {
         if (key == null) {
             throw new IllegalArgumentException("Cache request key must not be null");
@@ -21,6 +22,20 @@ public record CacheRequest(
         error = saturateFinite(error);
         luma = Math.max(0.0f, finiteOrZero(luma));
         distanceSquared = Math.max(0.0f, finiteOrZero(distanceSquared));
+        versionStamp = versionStamp == null ? CacheInvalidationTracker.global().capture(key) : versionStamp;
+    }
+
+    public CacheRequest(
+            CacheRequestKey key,
+            CacheRequestSource source,
+            int frameIndex,
+            int priorityHint,
+            float visibility,
+            float error,
+            float luma,
+            float distanceSquared) {
+        this(key, source, frameIndex, priorityHint, visibility, error, luma, distanceSquared,
+                CacheInvalidationTracker.global().capture(key));
     }
 
     public static CacheRequest sectionProbeCell(
@@ -49,7 +64,8 @@ public record CacheRequest(
                 Math.max(visibility, other.visibility()),
                 Math.max(error, other.error()),
                 Math.max(luma, other.luma()),
-                Math.min(distanceSquared, other.distanceSquared()));
+                Math.min(distanceSquared, other.distanceSquared()),
+                other.frameIndex() >= frameIndex ? other.versionStamp() : versionStamp);
     }
 
     public float priorityScore(int currentFrameIndex) {

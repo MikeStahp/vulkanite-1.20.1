@@ -1,5 +1,6 @@
 package me.cortex.vulkanite.client.rendering;
 
+import me.cortex.vulkanite.client.config.DLSSConfig;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.memory.VImage;
@@ -35,8 +36,7 @@ public class FSRUpscaler {
     
     // FSR state
     private boolean initialized;
-    // FIX: Use FSRQualityPreset from DLSSConfig instead of local duplicate
-    private me.cortex.vulkanite.client.config.DLSSConfig.FSRQualityPreset qualityPreset;
+    private DLSSConfig.QualityPreset qualityPreset;
     private boolean sharpeningEnabled;
     private float sharpeningStrength;
     
@@ -56,13 +56,10 @@ public class FSRUpscaler {
     private VRef<VImage> intermediateImage;
     private VRef<VImageView> intermediateView;
    
-    // FIX: Use FSRQualityPreset from DLSSConfig instead of duplicating the enum
-    // The enum is defined in me.cortex.vulkanite.client.config.DLSSConfig.FSRQualityPreset
-   
     public FSRUpscaler(VContext context) {
-    	this.context = context;
-    	this.initialized = false;
-    	this.qualityPreset = me.cortex.vulkanite.client.config.DLSSConfig.FSRQualityPreset.QUALITY;
+        this.context = context;
+        this.initialized = false;
+        this.qualityPreset = DLSSConfig.QualityPreset.QUALITY;
         this.sharpeningEnabled = true;
         this.sharpeningStrength = 0.5f;
         this.renderWidth = 1920;
@@ -83,12 +80,12 @@ public class FSRUpscaler {
      * @param sharpeningStrength Sharpening strength (0.0 to 1.0)
      * @return true if initialization succeeded
      */
-    public boolean initialize(me.cortex.vulkanite.client.config.DLSSConfig.FSRQualityPreset qualityPreset,
+    public boolean initialize(DLSSConfig.QualityPreset qualityPreset,
     	int outputWidth,
     	int outputHeight,
     	boolean sharpeningEnabled,
     	float sharpeningStrength) {
-    	this.qualityPreset = qualityPreset;
+        this.qualityPreset = qualityPreset == null ? DLSSConfig.QualityPreset.QUALITY : qualityPreset;
         this.outputWidth = outputWidth;
         this.outputHeight = outputHeight;
         this.sharpeningEnabled = sharpeningEnabled;
@@ -96,8 +93,8 @@ public class FSRUpscaler {
       
         // Calculate render resolution based on quality preset
         // FIX: Apply 8-pixel alignment for consistency with DLSS and GPU optimization
-        int baseRenderWidth = (int) (outputWidth * qualityPreset.getScale());
-        int baseRenderHeight = (int) (outputHeight * qualityPreset.getScale());
+        int baseRenderWidth = (int) (outputWidth * this.qualityPreset.getScale());
+        int baseRenderHeight = (int) (outputHeight * this.qualityPreset.getScale());
         this.renderWidth = (baseRenderWidth / 8) * 8;
         this.renderHeight = (baseRenderHeight / 8) * 8;
         // Ensure minimum size of 8x8
@@ -106,8 +103,8 @@ public class FSRUpscaler {
         
         System.out.println("[Vulkanite] FSR initialized: " + 
                           renderWidth + "x" + renderHeight + " -> " + 
-                          outputWidth + "x" + outputHeight + 
-                          " (preset: " + qualityPreset + 
+                          outputWidth + "x" + outputHeight +
+                          " (preset: " + this.qualityPreset +
                           ", sharpening: " + (sharpeningEnabled ? sharpeningStrength : "off") + ")");
         
         // Create input/output buffers
@@ -184,14 +181,17 @@ public class FSRUpscaler {
     /**
      * Get current quality preset
      */
-    public me.cortex.vulkanite.client.config.DLSSConfig.FSRQualityPreset getQualityPreset() {
+    public DLSSConfig.QualityPreset getQualityPreset() {
     	return qualityPreset;
     }
    
     /**
      * Set quality preset (will require reinitialization)
      */
-    public void setQualityPreset(me.cortex.vulkanite.client.config.DLSSConfig.FSRQualityPreset preset) {
+    public void setQualityPreset(DLSSConfig.QualityPreset preset) {
+        if (preset == null) {
+            preset = DLSSConfig.QualityPreset.QUALITY;
+        }
     	if (this.qualityPreset != preset) {
     		this.qualityPreset = preset;
     		this.initialized = false; // Require reinitialization

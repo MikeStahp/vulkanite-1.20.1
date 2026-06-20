@@ -4,6 +4,9 @@ import me.cortex.vulkanite.compat.ISectionLightBuildResult;
 import me.cortex.vulkanite.compat.SectionLight;
 import me.cortex.vulkanite.compat.SectionLightTable;
 import me.cortex.vulkanite.client.rendering.cache.CacheRequest;
+import me.cortex.vulkanite.client.rendering.cache.CacheRequestBatch;
+import me.cortex.vulkanite.client.rendering.cache.CacheRequestFamily;
+import me.cortex.vulkanite.client.rendering.cache.CacheInvalidationTracker;
 import me.cortex.vulkanite.client.rendering.cache.CacheRequestKey;
 import me.cortex.vulkanite.client.rendering.cache.CacheRequestQueue;
 import me.cortex.vulkanite.client.rendering.cache.CacheRequestSource;
@@ -82,6 +85,11 @@ public final class SectionLightManager {
             + (long) MAX_GPU_PROBE_PAGES * PROBE_PAGE_BYTES;
     private static final long PROBE_FEEDBACK_BUFFER_BYTES = PROBE_FEEDBACK_HEADER_BYTES
             + (long) PROBE_FEEDBACK_RECORD_COUNT * PROBE_FEEDBACK_RECORD_BYTES;
+    private static final int MAX_PROBE_FILL_REQUESTS = 256;
+    private static final int PROBE_FILL_REQUEST_HEADER_BYTES = 16;
+    private static final int PROBE_FILL_REQUEST_RECORD_BYTES = 16;
+    private static final int PROBE_FILL_REQUEST_BUFFER_BYTES = PROBE_FILL_REQUEST_HEADER_BYTES
+            + MAX_PROBE_FILL_REQUESTS * PROBE_FILL_REQUEST_RECORD_BYTES;
     private static final long PROBE_SHUTDOWN_JOIN_MS =
             Math.max(0L, Long.getLong("vulkanite.probeShutdownJoinMs", 2_000L));
 
@@ -101,6 +109,7 @@ public final class SectionLightManager {
     private final ArrayDeque<Integer> freeProbeSlots = new ArrayDeque<>();
     private final ArrayList<SectionLightTable> neighborTableScratch =
             new ArrayList<>(PROBE_LIGHT_CASCADE_SECTION_COUNT);
+    private final CacheInvalidationTracker cacheInvalidationTracker;
     private final ExecutorService probeBuildExecutor =
             Executors.newFixedThreadPool(PROBE_WORKER_COUNT, probeThreadFactory());
     private final ConcurrentLinkedQueue<ProbeBuildResult> completedProbeBuilds = new ConcurrentLinkedQueue<>();
@@ -117,6 +126,7 @@ public final class SectionLightManager {
     private boolean gpuDirty = true;
     private VRef<VBuffer> probeGpuBuffer;
     private VRef<VBuffer> probeFeedbackGpuBuffer;
+    private VRef<VBuffer> probeFillRequestGpuBuffer;
     private int probeSlotLimit;
     private int dirtyProbePageCount;
     private int neighborInfluenceDirtyMarks;
@@ -135,9 +145,15 @@ public final class SectionLightManager {
     private ByteBuffer probePageScratch;
     private ByteBuffer probeFeedbackHeaderScratch;
     private ByteBuffer probeFeedbackClearScratch;
+    private ByteBuffer probeFillRequestScratch;
     private volatile boolean destroyed;
 
     public SectionLightManager() {
+        this(CacheInvalidationTracker.global());
+    }
+
+    public SectionLightManager(CacheInvalidationTracker cacheInvalidationTracker) {
+        this.cacheInvalidationTracker = Objects.requireNonNull(cacheInvalidationTracker);
         LOGGER.info("[Vulkanite] Section light probe workers: {} of {} available processors",
                 PROBE_WORKER_COUNT, Runtime.getRuntime().availableProcessors());
     }
@@ -167,13 +183,17 @@ public final class SectionLightManager {
 
             SectionLightTable previous = activeTables.get(sectionPos);
             SectionLightTable retained = retainedTables.get(sectionPos);
+            SectionLightTable versionPrevious = previous != null ? previous : retained;
             boolean residentProbePage = activeProbePages.containsKey(sectionPos);
             boolean retainedProbeReusable = sectionBecameActive
                     && previous == null
                     && residentProbePage
                     && Objects.equals(retained, table);
             boolean tableChanged = previous == null ? table != null : !previous.equals(table);
+            boolean lightVersionChanged = sectionBecameActive || !sameLights(versionPrevious, table);
             boolean probeLightingChanged = tableChanged && !retainedProbeReusable;
+
+            cacheInvalidationTracker.recordSectionBuild(sectionPos, true, lightVersionChanged);
 
             if (table != null) {
                 batchLights += table.size();
@@ -232,6 +252,7 @@ public final class SectionLightManager {
             return;
         }
         ChunkSectionPos sectionPos = section.getPosition();
+        cacheInvalidationTracker.recordSectionRemoval(sectionPos);
         activeSectionPositions.remove(sectionPos);
         removeQueuedProbePage(sectionPos);
         removeQueuedProbeRtRequests(sectionPos);
@@ -452,6 +473,62 @@ public final class SectionLightManager {
         return probeFeedbackGpuBuffer.addRef();
     }
 
+    public synchronized VRef<VBuffer> ensureProbeFillRequestGpuBuffer(
+            VContext ctx,
+            VCmdBuff cmd,
+            CacheRequestBatch batch) {
+        ensureProbeFillRequestCapacity(ctx);
+
+        ByteBuffer data = probeFillRequestScratch(PROBE_FILL_REQUEST_BUFFER_BYTES);
+        data.putInt(0);
+        data.putInt(probeGpuVersion);
+        data.putInt(MAX_PROBE_FILL_REQUESTS);
+        data.putInt(0);
+
+        int requestCount = 0;
+        if (batch != null) {
+            for (CacheRequest request : batch.requests()) {
+                if (requestCount >= MAX_PROBE_FILL_REQUESTS
+                        || request.key().family() != CacheRequestFamily.SECTION_PROBE_CELL
+                        || !cacheInvalidationTracker.isCurrent(request.key(), request.versionStamp())) {
+                    continue;
+                }
+
+                ChunkSectionPos sectionPos = ChunkSectionPos.from(request.key().spatialKey());
+                SectionDirectionalProbePage page = activeProbePages.get(sectionPos);
+                int probeIndex = request.key().variantKey();
+                if (page == null || !page.hasPackedRadiance()
+                        || queuedDirtyProbePages.contains(sectionPos)
+                        || inFlightProbeBuilds.contains(sectionPos)
+                        || page.slot() < 0
+                        || probeIndex < 0
+                        || probeIndex >= SectionDirectionalProbePage.PROBE_COUNT) {
+                    continue;
+                }
+
+                data.putInt(sectionPos.getMinX());
+                data.putInt(sectionPos.getMinY());
+                data.putInt(sectionPos.getMinZ());
+                data.putInt(probeIndex);
+                requestCount++;
+            }
+        }
+
+        data.putInt(0, requestCount);
+        data.position(PROBE_FILL_REQUEST_HEADER_BYTES
+                + requestCount * PROBE_FILL_REQUEST_RECORD_BYTES);
+        data.flip();
+        int uploadBytes = data.remaining();
+        cmd.encodeDataUpload(ctx.memory, MemoryUtil.memAddress(data),
+                probeFillRequestGpuBuffer, 0, uploadBytes);
+        cmd.encodeBufferBarrier(probeFillRequestGpuBuffer, 0, uploadBytes,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT);
+        return probeFillRequestGpuBuffer.addRef();
+    }
+
     public synchronized int activeSectionCount() {
         return activeTables.size();
     }
@@ -488,12 +565,15 @@ public final class SectionLightManager {
             float distanceSquared = requestDistanceSquared(sectionPos, cameraSection);
             while (probeIndex < SectionDirectionalProbePage.PROBE_COUNT && emitted < maxRequests) {
                 CacheRequestKey key = CacheRequestKey.sectionProbeCell(sectionPos, probeIndex);
-                requests.enqueue(CacheRequest.sectionProbeCell(
+                CacheRequestQueue.EnqueueResult enqueueResult = requests.enqueue(CacheRequest.sectionProbeCell(
                         key,
                         CacheRequestSource.SECTION_DIRTY_QUEUE,
                         frameIndex,
                         page.probeLuma(probeIndex),
                         distanceSquared));
+                if (!enqueueResult.accepted()) {
+                    break;
+                }
                 probeIndex++;
                 emitted++;
             }
@@ -532,6 +612,7 @@ public final class SectionLightManager {
         inFlightProbeBuilds.clear();
         probeBuildVersions.clear();
         neighborTableScratch.clear();
+        cacheInvalidationTracker.clearSectionVersions();
         sortedTableCache = null;
         activeLightCount = 0;
         gpuDirty = true;
@@ -556,6 +637,10 @@ public final class SectionLightManager {
         if (probeFeedbackGpuBuffer != null) {
             probeFeedbackGpuBuffer.close();
             probeFeedbackGpuBuffer = null;
+        }
+        if (probeFillRequestGpuBuffer != null) {
+            probeFillRequestGpuBuffer.close();
+            probeFillRequestGpuBuffer = null;
         }
         gpuBufferCapacityBytes = 0;
         freeUploadScratchBuffers();
@@ -640,6 +725,18 @@ public final class SectionLightManager {
         probeFeedbackGpuBuffer.get().setDebugUtilsObjectName("Section directional light probe RT radiance cache");
         probeFeedbackHeaderDirty = true;
         probeFeedbackFullClearDirty = true;
+    }
+
+    private void ensureProbeFillRequestCapacity(VContext ctx) {
+        if (probeFillRequestGpuBuffer != null) {
+            return;
+        }
+
+        probeFillRequestGpuBuffer = ctx.memory.createBuffer(
+                PROBE_FILL_REQUEST_BUFFER_BYTES,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        probeFillRequestGpuBuffer.get().setDebugUtilsObjectName("Section probe RTX fill requests");
     }
 
     private int processDirtyProbePages(int maxPages) {
@@ -1016,6 +1113,11 @@ public final class SectionLightManager {
             return false;
         }
 
+        SectionDirectionalProbePage residentPage = activeProbePages.get(sectionPos);
+        if (residentPage != null) {
+            removeQueuedProbeRtRequests(sectionPos);
+            markProbeFeedbackSlotDirty(residentPage.slot());
+        }
         dirtyProbePageQueue.addLast(sectionPos);
         if (neighborInfluence) {
             neighborInfluenceDirtyMarks++;
@@ -1153,6 +1255,11 @@ public final class SectionLightManager {
         return probeFeedbackClearScratch;
     }
 
+    private ByteBuffer probeFillRequestScratch(int requiredBytes) {
+        probeFillRequestScratch = uploadScratch(probeFillRequestScratch, requiredBytes);
+        return probeFillRequestScratch;
+    }
+
     private static ByteBuffer uploadScratch(ByteBuffer scratch, int requiredBytes) {
         if (scratch == null || scratch.capacity() < requiredBytes) {
             if (scratch != null) {
@@ -1173,6 +1280,7 @@ public final class SectionLightManager {
         probePageScratch = freeUploadScratch(probePageScratch);
         probeFeedbackHeaderScratch = freeUploadScratch(probeFeedbackHeaderScratch);
         probeFeedbackClearScratch = freeUploadScratch(probeFeedbackClearScratch);
+        probeFillRequestScratch = freeUploadScratch(probeFillRequestScratch);
     }
 
     private static ByteBuffer freeUploadScratch(ByteBuffer scratch) {
@@ -1422,6 +1530,16 @@ public final class SectionLightManager {
             return 0.0f;
         }
         return (float) Math.min(sectionDistanceSquared(sectionPos, cameraSection), (long) Float.MAX_VALUE);
+    }
+
+    private static boolean sameLights(SectionLightTable left, SectionLightTable right) {
+        if (left == right) {
+            return true;
+        }
+        if (left == null || right == null) {
+            return false;
+        }
+        return left.lights().equals(right.lights());
     }
 
     private record DirtyProbeMarks(int total, int neighbor) {

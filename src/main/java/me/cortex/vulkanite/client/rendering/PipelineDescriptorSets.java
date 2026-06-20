@@ -60,6 +60,9 @@ public final class PipelineDescriptorSets {
                     new ShaderReflection.Binding("", 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
             });
 
     // Cache for base common set without G-buffer bindings (for full path tracers)
@@ -78,12 +81,14 @@ public final class PipelineDescriptorSets {
                     // Binding 12: Final output target
                     new ShaderReflection.Binding("", 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 0, false),
                     new ShaderReflection.Binding("", 24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
             });
 
     // Cache for VulkaniteRT hybrid set - matches actual bindings used by PBR
     // shaders
-    // Bindings: 0,1,2,3,4,5,6,7,8,9,10,12 (all PBR textures + G-buffer material,
-    // without 11 gbufferExtra)
+    // Includes VulkaniteRT's cache feedback/fill-request storage buffers at 24/25.
     private static final ShaderReflection.Set COMMON_SET_EXPECTED_VULKANITE_RT = new ShaderReflection.Set(
             new ShaderReflection.Binding[] {
                     new ShaderReflection.Binding("", 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, false),
@@ -115,6 +120,9 @@ public final class PipelineDescriptorSets {
                     new ShaderReflection.Binding("", 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
             });
 
     private PipelineDescriptorSets() {
@@ -161,6 +169,9 @@ public final class PipelineDescriptorSets {
                 new ShaderReflection.Binding("", 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                 new ShaderReflection.Binding("", 23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                 new ShaderReflection.Binding("", 24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                new ShaderReflection.Binding("", 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                new ShaderReflection.Binding("", 26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                new ShaderReflection.Binding("", 27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
         });
     }
 
@@ -185,7 +196,8 @@ public final class PipelineDescriptorSets {
      * Returns the cached VulkaniteRT hybrid descriptor set layout.
      * This matches the actual bindings used by VulkaniteRT (bindings that are
      * sampled).
-     * Contains bindings: 0,1,2,3,6,7,9,10,12 (WITHOUT unused PBR bindings 4,5,8,11)
+     * Includes the complete reflected VulkaniteRT set, including cache bindings 24
+     * and 25.
      */
     public static ShaderReflection.Set createCommonSetExpectedVulkaniteRT() {
         return COMMON_SET_EXPECTED_VULKANITE_RT;

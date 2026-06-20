@@ -308,17 +308,11 @@ public class DLSSDParameterValidator {
 
 		logInfo(String.format(" Quality Mode Value: %d", params.qualityMode));
 
-		// Map quality mode to name (based on NVSDK_NGX_PerfQuality_Value)
-		String qualityName;
-		switch (params.qualityMode) {
-			case 0: qualityName = "PERFORMANCE (MaxPerf, 0.5x)"; break;
-			case 1: qualityName = "BALANCED (0.583x)"; break;
-			case 2: qualityName = "QUALITY (MaxQuality, 0.667x)"; break;
-			case 3: qualityName = "ULTRA_PERFORMANCE (0.333x)"; break;
-			case 4: qualityName = "ULTRA_QUALITY (0.77x)"; break;
-			case 5: qualityName = "DLAA (1.0x, no upscaling)"; break;
-			default: qualityName = "UNKNOWN"; break;
-		}
+		// Map quality mode to the shared config enum used by runtime code.
+		DLSSConfig.QualityPreset preset = DLSSConfig.QualityPreset.fromNgxValue(params.qualityMode);
+		String qualityName = preset == null
+                ? "UNKNOWN"
+                : String.format("%s (%s, %.3fx)", preset.name(), preset.getDisplayName(), preset.getScale());
 		logInfo(String.format(" Quality Mode Name: %s", qualityName));
 
 		// Validate range (0-5 based on SDK)

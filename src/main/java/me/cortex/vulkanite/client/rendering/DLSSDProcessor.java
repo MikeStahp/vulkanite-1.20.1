@@ -209,6 +209,7 @@ public class DLSSDProcessor {
                 && !mc.isPaused()
                 && config != null
                 && config.isEnabled()
+                && config.usesDLSSBackend()
                 && !config.isDebugEnabled()
                 && supported;
     }

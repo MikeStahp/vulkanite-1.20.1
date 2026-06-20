@@ -33,7 +33,7 @@ public class MixinGameRenderer {
         }
 
         DLSSConfig config = DLSSConfig.load();
-        boolean jitterEnabled = config.isEnabled() && config.isJitterEnabled() && !config.isDebugEnabled();
+        boolean jitterEnabled = config.usesDLSSBackend() && config.isJitterEnabled() && !config.isDebugEnabled();
         JitterManager.setEnabled(jitterEnabled);
         if (!jitterEnabled || !JitterManager.isDLSSActive()) {
             return;

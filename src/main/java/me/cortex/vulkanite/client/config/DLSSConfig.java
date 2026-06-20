@@ -6,6 +6,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
+import java.util.Locale;
+import java.util.Objects;
 import java.util.Properties;
 
 /**
@@ -83,27 +85,35 @@ public class DLSSConfig {
     	public float getScale() { return resolutionRatio; }
     	public String getDisplayName() { return displayName; }
     	public String getDescription() { return description; }
-    }
 
-    /**
-     * FSR Quality preset - separate enum for FSR-specific scaling
-     */
-    public enum FSRQualityPreset {
-        QUALITY(0.667f, "Quality"),
-        BALANCED(0.583f, "Balanced"),
-        PERFORMANCE(0.5f, "Performance"),
-        ULTRA_PERFORMANCE(0.333f, "Ultra Performance");
-
-        private final float scale;
-        private final String displayName;
-
-        FSRQualityPreset(float scale, String displayName) {
-            this.scale = scale;
-            this.displayName = displayName;
+        public static QualityPreset fromNgxValue(int ngxValue) {
+            for (QualityPreset preset : values()) {
+                if (preset.ngxValue == ngxValue) {
+                    return preset;
+                }
+            }
+            return null;
         }
 
-        public float getScale() { return scale; }
-        public String getDisplayName() { return displayName; }
+        public static QualityPreset fromLegacyFsrQuality(int quality) {
+            switch (quality) {
+                case 0: return QUALITY;
+                case 1: return BALANCED;
+                case 2: return PERFORMANCE;
+                case 3: return ULTRA_PERFORMANCE;
+                default: return BALANCED;
+            }
+        }
+
+        public int getLegacyFsrQuality() {
+            switch (this) {
+                case QUALITY: return 0;
+                case BALANCED: return 1;
+                case PERFORMANCE: return 2;
+                case ULTRA_PERFORMANCE: return 3;
+                default: return 1;
+            }
+        }
     }
 
     /**
@@ -165,7 +175,6 @@ public class DLSSConfig {
 
     // FSR Settings
     private boolean fsrEnabled = false;
-    private int fsrQuality = 1; // 0=Quality, 1=Balanced, 2=Performance, 3=Ultra Performance
 
     // ReSTIR Settings
     private boolean restirEnabled = false;
@@ -223,42 +232,64 @@ public class DLSSConfig {
         Properties props = new Properties();
         try (FileReader reader = new FileReader(configFile)) {
             props.load(reader);
+            dirty = false;
 
             // Core DLSS Settings
-            dlssEnabled = Boolean.parseBoolean(props.getProperty("dlssEnabled", "true"));
-            rayReconstructionEnabled = Boolean.parseBoolean(props.getProperty("rayReconstructionEnabled", "true"));
-            denoiserType = parseDenoiserType(props.getProperty("denoiserType", "DLSS_RR"));
-            qualityPreset = parseQualityPreset(props.getProperty("qualityPreset", "QUALITY"));
-            debugType = parseDebugType(props.getProperty("debugType", "NONE"));
-            sharpness = Float.parseFloat(props.getProperty("sharpness", "0.5"));
-            motionVectorsEnabled = Boolean.parseBoolean(props.getProperty("motionVectorsEnabled", "true"));
-            jitterEnabled = Boolean.parseBoolean(props.getProperty("jitterEnabled", "true"));
+            dlssEnabled = parseBoolean(props, "dlssEnabled", true);
+            rayReconstructionEnabled = parseBoolean(props, "rayReconstructionEnabled", true);
+            boolean hasDenoiserType = props.containsKey("denoiserType");
+            denoiserType = parseDenoiserType(props.getProperty("denoiserType"), DenoiserType.DLSS_RR);
+            qualityPreset = parseQualityPreset("qualityPreset", props.getProperty("qualityPreset"), QualityPreset.QUALITY);
+            debugType = parseDebugType(props.getProperty("debugType"), DebugType.NONE);
+            sharpness = parseFloat(props, "sharpness", 0.5f, 0.0f, 1.0f);
+            motionVectorsEnabled = parseBoolean(props, "motionVectorsEnabled", true);
+            jitterEnabled = parseBoolean(props, "jitterEnabled", true);
 
             // FSR Settings
-            fsrEnabled = Boolean.parseBoolean(props.getProperty("fsrEnabled", "false"));
-            fsrQuality = Integer.parseInt(props.getProperty("fsrQuality", "1"));
+            fsrEnabled = parseBoolean(props, "fsrEnabled", false);
+            if (!hasDenoiserType && fsrEnabled) {
+                denoiserType = DenoiserType.FSR;
+                dirty = true;
+            }
+            boolean expectedFsrEnabled = denoiserType == DenoiserType.FSR;
+            if (fsrEnabled != expectedFsrEnabled) {
+                fsrEnabled = expectedFsrEnabled;
+                dirty = true;
+            }
+            if (!props.containsKey("qualityPreset")) {
+                if (props.containsKey("fsrQualityPreset")) {
+                    qualityPreset = parseQualityPreset("fsrQualityPreset", props.getProperty("fsrQualityPreset"), QualityPreset.BALANCED);
+                    dirty = true;
+                } else if (props.containsKey("fsrQuality")) {
+                    int legacyFsrQuality = parseInt(props, "fsrQuality", 1, 0, 3);
+                    qualityPreset = QualityPreset.fromLegacyFsrQuality(legacyFsrQuality);
+                    dirty = true;
+                }
+            }
 
             // ReSTIR Settings
-            restirEnabled = Boolean.parseBoolean(props.getProperty("restirEnabled", "false"));
+            restirEnabled = parseBoolean(props, "restirEnabled", false);
 
             // World/Lighting Parameters
-            indirectScale = Float.parseFloat(props.getProperty("indirectScale", "1.0"));
-            ambientFactor = Float.parseFloat(props.getProperty("ambientFactor", "0.1"));
-            minLighting = Float.parseFloat(props.getProperty("minLighting", "0.01"));
-            specularIntensity = Float.parseFloat(props.getProperty("specularIntensity", "1.0"));
-            gamma = Float.parseFloat(props.getProperty("gamma", "2.2"));
+            indirectScale = parseFloat(props, "indirectScale", 1.0f, 0.0f, Float.MAX_VALUE);
+            ambientFactor = parseFloat(props, "ambientFactor", 0.1f, 0.0f, 1.0f);
+            minLighting = parseFloat(props, "minLighting", 0.01f, 0.0f, 1.0f);
+            specularIntensity = parseFloat(props, "specularIntensity", 1.0f, 0.0f, Float.MAX_VALUE);
+            gamma = parseFloat(props, "gamma", 2.2f, 1.0f, 3.0f);
 
             // Debug Settings
-            debugCellIndex = Integer.parseInt(props.getProperty("debugCellIndex", "-1"));
+            debugCellIndex = parseInt(props, "debugCellIndex", -1, -1, Integer.MAX_VALUE);
 
             LOGGER.info("[Vulkanite] DLSS config loaded: denoiser={}, quality={}, restir={}", 
                 denoiserType, qualityPreset, restirEnabled);
 
+            if (dirty) {
+                LOGGER.info("[Vulkanite] DLSS config contained invalid or legacy values, writing normalized config");
+                saveConfig();
+            }
+
         } catch (IOException e) {
             LOGGER.error("[Vulkanite] Failed to load DLSS config: {}", e.getMessage());
-            saveConfig(); // Save defaults
-        } catch (NumberFormatException e) {
-            LOGGER.error("[Vulkanite] Invalid config value: {}", e.getMessage());
             saveConfig(); // Save defaults
         }
     }
@@ -287,7 +318,8 @@ public class DLSSConfig {
 
         // FSR Settings
         props.setProperty("fsrEnabled", String.valueOf(fsrEnabled));
-        props.setProperty("fsrQuality", String.valueOf(fsrQuality));
+        props.setProperty("fsrQualityPreset", qualityPreset.name());
+        props.setProperty("fsrQuality", String.valueOf(qualityPreset.getLegacyFsrQuality()));
 
         // ReSTIR Settings
         props.setProperty("restirEnabled", String.valueOf(restirEnabled));
@@ -315,28 +347,109 @@ public class DLSSConfig {
     // PARSING HELPERS
     // =====================================================================
 
-    private DenoiserType parseDenoiserType(String value) {
+    private boolean parseBoolean(Properties props, String key, boolean fallback) {
+        String value = props.getProperty(key);
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        if ("true".equals(normalized)) {
+            return true;
+        }
+        if ("false".equals(normalized)) {
+            return false;
+        }
+
+        logNormalizedValue(key, value, fallback);
+        return fallback;
+    }
+
+    private int parseInt(Properties props, String key, int fallback, int min, int max) {
+        String value = props.getProperty(key);
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+
         try {
-            return DenoiserType.valueOf(value.toUpperCase());
-        } catch (IllegalArgumentException e) {
-            return DenoiserType.DLSS_RR;
+            int parsed = Integer.parseInt(value.trim());
+            int clamped = Math.max(min, Math.min(max, parsed));
+            if (clamped != parsed) {
+                logNormalizedValue(key, value, clamped);
+            }
+            return clamped;
+        } catch (NumberFormatException e) {
+            logNormalizedValue(key, value, fallback);
+            return fallback;
         }
     }
 
-    private QualityPreset parseQualityPreset(String value) {
+    private float parseFloat(Properties props, String key, float fallback, float min, float max) {
+        String value = props.getProperty(key);
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+
         try {
-            return QualityPreset.valueOf(value.toUpperCase());
-        } catch (IllegalArgumentException e) {
-            return QualityPreset.QUALITY;
+            float parsed = Float.parseFloat(value.trim());
+            if (!Float.isFinite(parsed)) {
+                logNormalizedValue(key, value, fallback);
+                return fallback;
+            }
+
+            float clamped = Math.max(min, Math.min(max, parsed));
+            if (Float.compare(clamped, parsed) != 0) {
+                logNormalizedValue(key, value, clamped);
+            }
+            return clamped;
+        } catch (NumberFormatException e) {
+            logNormalizedValue(key, value, fallback);
+            return fallback;
         }
     }
 
-    private DebugType parseDebugType(String value) {
-        try {
-            return DebugType.valueOf(value.toUpperCase());
-        } catch (IllegalArgumentException e) {
-            return DebugType.NONE;
+    private DenoiserType parseDenoiserType(String value, DenoiserType fallback) {
+        if (value == null || value.isBlank()) {
+            return fallback;
         }
+
+        try {
+            return DenoiserType.valueOf(value.trim().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            logNormalizedValue("denoiserType", value, fallback);
+            return fallback;
+        }
+    }
+
+    private QualityPreset parseQualityPreset(String key, String value, QualityPreset fallback) {
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+
+        try {
+            return QualityPreset.valueOf(value.trim().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            logNormalizedValue(key, value, fallback);
+            return fallback;
+        }
+    }
+
+    private DebugType parseDebugType(String value, DebugType fallback) {
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+
+        try {
+            return DebugType.valueOf(value.trim().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            logNormalizedValue("debugType", value, fallback);
+            return fallback;
+        }
+    }
+
+    private void logNormalizedValue(String key, Object oldValue, Object newValue) {
+        LOGGER.warn("[Vulkanite] Invalid DLSS config value for {}='{}'; using {}", key, oldValue, newValue);
+        dirty = true;
     }
 
     // =====================================================================
@@ -351,6 +464,14 @@ public class DLSSConfig {
 
     public boolean isRayReconstructionEnabled() { 
         return rayReconstructionEnabled && (denoiserType == DenoiserType.DLSS_RR || denoiserType == DenoiserType.DLSS); 
+    }
+
+    public boolean usesDLSSBackend() {
+        return dlssEnabled && (denoiserType == DenoiserType.DLSS || denoiserType == DenoiserType.DLSS_RR);
+    }
+
+    public boolean usesFSRBackend() {
+        return dlssEnabled && denoiserType == DenoiserType.FSR;
     }
 
     public DenoiserType getDenoiserType() { return denoiserType; }
@@ -383,18 +504,12 @@ public class DLSSConfig {
     // GETTERS - FSR Settings
     // =====================================================================
 
-    public boolean isFSREnabled() { return fsrEnabled; }
+    public boolean isFSREnabled() { return usesFSRBackend(); }
 
-    public int getFSRQuality() { return fsrQuality; }
+    public int getFSRQuality() { return qualityPreset.getLegacyFsrQuality(); }
 
-    public FSRQualityPreset getFSRQualityPreset() {
-        switch (fsrQuality) {
-            case 0: return FSRQualityPreset.QUALITY;
-            case 1: return FSRQualityPreset.BALANCED;
-            case 2: return FSRQualityPreset.PERFORMANCE;
-            case 3: return FSRQualityPreset.ULTRA_PERFORMANCE;
-            default: return FSRQualityPreset.BALANCED;
-        }
+    public QualityPreset getFSRQualityPreset() {
+        return qualityPreset;
     }
 
     // =====================================================================
@@ -423,44 +538,62 @@ public class DLSSConfig {
     // SETTERS - Core DLSS Settings
     // =====================================================================
 
+    private void markChanged(String key, Object oldValue, Object newValue) {
+        if (!Objects.equals(oldValue, newValue)) {
+            LOGGER.info("[Vulkanite] DLSS config changed: {}={} -> {}", key, oldValue, newValue);
+            dirty = true;
+        }
+    }
+
     public void setDLSSEnabled(boolean enabled) { 
-        this.dlssEnabled = enabled; 
-        this.dirty = true;
+        boolean oldValue = this.dlssEnabled;
+        this.dlssEnabled = enabled;
+        markChanged("dlssEnabled", oldValue, this.dlssEnabled);
     }
 
     public void setRayReconstructionEnabled(boolean enabled) { 
-        this.rayReconstructionEnabled = enabled; 
-        this.dirty = true;
+        boolean oldValue = this.rayReconstructionEnabled;
+        this.rayReconstructionEnabled = enabled;
+        markChanged("rayReconstructionEnabled", oldValue, this.rayReconstructionEnabled);
     }
 
     public void setDenoiserType(DenoiserType type) { 
-        this.denoiserType = type; 
-        this.dirty = true;
+        DenoiserType oldValue = this.denoiserType;
+        boolean oldFsrEnabled = this.fsrEnabled;
+        this.denoiserType = type == null ? DenoiserType.NONE : type;
+        this.fsrEnabled = this.denoiserType == DenoiserType.FSR;
+        markChanged("denoiserType", oldValue, this.denoiserType);
+        markChanged("fsrEnabled", oldFsrEnabled, this.fsrEnabled);
     }
 
     public void setQualityPreset(QualityPreset preset) { 
-        this.qualityPreset = preset; 
-        this.dirty = true;
+        QualityPreset oldValue = this.qualityPreset;
+        this.qualityPreset = preset == null ? QualityPreset.QUALITY : preset;
+        markChanged("qualityPreset", oldValue, this.qualityPreset);
     }
 
     public void setDebugType(DebugType type) { 
-        this.debugType = type; 
-        this.dirty = true;
+        DebugType oldValue = this.debugType;
+        this.debugType = type == null ? DebugType.NONE : type;
+        markChanged("debugType", oldValue, this.debugType);
     }
 
     public void setSharpness(float sharpness) { 
-        this.sharpness = Math.max(0.0f, Math.min(1.0f, sharpness)); 
-        this.dirty = true;
+        float oldValue = this.sharpness;
+        this.sharpness = Math.max(0.0f, Math.min(1.0f, sharpness));
+        markChanged("sharpness", oldValue, this.sharpness);
     }
 
     public void setMotionVectorsEnabled(boolean enabled) { 
-        this.motionVectorsEnabled = enabled; 
-        this.dirty = true;
+        boolean oldValue = this.motionVectorsEnabled;
+        this.motionVectorsEnabled = enabled;
+        markChanged("motionVectorsEnabled", oldValue, this.motionVectorsEnabled);
     }
 
     public void setJitterEnabled(boolean enabled) { 
-        this.jitterEnabled = enabled; 
-        this.dirty = true;
+        boolean oldValue = this.jitterEnabled;
+        this.jitterEnabled = enabled;
+        markChanged("jitterEnabled", oldValue, this.jitterEnabled);
     }
 
     // =====================================================================
@@ -468,13 +601,27 @@ public class DLSSConfig {
     // =====================================================================
 
     public void setFSREnabled(boolean enabled) { 
-        this.fsrEnabled = enabled; 
-        this.dirty = true;
+        boolean oldFsrEnabled = this.fsrEnabled;
+        boolean oldDLSSEnabled = this.dlssEnabled;
+        DenoiserType oldDenoiserType = this.denoiserType;
+        this.fsrEnabled = enabled;
+        if (enabled) {
+            this.dlssEnabled = true;
+            this.denoiserType = DenoiserType.FSR;
+        } else if (this.denoiserType == DenoiserType.FSR) {
+            this.denoiserType = DenoiserType.NONE;
+        }
+        markChanged("fsrEnabled", oldFsrEnabled, this.fsrEnabled);
+        markChanged("dlssEnabled", oldDLSSEnabled, this.dlssEnabled);
+        markChanged("denoiserType", oldDenoiserType, this.denoiserType);
     }
 
     public void setFSRQuality(int quality) { 
-        this.fsrQuality = Math.max(0, Math.min(3, quality)); 
-        this.dirty = true;
+        setQualityPreset(QualityPreset.fromLegacyFsrQuality(quality));
+    }
+
+    public void setFSRQualityPreset(QualityPreset preset) {
+        setQualityPreset(preset == null ? QualityPreset.BALANCED : preset);
     }
 
     // =====================================================================
@@ -482,8 +629,9 @@ public class DLSSConfig {
     // =====================================================================
 
     public void setReSTIREnabled(boolean enabled) { 
-        this.restirEnabled = enabled; 
-        this.dirty = true;
+        boolean oldValue = this.restirEnabled;
+        this.restirEnabled = enabled;
+        markChanged("restirEnabled", oldValue, this.restirEnabled);
     }
 
     // =====================================================================
@@ -491,28 +639,33 @@ public class DLSSConfig {
     // =====================================================================
 
     public void setIndirectScale(float scale) { 
-        this.indirectScale = Math.max(0.0f, scale); 
-        this.dirty = true;
+        float oldValue = this.indirectScale;
+        this.indirectScale = Math.max(0.0f, scale);
+        markChanged("indirectScale", oldValue, this.indirectScale);
     }
 
     public void setAmbientFactor(float factor) { 
-        this.ambientFactor = Math.max(0.0f, Math.min(1.0f, factor)); 
-        this.dirty = true;
+        float oldValue = this.ambientFactor;
+        this.ambientFactor = Math.max(0.0f, Math.min(1.0f, factor));
+        markChanged("ambientFactor", oldValue, this.ambientFactor);
     }
 
     public void setMinLighting(float min) { 
-        this.minLighting = Math.max(0.0f, Math.min(1.0f, min)); 
-        this.dirty = true;
+        float oldValue = this.minLighting;
+        this.minLighting = Math.max(0.0f, Math.min(1.0f, min));
+        markChanged("minLighting", oldValue, this.minLighting);
     }
 
     public void setSpecularIntensity(float intensity) { 
-        this.specularIntensity = Math.max(0.0f, intensity); 
-        this.dirty = true;
+        float oldValue = this.specularIntensity;
+        this.specularIntensity = Math.max(0.0f, intensity);
+        markChanged("specularIntensity", oldValue, this.specularIntensity);
     }
 
     public void setGamma(float gamma) { 
-        this.gamma = Math.max(1.0f, Math.min(3.0f, gamma)); 
-        this.dirty = true;
+        float oldValue = this.gamma;
+        this.gamma = Math.max(1.0f, Math.min(3.0f, gamma));
+        markChanged("gamma", oldValue, this.gamma);
     }
 
     // =====================================================================
@@ -520,8 +673,9 @@ public class DLSSConfig {
     // =====================================================================
 
     public void setDebugCellIndex(int index) {
+        int oldValue = this.debugCellIndex;
         this.debugCellIndex = index;
-        this.dirty = true;
+        markChanged("debugCellIndex", oldValue, this.debugCellIndex);
     }
 
     // =====================================================================
@@ -574,7 +728,7 @@ public class DLSSConfig {
             case DLSS_RR:
                 return qualityPreset.getScale();
             case FSR:
-                return getFSRQualityPreset().getScale();
+                return qualityPreset.getScale();
             default:
                 return 1.0f;
         }
@@ -593,7 +747,6 @@ public class DLSSConfig {
         motionVectorsEnabled = true;
         jitterEnabled = true;
         fsrEnabled = false;
-        fsrQuality = 1;
         restirEnabled = false;
         indirectScale = 1.0f;
         ambientFactor = 0.1f;

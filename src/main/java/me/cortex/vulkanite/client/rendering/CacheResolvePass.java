@@ -7,6 +7,7 @@ import me.cortex.vulkanite.lib.descriptors.DescriptorUpdateBuilder;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorPool;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorSet;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorSetLayout;
+import me.cortex.vulkanite.lib.memory.VBuffer;
 import me.cortex.vulkanite.lib.memory.VImage;
 import me.cortex.vulkanite.lib.other.VImageView;
 import me.cortex.vulkanite.lib.other.VSampler;
@@ -101,6 +102,7 @@ final class CacheResolvePass {
             updater.imageStore(19, createView(frame.specularHitDepth(), resourcesToClose));
             updater.imageStore(20, createView(frame.firstHitDepth(), resourcesToClose));
             updater.imageStore(21, createView(frame.blocklightDetail(), resourcesToClose));
+            bindOptionalStorageBuffer(updater, frame.diffuseRadianceCacheBuffer(), 26);
             updater.apply();
 
             cmdPushConstants(frame, clearReservoir);
@@ -151,6 +153,12 @@ final class CacheResolvePass {
         VRef<VImageView> view = VImageView.create(ctx, image);
         resourcesToClose.add(view);
         return view;
+    }
+
+    private void bindOptionalStorageBuffer(DescriptorUpdateBuilder updater, VRef<VBuffer> buffer, int binding) {
+        if (setReflection.getBindingAt(binding) != null && buffer != null) {
+            updater.buffer(binding, buffer);
+        }
     }
 
     void destroy() {
@@ -208,6 +216,18 @@ final class CacheResolvePass {
             layout(binding = 20, r16f) uniform image2D FirstHitDepth;
             layout(binding = 21, rgba16f) uniform image2D blocklightDetailImage;
 
+            struct DiffuseRadianceCacheEntry {
+                ivec4 key;
+                uvec4 payload;
+            };
+
+            layout(binding = 26, std430) readonly buffer DiffuseRadianceCacheBuffer {
+                uvec4 diffuseRadianceCacheHeader;
+                DiffuseRadianceCacheEntry diffuseRadianceCacheEntries[];
+            };
+
+            const float UNKNOWN_SPECULAR_HIT_DISTANCE = 10000.0;
+
             bool finiteVec4(vec4 value) {
                 return !any(isnan(value)) && !any(isinf(value));
             }
@@ -239,6 +259,69 @@ final class CacheResolvePass {
                 vec3 daySky = mix(vec3(0.45, 0.56, 0.72), vec3(0.10, 0.26, 0.62), up);
                 float sunDisk = pow(max(dot(direction, lightDir), 0.0), 512.0);
                 return mix(nightSky, daySky, day) + sunColor * sunDisk * day;
+            }
+
+            uint diffuseRadianceHashMix(uint value) {
+                value ^= value >> 16u;
+                value *= 0x7feb352du;
+                value ^= value >> 15u;
+                value *= 0x846ca68bu;
+                return value ^ (value >> 16u);
+            }
+
+            uint diffuseRadianceCacheHash(ivec4 key) {
+                uint value = uint(key.x) * 0x9e3779b9u;
+                value ^= uint(key.y) * 0x85ebca6bu;
+                value ^= uint(key.z) * 0xc2b2ae35u;
+                value ^= uint(key.w) * 0x27d4eb2du;
+                return diffuseRadianceHashMix(value);
+            }
+
+            int diffuseRadianceNormalBucket(vec3 normal) {
+                vec3 axis = abs(normal);
+                if (axis.x >= axis.y && axis.x >= axis.z) return normal.x >= 0.0 ? 0 : 1;
+                if (axis.y >= axis.z) return normal.y >= 0.0 ? 2 : 3;
+                return normal.z >= 0.0 ? 4 : 5;
+            }
+
+            vec3 unpackDiffuseRadiance(uint packed) {
+                if (packed == 0u) return vec3(0.0);
+                uvec3 mantissa = uvec3(
+                    packed & 511u,
+                    (packed >> 9u) & 511u,
+                    (packed >> 18u) & 511u);
+                uint exponent = (packed >> 27u) & 31u;
+                float scale = exp2(float(exponent) - 24.0);
+                return vec3(mantissa) * scale;
+            }
+
+            bool readDiffuseRadianceCache(ivec4 key, out vec3 radiance, out float confidence) {
+                radiance = vec3(0.0);
+                confidence = 0.0;
+                uint entryCount = diffuseRadianceCacheHeader.x;
+                uint probeCount = min(diffuseRadianceCacheHeader.z, 8u);
+                if (entryCount == 0u || probeCount == 0u) return false;
+
+                uint readyState = 0x80000000u | (diffuseRadianceCacheHeader.y & 0x3fffffffu);
+                uint slot = diffuseRadianceCacheHash(key) % entryCount;
+                for (uint probe = 0u; probe < 8u; probe++) {
+                    if (probe >= probeCount) break;
+                    uint index = (slot + probe) % entryCount;
+                    DiffuseRadianceCacheEntry entry = diffuseRadianceCacheEntries[index];
+                    if (entry.payload.y == readyState && all(equal(entry.key, key))) {
+                        radiance = unpackDiffuseRadiance(entry.payload.x);
+                        float hitDistance = uintBitsToFloat(entry.payload.w);
+                        float distanceConfidence = hitDistance < 0.08 ? 0.15 : 1.0;
+                        confidence = 0.45 * distanceConfidence;
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            // Match ray0.rgen: normalized world-space normals use [0, 1] RGB.
+            vec3 encodeDlssNormalGuide(vec3 worldNormal) {
+                return normalize(worldNormal) * 0.5 + 0.5;
             }
 
             vec4 debugCell(
@@ -358,9 +441,11 @@ final class CacheResolvePass {
                 imageStore(linearDepthImage, pixel, vec4(linearDepth));
                 imageStore(DiffuseAlbedoMetallic, pixel, vec4(clamp(albedo, vec3(0.0), vec3(1.0)), metallic));
                 imageStore(SpecularAlbedo, pixel, vec4(f0, 1.0));
-                imageStore(NormalRoughness, pixel, vec4(normal * 0.5 + 0.5, roughness));
+                imageStore(NormalRoughness, pixel, vec4(encodeDlssNormalGuide(normal), roughness));
                 imageStore(FirstHitDepth, pixel, vec4(linearDepth));
-                imageStore(SpecularHitDepth, pixel, vec4(linearDepth));
+                // No reflection/refraction cache has supplied a continuation hit.
+                // First-surface depth is not a valid specular hit-distance guide.
+                imageStore(SpecularHitDepth, pixel, vec4(UNKNOWN_SPECULAR_HIT_DISTANCE));
 
                 float nDotL = max(dot(normal, lightDir), 0.0);
                 float day = smoothstep(-0.15, 0.25, lightDir.y);
@@ -368,13 +453,27 @@ final class CacheResolvePass {
                 vec3 direct = albedo * sunColor * nDotL * (0.18 + 0.82 * skylight) * (0.25 + 0.75 * ao);
                 vec3 ambient = albedo * skyAmbient * (0.10 + 0.40 * skylight) * (0.30 + 0.70 * ao);
                 vec3 localLight = albedo * blocklight * vec3(1.0, 0.78, 0.48) * 1.15;
+                ivec4 cacheKey = ivec4(
+                    ivec3(floor(absWorldPos * 0.5)),
+                    diffuseRadianceNormalBucket(normal));
+                vec3 cachedIncident;
+                float cacheConfidence;
+                bool cacheHit = readDiffuseRadianceCache(cacheKey, cachedIncident, cacheConfidence);
+                vec3 diffuseResponse = albedo * max(vec3(1.0) - f0, vec3(0.0)) * (1.0 - metallic);
+                vec3 fallbackIndirect = ambient + localLight;
+                vec3 cachedIndirect = cachedIncident * diffuseResponse + ambient * 0.20 + localLight * 0.25;
+                vec3 diffuseIndirect = cacheHit
+                    ? mix(fallbackIndirect, cachedIndirect, cacheConfidence)
+                    : fallbackIndirect;
                 vec3 halfway = normalize(lightDir + viewDir);
                 float specPower = mix(96.0, 8.0, roughness);
                 vec3 specular = f0 * pow(max(dot(normal, halfway), 0.0), specPower) * nDotL * (1.0 - roughness * 0.65);
                 vec3 minLight = albedo * 0.004 * (0.2 + 0.8 * ao);
-                vec3 finalColor = linearColorGrade(direct + ambient + localLight + specular + minLight);
+                vec3 finalColor = linearColorGrade(direct + diffuseIndirect + specular + minLight);
 
-                imageStore(blocklightDetailImage, pixel, vec4(localLight, blocklight));
+                imageStore(blocklightDetailImage, pixel,
+                    vec4(localLight + (cacheHit ? cachedIncident * diffuseResponse : vec3(0.0)),
+                        max(blocklight, cacheConfidence)));
 
                 vec4 color = vec4(finalColor, 1.0);
                 if (pc.debugMode == 1) {

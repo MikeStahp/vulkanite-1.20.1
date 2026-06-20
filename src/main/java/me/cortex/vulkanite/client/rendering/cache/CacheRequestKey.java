@@ -13,6 +13,8 @@ public record CacheRequestKey(
         long spatialKey,
         int variantKey,
         int detailKey) implements Comparable<CacheRequestKey> {
+    public static final int DIFFUSE_INCIDENT_RADIANCE_BUCKET = 0;
+
     private static final int GRID_XZ_BITS = 22;
     private static final int GRID_Y_BITS = 20;
     private static final long GRID_XZ_MASK = (1L << GRID_XZ_BITS) - 1L;
@@ -45,6 +47,9 @@ public record CacheRequestKey(
             int cellZ,
             int normalBucket,
             int materialBucket) {
+        // The diffuse cache stores incident radiance. Albedo/material response is
+        // applied during resolve, so the first cache backing should not fork the
+        // same incoming light by surface material.
         return new CacheRequestKey(
                 CacheRequestFamily.DIFFUSE_RADIANCE,
                 packGridCell(cellX, cellY, cellZ),
@@ -94,8 +99,32 @@ public record CacheRequestKey(
                 | (clampByte(c) << 16);
     }
 
+    public long primarySectionKey() {
+        if (family == CacheRequestFamily.SECTION_PROBE_CELL) {
+            return spatialKey;
+        }
+        return ChunkSectionPos.from(gridCellX() >> 3, gridCellY() >> 3, gridCellZ() >> 3).asLong();
+    }
+
+    public int gridCellX() {
+        return unpackSigned(spatialKey >> (GRID_Y_BITS + GRID_XZ_BITS), GRID_XZ_BITS);
+    }
+
+    public int gridCellY() {
+        return unpackSigned(spatialKey >> GRID_XZ_BITS, GRID_Y_BITS);
+    }
+
+    public int gridCellZ() {
+        return unpackSigned(spatialKey, GRID_XZ_BITS);
+    }
+
     private static long packSigned(int value, long mask) {
         return (long) value & mask;
+    }
+
+    private static int unpackSigned(long value, int bits) {
+        int shift = Long.SIZE - bits;
+        return (int) (value << shift >> shift);
     }
 
     private static int clampByte(int value) {

@@ -111,6 +111,9 @@ public final class RenderPassExecutor {
             VRef<VBuffer> sectionLightBuffer,
             VRef<VBuffer> sectionLightProbeBuffer,
             VRef<VBuffer> sectionLightProbeFeedbackBuffer,
+            VRef<VBuffer> sectionLightProbeFillRequestBuffer,
+            VRef<VBuffer> diffuseRadianceCacheBuffer,
+            VRef<VBuffer> diffuseRadianceFillRequestBuffer,
             VRef<VImage> scaledOutputImage, // DLSS: Scaled output image for binding 12 (or null to use Iris target)
             int renderWidth, // DLSS: Scaled render width (or full resolution if DLSS inactive)
             int renderHeight) { // DLSS: Scaled render height (or full resolution if DLSS inactive)
@@ -339,6 +342,12 @@ public final class RenderPassExecutor {
                 bindOptionalStorageBuffer(updater, setReflection, 23, sectionLightProbeBuffer, "SectionLightProbes");
                 bindOptionalStorageBuffer(updater, setReflection, 24, sectionLightProbeFeedbackBuffer,
                         "SectionLightProbeFeedback");
+                bindOptionalStorageBuffer(updater, setReflection, 25, sectionLightProbeFillRequestBuffer,
+                        "SectionLightProbeFillRequests");
+                bindOptionalStorageBuffer(updater, setReflection, 26, diffuseRadianceCacheBuffer,
+                        "DiffuseRadianceCache");
+                bindOptionalStorageBuffer(updater, setReflection, 27, diffuseRadianceFillRequestBuffer,
+                        "DiffuseRadianceFillRequests");
 
                 updater.apply();
 

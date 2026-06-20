@@ -35,7 +35,7 @@ import java.util.List;
  * <li>pInMotionVectors - Screen-space motion vectors</li>
  * <li>pInDiffuseAlbedo - Diffuse albedo (G-buffer)</li>
  * <li>pInSpecularAlbedo - Specular albedo/F0 (G-buffer)</li>
- * <li>pInNormals - World-space normals with roughness in .w (if packed)</li>
+ * <li>pInNormals - World-space normals encoded from [-1, 1] to [0, 1], with roughness in .w</li>
  * <li>pInRoughness - Separate roughness buffer (if unpacked)</li>
  * <li>InJitterOffsetX/Y - Subpixel jitter in pixel space [-0.5, 0.5]</li>
  * <li>InReset - Set to 1 on scene changes to reset temporal history</li>

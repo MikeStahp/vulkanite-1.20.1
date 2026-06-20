@@ -12,12 +12,8 @@ import org.slf4j.LoggerFactory;
  * when DLSS is enabled, ensuring all components (G-buffers, ray tracing targets,
  * jitter calculations, UBO data) use consistent scaled dimensions.
  * 
- * DLSS Quality Mode Scaling:
- * - NATIVE: 1.0 (100% - no scaling)
- * - QUALITY: 0.667 (66.67% - e.g., 848x480 -> 565x320)
- * - BALANCED: 0.583 (58.3%)
- * - PERFORMANCE: 0.5 (50%)
- * - ULTRA_PERFORMANCE: 0.333 (33.3%)
+ * Quality mode scaling is sourced from {@link DLSSConfig.QualityPreset} so DLSS
+ * and FSR share one set of scale factors.
  */
 public class ResolutionScaleManager {
     private static final Logger LOGGER = LoggerFactory.getLogger(ResolutionScaleManager.class);
@@ -32,7 +28,8 @@ public class ResolutionScaleManager {
     private volatile int cachedRenderWidth = 0;
     private volatile int cachedRenderHeight = 0;
     private volatile float cachedScale = 1.0f;
-    private volatile boolean cachedDLSSEnabled = false;
+    private volatile boolean cachedUpscalingEnabled = false;
+    private volatile boolean cachedDLSSBackendEnabled = false;
 
     private ResolutionScaleManager() {
     }
@@ -63,27 +60,23 @@ public class ResolutionScaleManager {
         int alignedOutputHeight = Math.max(8, outputHeight & ~7);
 
         DLSSConfig config = DLSSConfig.load();
-        // Enable DLSS scaling for both DLSS and DLSS_RR (Ray Reconstruction) modes
-        String denoiser = config.getDenoiser();
-        boolean dlssEnabled = config.isEnabled() && ("DLSS".equals(denoiser) || "DLSS_RR".equals(denoiser));
-        float scale = 1.0f;
-
-        if (dlssEnabled) {
-            // Get scale from quality preset
-            scale = config.getQualityPreset().getScale();
-        }
+        boolean upscalingEnabled = config.isEnabled();
+        boolean dlssBackendEnabled = config.usesDLSSBackend();
+        float scale = upscalingEnabled ? config.getEffectiveScale() : 1.0f;
 
         // Check if dimensions changed
         boolean dimensionsChanged = (alignedOutputWidth != cachedOutputWidth ||
                 alignedOutputHeight != cachedOutputHeight ||
                 scale != cachedScale ||
-                dlssEnabled != cachedDLSSEnabled);
+                upscalingEnabled != cachedUpscalingEnabled ||
+                dlssBackendEnabled != cachedDLSSBackendEnabled);
 
         if (dimensionsChanged) {
             cachedOutputWidth = alignedOutputWidth;
             cachedOutputHeight = alignedOutputHeight;
             cachedScale = scale;
-            cachedDLSSEnabled = dlssEnabled;
+            cachedUpscalingEnabled = upscalingEnabled;
+            cachedDLSSBackendEnabled = dlssBackendEnabled;
 
             // Calculate render dimensions
             // IMPORTANT: Align to multiple of 8 for DLSS compatibility
@@ -93,16 +86,10 @@ public class ResolutionScaleManager {
             // preventing temporal buffer misalignment in DLSSD that causes bottom-left
             // quadrant artifacting.
             //
-            // Previous behavior (caused artifacts):
-            //   Output: 1920x1080 (unaligned)
-            //   Quality mode (0.667): Expected 1280x720 -> Actually 1272x712 (8-pixel difference)
-            //   This mismatch caused DLSSD's internal temporal buffer to misalign
-            //
-            // New behavior (fixed):
-            //   Output: 1920x1080 -> Aligned to 1920x1080 (already aligned)
-            //   Quality mode (0.667): 1920 * 0.667 = 1280 -> Aligned to 1280x720
-            //   Both dimensions are now consistently aligned
-            if (dlssEnabled && scale < 1.0f) {
+            // Previous behavior aligned render dimensions after applying the quality
+            // scale, which could leave output and render dimensions out of step.
+            // Aligning output first keeps DLSSD temporal buffers consistent.
+            if (upscalingEnabled && scale < 1.0f) {
                 cachedRenderWidth = ((int)(alignedOutputWidth * scale)) & ~7;
                 cachedRenderHeight = ((int)(alignedOutputHeight * scale)) & ~7;
             } else {
@@ -115,8 +102,9 @@ public class ResolutionScaleManager {
             cachedRenderWidth = Math.max(8, cachedRenderWidth);
             cachedRenderHeight = Math.max(8, cachedRenderHeight);
 
-            LOGGER.info("[ResolutionScaleManager] Updated: output={}x{}, render={}x{}, scale={}, dlssEnabled={}",
-                    cachedOutputWidth, cachedOutputHeight, cachedRenderWidth, cachedRenderHeight, scale, dlssEnabled);
+            LOGGER.info("[ResolutionScaleManager] Updated: output={}x{}, render={}x{}, scale={}, upscalingEnabled={}, dlssBackend={}",
+                    cachedOutputWidth, cachedOutputHeight, cachedRenderWidth, cachedRenderHeight, scale,
+                    upscalingEnabled, dlssBackendEnabled);
         }
     }
     
@@ -167,14 +155,21 @@ public class ResolutionScaleManager {
      * Returns true only if DLSS is enabled AND scale < 1.0.
      */
     public boolean isScalingActive() {
-        return cachedDLSSEnabled && cachedScale < 1.0f;
+        return cachedUpscalingEnabled && cachedScale < 1.0f;
     }
     
     /**
      * Check if DLSS is enabled.
      */
     public boolean isDLSSEnabled() {
-        return cachedDLSSEnabled;
+        return cachedDLSSBackendEnabled;
+    }
+
+    /**
+     * Check if any configured upscaler is enabled.
+     */
+    public boolean isUpscalingEnabled() {
+        return cachedUpscalingEnabled;
     }
     
     /**
@@ -202,7 +197,7 @@ public class ResolutionScaleManager {
      *
      * @param outputWidth The output width
      * @param outputHeight The output height
-     * @param scale The scale factor (e.g., 0.667 for Quality mode)
+     * @param scale The quality scale factor from the active config preset
      * @return int[2] with render width and height (aligned to 8)
      */
     public static int[] calculateRenderDimensions(int outputWidth, int outputHeight, float scale) {
@@ -226,6 +221,8 @@ public class ResolutionScaleManager {
 		cachedOutputHeight = 0;
 		cachedRenderWidth = 0;
 		cachedRenderHeight = 0;
+        cachedUpscalingEnabled = false;
+        cachedDLSSBackendEnabled = false;
 	}
 
 	/**
@@ -246,7 +243,7 @@ public class ResolutionScaleManager {
 	 * @return true if DLSSD would be supported (non-native resolution with DLSS enabled)
 	 */
 	public boolean isDLSSDSupported() {
-		return cachedDLSSEnabled && !isNativeResolution();
+		return cachedDLSSBackendEnabled && !isNativeResolution();
 	}
 
 	/**
@@ -256,7 +253,7 @@ public class ResolutionScaleManager {
 	 * @return A human-readable explanation, or null if DLSSD is supported
 	 */
 	public String getDLSSDUnsupportedReason() {
-		if (!cachedDLSSEnabled) {
+		if (!cachedDLSSBackendEnabled) {
 			return "DLSS is not enabled";
 		}
 		if (isNativeResolution()) {
