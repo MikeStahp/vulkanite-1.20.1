@@ -1,577 +1,656 @@
-# Agent Prompt
+# Vulkanite Cache-First Optimization Plan
 
-Optimize the complete Vulkanite lifecycle, not only the ray-generation shader. Follow work from project/shaderpack preparation and Vulkan startup through Sodium/Iris capture, geometry and lighting extraction, asynchronous BLAS work, entity capture, TLAS construction, OpenGL/Vulkan interop, descriptor and command encoding, all ray-tracing shader stages, temporal reconstruction/upscaling, final composition, reloads, world changes, memory retirement, and shutdown.
+This is the shared source of truth for making Vulkanite lighting light. The goal is
+not to make the current full-frame RT shader a little faster. The goal is to stop
+using full-frame RT as steady-state lighting.
 
-Use evidence-driven, reversible changes. Preserve rendering correctness, compatibility, synchronization, descriptor/resource contracts, DLSS/Ray Reconstruction guide validity, temporal stability, and safe resource lifetimes. Do not report lower image quality as an algorithmic optimization. Inspect the existing dirty worktree before every change and preserve work that was already present.
+User clarification on 2026-06-20: RT/RTX is for validation and cache fill. RTX
+runs when radiance, reflection, or refraction data is missing, stale, or needs
+validation, writes or validates the cache, then turns off once cached data is
+usable.
 
-Use this document as the shared source of truth. Take one part at a time, check what previous agents completed, inspect their source/diff evidence, and update the checklist as work progresses. When a part finishes, check only verified items, update its status, add changed files and user observations to the evidence ledger, record rejected experiments, and replace the latest handoff with exact information for the next agent. Then report what was done, what the user observed, what remains, and the next recommended part.
+## Objective
 
-# Objective
+Make steady-state frames cheap by replacing per-frame full-resolution RT with:
 
-Improve end-to-end frame time, RT GPU time, CPU overhead, chunk-update stutter, memory use, load/reload latency, and shutdown reliability without moving cost to another stage or introducing visual and lifetime regressions.
+1. A bounded RTX cache-fill path for missing or stale lighting data.
+2. A non-RT cache resolve path that runs every eligible frame.
+3. Explicit cache validity and invalidation rules for world, geometry, lighting,
+   material, camera, shaderpack, resolution, and temporal state changes.
 
-## Current working mode - manual flow review
+Success means steady-state cache-hit frames avoid unnecessary `traceRays` work
+without using stale radiance, reflection, refraction, probe, or guide data.
 
-This plan is in manual-review mode until the user explicitly changes it.
+## Working Mode
 
-- Do not create new benchmark worlds, scripted test scenes, automated capture harnesses, or reference-image test suites.
-- Do not run benchmark/test captures or automated A/B tests unless the user explicitly asks for them.
-- Inspect the lifecycle, source flow, logs, configuration, and diffs manually, then look for one reversible improvement at a time.
-- Treat visual quality and "better or worse" judgments as user-owned observations. Record them only when the user provides them.
-- It is acceptable to document manual checkpoints and exact places for the user to look, but do not declare a rendering improvement from an automated test result.
-- If an older checklist item says "test", "run", "capture", or "baseline", interpret it in this mode as "prepare or record a manual user-check path" unless the user explicitly re-enables automated testing.
+Manual review remains active until the user explicitly changes it.
 
-A successful result must distinguish:
+- Do not create new benchmark worlds, scripted scenes, automated capture
+  harnesses, or reference-image suites.
+- Do not run benchmark captures or automated A/B tests unless the user asks.
+- Inspect source flow, diffs, logs, and configuration manually.
+- Treat visual quality and "better or worse" as user-owned observations.
+- Mark checklist items complete only with source inspection, commands, diffs, or
+  user-provided observations.
+- Label findings as `code-verified`, `inferred`, `target`, `measured`, or
+  `user-observed`.
 
-- Steady-state CPU frame time
-- Steady-state GPU frame time
-- RT pass GPU time
-- Chunk rebuild and BLAS/TLAS update spikes
-- Interop and queue wait time
-- Reconstruction/upscaling time
-- Allocation count, memory footprint, and resource churn
-- Startup, shader reload, resize, world switch, and shutdown behavior
+## Research Anchors
 
-# End-to-End Flow
+Use these as design direction, not as proof that Vulkanite already behaves this
+way.
 
-## Build and startup
+- NVIDIA RTXGI / SHaRC / NRC:
+  https://github.com/NVIDIA-RTX/RTXGI
+  Key idea: cache outgoing radiance in world space and replace much of path
+  tracing with a hit evaluation plus cache lookup.
+- RTXGI-DDGI:
+  https://github.com/NVIDIAGameWorks/RTXGI-DDGI/blob/main/docs/Algorithms.md
+  Key idea: maintain irradiance and distance probe data with fast ray-traced
+  updates, then shade from probes.
+- Kajiya GI overview:
+  https://github.com/EmbarkStudios/kajiya/blob/main/docs/gi-overview.md
+  Key idea: use an output-sensitive irradiance cache; queries drive where cache
+  entries are allocated and refreshed.
+- ReSTIR GI:
+  https://research.nvidia.com/publication/2021-06_restir-gi-path-resampling-real-time-path-tracing
+  Key idea: reuse paths across pixels and frames when rays still need to be
+  traced.
+- Real-time Neural Radiance Caching:
+  https://research.nvidia.com/publication/2021-06_real-time-neural-radiance-caching-path-tracing
+  Key idea: learn a radiance cache while rendering. Treat as future work unless
+  the user explicitly wants neural-cache complexity.
+- Minecraft PTGI:
+  https://github.com/MahoganyTown/Minecraft-PTGI
+  Useful comparison for path-traced GI plus SVGF/TAA, but not the main path to
+  cache-hit steady state.
+- Rethinking Voxels:
+  https://github.com/gri573/rethinking-voxels
+  Useful Minecraft-specific comparison for voxelization, ray-tested occlusion,
+  and cheaper colored block lighting.
 
-```mermaid
-flowchart TD
-    A[Tracked shaderpacks/VulkaniteRT sources] --> B[Gradle syncVulkaniteShaderpacks]
-    B --> C[run/shaderpacks/VulkaniteRT runtime copy]
-    C --> D[Fabric client startup]
-    D --> E[VulkaniteInitializer registers debug input]
-    D --> F[First active Vulkanite class reference]
-    F --> G[Static Vulkanite singleton construction]
-    G --> H[Query required NGX and interop extensions]
-    H --> I[Create Vulkan instance/device/queues, allocators, sync, and acceleration managers]
-    I --> J[Iris shaderpack load]
-    J --> K[Discover rayN stages and inject defines/includes]
-    K --> L[Compile SPIR-V and reflect resources]
-    L --> M[Create RT pipelines, descriptors, SBTs, samplers, placeholders]
-    M --> N[Ready for world rendering]
-    N --> O[First eligible frame allocates frame images and lazily creates DLSS/RR feature]
-```
+## Current Code-Verified Problem
 
-`VulkaniteInitializer` is not the Vulkan bootstrap: it currently registers only
-`DebugKeyHandler`. The Vulkan context is created by static `Vulkanite.INSTANCE`
-construction when the class is first actively referenced. NGX-required extension
-discovery happens before device creation, while DLSS/RR feature creation happens
-later through `DLSSDProcessor` when an eligible frame and its dimensions exist.
+Current default/reference source flow still runs RT every eligible frame. Part 2
+adds a temporary `cache_resolve_only` path that skips `traceRays`, but the
+default remains `full_rt_reference` until request lists, cache validity, and
+quality checkpoints make cache-hit steady state trustworthy.
 
-## Persistent world-data preparation
+- [VulkanPipeline.java](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/src/main/java/me/cortex/vulkanite/client/rendering/VulkanPipeline.java:454)
+  calls `passGraph.execute(...)` inside the per-frame render path.
+- [RtxPassGraph.java](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/src/main/java/me/cortex/vulkanite/client/rendering/RtxPassGraph.java:34)
+  loops every reflected RT pass.
+- [RenderPassExecutor.java](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/src/main/java/me/cortex/vulkanite/client/rendering/RenderPassExecutor.java:448)
+  calls `traceRays(renderWidth, renderHeight, 1)`.
+- [ray0.rgen](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/shaderpacks/VulkaniteRT/shaders/ray0.rgen:3918)
+  still contains per-frame reflection/refraction/indirect/section-light RT work.
+- [ray0.rgen](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/shaderpacks/VulkaniteRT/shaders/ray0.rgen:1638)
+  already has section-light probe RT cache read/write machinery, which should be
+  treated as a foothold for the cache-first rewrite.
+- [CacheResolvePass.java](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/src/main/java/me/cortex/vulkanite/client/rendering/CacheResolvePass.java)
+  now provides a non-RT compute resolve/debug path for Part 2, but it is still
+  fallback lighting rather than a real cache-hit implementation.
 
-```mermaid
-flowchart TD
-    A[Sodium chunk meshing task] --> B[Capture RT geometry ranges]
-    A --> C[Scan section lights and opacity]
-    B --> D[ChunkBuildOutput]
-    C --> D
-    D --> E[Render-section upload/result collection]
-    E --> F[AccelerationManager.chunkBuilds]
-    F --> G[Async BLAS batches: upload/build/compact]
-    G --> H[Completed BLAS result queue]
-    H --> I[AccelerationManager.updateTick]
-    I --> J[Reject stale/retired results]
-    J --> K[Install current section holders]
-    K --> L[Persistent TLAS instance set]
-    E --> M[SectionLightManager update]
-    M --> N[Dirty pages and neighboring influence]
-    N --> O[Probe worker generation]
-    O --> P[Light table/probe/feedback GPU uploads]
-```
+These are source observations, not performance measurements.
 
-## Per-frame render flow
-
-```mermaid
-flowchart TD
-    A[Minecraft + Iris compatibility rendering] --> B[Raster terrain/entities/translucency]
-    B --> C[Populate colortex G-buffers]
-    C --> D[finalizeLevelRendering injection]
-    D --> E[Detect settings and collect outputs/required G-buffer views]
-    E --> F[World/camera/temporal reset checks]
-    F --> G[Resolution selection and frame-image allocation check]
-    G --> H[Process completed submissions and begin frame]
-    H --> I[Optional throttled transient entity capture]
-    I --> J[Collect shared outputs, G-buffers, and entity textures]
-    J --> K[OpenGL signals shared semaphore]
-    K --> L[Create command resources]
-    L --> M[Wait for required BLAS executions]
-    M --> N[Build/update TLAS including transient entities]
-    N --> O[Encode camera UBO and initialize frame images]
-    O --> P[Transition sampled/G-buffer resources]
-    P --> Q[Upload/bind section light, probe, and feedback buffers]
-    Q --> R[RtxPassGraph executes each reflected RT pass]
-    R --> S[Descriptor update + bind + barriers + traceRays]
-    S --> T[Noisy radiance, reservoirs, DLSS guides, blocklight detail]
-    T --> U{Reconstruction/upscaling active and valid?}
-    U -->|DLSS/RR| V[DLSSDProcessor evaluation]
-    U -->|Standard DLSS| W[Standard DLSS evaluation]
-    U -->|FSR/fallback/off| X[Fallback processing or noisy output]
-    V --> Y[Processed image]
-    W --> Y
-    X --> Y
-    Y --> Z[Blit/compose to Iris target]
-    Z --> AA[Restore resource layouts]
-    AA --> AB[Submit Vulkan work waiting on GL semaphore]
-    AB --> AC[Vulkan signals completion semaphore]
-    AC --> AD[OpenGL waits and resumes Iris composition]
-    AD --> AE[Retire references/resources after safe completion]
-```
-
-## Reset, reload, resize, and shutdown
+## Target Architecture
 
 ```mermaid
 flowchart TD
-    A{Lifecycle event} -->|Camera cut/world change| B[Reset previous matrices, jitter, and DLSS temporal state]
-    B --> B2[Audit explicit ReSTIR reservoir invalidation; images are not currently cleared here]
-    A -->|Window/render-scale change| C[Reallocate frame images and recreate reconstruction resources]
-    A -->|Shaderpack reload| D[Drain required queue work]
-    D --> E[Destroy old pass graph/pipelines/descriptors/views]
-    E --> F[Compile and create new shaderpack pipeline]
-    A -->|Chunk removal| G[Retire section and reject stale BLAS results]
-    A -->|Client shutdown| H[Destroy active pipelines]
-    H --> I[Device idle, NGX shutdown, lighting and acceleration manager destruction]
-    I --> J[Required audit: stop/join BLAS worker and explicitly destroy command/sync/context resources]
+    A[Minecraft/Iris raster compatibility pass] --> B[G-buffer and material inputs]
+    B --> C[Collect world, section, light, material, entity, camera versions]
+    C --> D[Build cache request lists]
+    D --> E{Any cache work needed within budget?}
+    E -->|yes| F[RTX cache-fill/validation pass]
+    F --> G[Write radiance/reflection/refraction/probe cache entries]
+    E -->|no| H[No RT dispatch this frame]
+    G --> I[Cache resolve pass]
+    H --> I
+    I --> J[Write radiance, DLSS/RR guides, depth, motion, hit-distance outputs]
+    J --> K[DLSS/RR, DLSS, FSR, or fallback]
+    K --> L[Compose to Iris target]
+    L --> M[Retire resources after queue completion]
 ```
 
-# Source and Ownership Map
+The important split is:
 
-Edit tracked sources, not generated/runtime copies.
+- `Cache fill`: optional, bounded, RT-capable, driven by dirty/missing cache
+  requests.
+- `Cache resolve`: mandatory for rendered frames, non-RT if possible, samples
+  cache data and produces the same downstream outputs expected today.
 
-| Flow area | Main owners |
+## Cache Families
+
+Start with explicit families instead of one vague "RT cache".
+
+| Cache | Purpose | Likely backing | Filled by RT? | Read by steady state? |
+|---|---|---|---|---|
+| Section blocklight probe cache | Colored local block lighting and visibility | Existing `SectionLightManager` buffers and `ray0.rgen` RT cache cells | Yes, bounded | Yes |
+| Diffuse radiance cache | Indirect diffuse tail lighting | World-space grid/hash or section/probe pages | Yes | Yes |
+| Reflection cache | Specular/env result for stable surfaces | Screen-space history plus world/material keyed cache | Sometimes | Yes |
+| Refraction cache | Water/glass/ice/crystal transmission result | Screen-space history plus material/medium keyed cache | Sometimes | Yes |
+| Guide cache | DLSS/RR albedo, normal, roughness, depth, motion, hit distance | `RtxFrameImages` or split compute outputs | No RT unless hit distance requires it | Yes |
+
+Do not add a cache without specifying its key, lifetime, invalidation, fallback,
+and debug view.
+
+## Invalidation Rules
+
+Every cached value must be invalidated or revalidated by a clear version source.
+
+| Event | Required action |
 |---|---|
-| Build/runtime shaderpack sync | `build.gradle`, `shaderpacks/VulkaniteRT`, `run/shaderpacks/VulkaniteRT` |
-| Client/Vulkan initialization | `VulkaniteInitializer` (debug input only), static `Vulkanite.INSTANCE`, `Vulkanite`, `VInitializer`, `VContext`, `DeviceProperties` |
-| Iris integration and G-buffer handoff | `MixinIrisRenderingPipeline`, Iris texture/render-target mixins |
-| Shader discovery/compilation/reflection | `MixinProgramSet`, `RaytracingShaderSource`, `RaytracingShaderSet`, `ShaderCompiler`, `ShaderReflection`, `SpirvParser` |
-| RT pipeline/pass execution | `VulkanPipeline`, `RtxPassGraph`, `RtPipeline`, `RenderPassExecutor`, `RaytracePipelineBuilder` |
-| Chunk geometry capture | `MixinChunkRenderRebuildTask`, `SodiumResultAdapter`, `SodiumGeometry*` |
-| Chunk light extraction | `SectionLightExtractor`, `SectionLightTable`, `SectionLightManager`, `SectionDirectionalProbePage` |
-| BLAS work | `AccelerationManager`, `AccelerationBlasBuilder`, `acceleration/blas/*` |
-| TLAS and instances | `AccelerationTLASManager`, `TLASSectionManager`, `TLASInstanceBuffer`, `TlasPointerArena` |
-| Entity/transient geometry | `EntityCapture`, `EntityBlasBuilder`, entity/particle capture mixins |
-| Shared GL/Vulkan images and sync | `HybridInterop`, `SharedImageViewTracker`, `VGImage`, `VGSemaphore`, `SyncManager` |
-| Command submission and barriers | `CommandManager`, `CommandSubmissionRequest`, `VCommandPool`, `VCmdBuff` |
-| Images, buffers, allocation | `RtxFrameImages`, `MemoryManager`, allocators, `UploadStream`, `VRef`, `VRegistry` |
-| Ray-tracing shaders | `shaderpacks/VulkaniteRT/shaders/ray0*`, `lib/rt/*`, `lib/pbr/*` |
-| Resolution and temporal state | `ResolutionScaleManager`, `JitterManager`, `UBODataEncoder` |
-| DLSS/RR/FSR | `DLSSDProcessor`, `DLSSBridge`, `GBufferDLSSDAdapter`, `DLSSDParameterValidator`, `FSRUpscaler` |
-| Configuration/UI | `VulkaniteConfig`, `DLSSConfig`, `ShaderpackSettingsHandler`, Sodium option classes |
-| Destruction/reload | `VulkanPipeline.destroy`, `Vulkanite.destroy`, resource mixins, `MixinMinecraftClient` |
+| Chunk section geometry changed | Invalidate affected section cache entries and neighbor entries that can see through/around the changed section |
+| Section light table changed | Invalidate local light/probe/radiance entries and nearby influence region |
+| Material atlas or PBR texture changed | Invalidate material-dependent reflection/refraction/radiance entries |
+| Entity BLAS changed | Invalidate only dynamic/entity-dependent cache entries, not the whole world cache |
+| Camera teleport/world switch | Reset temporal history and require cache revalidation where screen history is trusted |
+| Sun/sky/time/weather changed | Either version sky-dependent entries or use a cheap analytic sky term outside the cache |
+| Shaderpack/settings changed | Rebuild pipelines and invalidate cache entries whose layout, format, or meaning changed |
+| Resolution/render scale changed | Recreate image-sized outputs and preserve only world-space caches that remain valid |
+| DLSS/RR mode changed | Reset guide history and verify cache resolve outputs still match guide contracts |
 
-`shaderpacks/VulkaniteRT` is the active tracked shaderpack source. `run/shaderpacks/VulkaniteRT` is generated by Gradle. The smaller shader under `src/main/resources/assets/vulkanite/shaders/raytracing` is not assumed to be equivalent.
+Stale light is a regression. A lower RT count only counts as an optimization when
+the cache validity model still explains why the reused value is correct enough.
 
-## Verified implementation notes and open lifecycle gaps
+## Execution Rules
 
-Verified against the dirty working tree on 2026-06-20:
+- Full-screen `traceRays(renderWidth, renderHeight, 1)` is allowed only during
+  the transition period or when explicitly selected as a debug/reference mode.
+- Default steady state should have a path where no RT dispatch occurs if all
+  required cache entries are valid.
+- Cache-fill work must be budgeted: max entries, max rays, max pages, or max time
+  per frame.
+- Missing cache data must degrade predictably: previous valid value, local
+  fallback, probe fallback, screen-space fallback, or noisy RT debug path.
+- Debug views must show cache hit/miss/stale/in-flight/fallback state.
+- DLSS/RR guides must remain valid even when RT is skipped.
 
-- `MixinIrisRenderingPipeline.finalizeLevelRendering` invokes the RTX overlay at
-  `HEAD`, after Iris has populated the compatibility G-buffers expected by this
-  integration.
-- Each eligible frame currently creates two shared binary semaphores, one
-  transient command pool, and one command buffer. `CommandManager.Queue` retains
-  the submitted command buffer, and the command buffer retains semaphore/resource
-  references until the queue timeline reports completion.
-- `AccelerationManager.updateTick` accepts only completed async BLAS batches,
-  rejects retired/superseded section results, and limits installation to 32
-  sections per render tick. `buildTLAS` then queues the required async-BLAS
-  timeline dependencies on queue 0; it does not perform a host wait for each BLAS.
-- World identity changes and camera jumps over 10 blocks reset previous matrices,
-  jitter, and DLSS temporal state. They do not explicitly clear or version the two
-  ReSTIR reservoir images, so reservoir invalidation remains a correctness audit
-  item rather than a verified behavior.
-- `syncVulkaniteShaderpacks` deletes and recopies each runtime pack. Because
-  `validateVulkaniteShaderpackDrift` depends on that sync task, it verifies the
-  generated result, not pre-sync runtime drift. Capture any runtime-only diff
-  before invoking either task.
-- `MixinMinecraftClient.close` destroys active pipelines before
-  `Vulkanite.destroy`, which calls `vkDeviceWaitIdle`, shuts down NGX, and destroys
-  lighting/acceleration managers. `AccelerationBlasBuilder` now retains its BLAS
-  worker thread, cancels queued-but-not-started BLAS batches on shutdown, lets an
-  in-flight batch finish, and joins before releasing builder-owned BLAS resources.
-  `Vulkanite.destroy` still does not visibly destroy `VContext`/command/sync/device/
-  instance ownership. Treat complete context teardown as unverified Part 15 work.
+## Implementation Parts
 
-These notes describe current implementation, not proof that the behavior is
-correct. A diagram box or source-code path is not a completed checklist item until
-runtime evidence is recorded.
-
-# Rules for Every Part
-
-- Record initial `git status --short`; never reset, clean, or overwrite unrelated changes.
-- In manual-review mode, do not create or run tests, benchmark worlds, scripted captures, or automated A/B comparisons unless the user explicitly asks.
-- Inspect flow before changing behavior. File size, line count, and intuition are hypotheses, not proof.
-- Reason about the complete frame as well as the local stage; a local gain that increases a wait or later pass is not a win.
-- Change one attributable cost center at a time and keep it independently reversible.
-- When a visual/performance check is needed, provide a manual checkpoint for the user instead of declaring the result yourself.
-- Record user-provided observations separately from code-verified or inferred findings.
-- Separate CPU encode time from GPU execution time and queue-wait time when inspecting or instrumenting flow.
-- Never remove a barrier, wait, flush, reference, or close call without proving the replacement lifetime/synchronization rule.
-- Preserve DLSS/RR guide spaces, formats, ranges, jitter conventions, and sky/miss writes.
-- Do not silently lower default samples, bounce counts, view distance, render scale, or material features.
-- Compile-time permutations may eliminate unused paths, but supported debug and fallback modes must still work.
-- Descriptor, UBO, push-constant, SSBO, SBT, cache packing, and image-layout changes require validation of all producers and consumers.
-- Label findings as `measured`, `code-verified`, `inferred`, or `target`; do not present an intended lifecycle as implemented behavior.
-- In manual-review mode, label user feedback as `user-observed`; do not convert it into an automated pass/fail claim.
-- Do not mark a checkbox complete without a command, code inspection, diff, or user-provided reproducible observation in the ledger.
-
-# Part 0 - Define Manual Review Scope and Acceptance Targets
+### Part 0 - Preserve Manual Scope
 
 Status: **in progress**
 
-- [x] Record commit, dirty files, OS, CPU, GPU, driver, Java, JVM flags, memory allocation, resolution, and display refresh.
-- [x] Record shaderpack, all RT/DLSS/FSR settings, render scale, view distance, entity distance, VSync/FPS cap, and debug mode.
-- [x] Create fixed cases for startup, shader reload, resize, world switch, and shutdown.
-- [x] Switch the plan to manual-review mode: no new test worlds, scripted scenes, capture harnesses, or automated A/B tests are required.
-- [x] Pick the next lifecycle/source-flow area to inspect manually.
-- [x] Record the exact user-driven manual checkpoint for each retained change.
-- [ ] Record user-provided performance or image-quality observations as `user-observed`, without declaring the result independently.
-- [ ] Record CPU/GPU/VRAM/heap/native-memory facts only when they come from existing logs, explicit user-provided data, or a user-requested diagnostic pass.
-- [x] Define acceptable image difference and temporal-stability criteria before implementation.
-- [ ] Save screenshots/debug guides only when the user provides them or explicitly requests them.
+- [x] Keep manual-review mode active.
+- [x] Record that the user wants RT/RTX as validation/cache fill, then off.
+- [x] Record source-verified evidence that RT currently runs every eligible frame.
+- [ ] Record user-provided performance and image-quality observations as
+  `user-observed`.
+- [ ] Do not run automated captures unless the user explicitly asks.
 
-Repository sanity checks, only when explicitly allowed:
+Exit condition: future agents know the target is cache-hit steady state, not
+per-frame full-screen RT.
 
-```powershell
-git status --short
-./gradlew syncVulkaniteShaderpacks validateVulkaniteShaderpackDrift
-```
+### Part 1 - Map Current Per-Frame RT Cost and Outputs
 
-The Gradle command mutates `run/shaderpacks` before validating it. In
-manual-review mode, do not run it unless the user explicitly asks. If runtime
-drift matters, compare or archive `run/shaderpacks/VulkaniteRT` first.
+Status: **complete**
 
-Exit condition: another agent can continue the manual flow review, make one reversible change at a time, and hand the user an exact place to judge whether it looks or feels better.
+- [x] Enumerate every output currently produced by `ray0.rgen`: radiance,
+  reservoirs, albedo/metallic, specular albedo, normal/roughness, motion,
+  linear depth, specular hit depth, first-hit depth, blocklight detail, final
+  noisy output, and section-light RT cache buffer writes.
+- [x] Separate outputs that require RT from outputs that can come from G-buffer,
+  compute, history, or cache resolve.
+- [x] Identify which outputs DLSS/RR consumes and their required formats/ranges.
+- [x] Record shader branches that trace indirect, reflection, refraction,
+  section-light sparse validation, and blocklight probe cache fill.
+- [x] Do not add optional counters or logs; user did not approve
+  instrumentation.
 
-# Part 1 - End-to-End Instrumentation and Cost Map
+Part 1 output map (`code-verified`):
 
-Status: **not started**
+| Output | Writer and backing | Current range/meaning | RT dependency | DLSS/RR consumer |
+|---|---|---|---|---|
+| Current reservoir / sun history, binding 6 | Injected `reservoirImage`, `rgba32f`; `RtxFrameImages` allocates `VK_FORMAT_R32G32B32A32_SFLOAT` | ReSTIR packs `w_sum`, `W`, `m`, sun-disk offset; sun-history path stores world position plus packed visibility/history | ReSTIR and sun-history visibility currently depend on `alphaAwareVisibility` ray queries | Not consumed by NGX; used by current/previous-frame ReSTIR and sun-shadow history |
+| Final noisy radiance, binding 12 | `outputImage`, `rgba16f`; `RtxFrameImages.radiance` is `VK_FORMAT_R16G16B16A16_SFLOAT` | Linear HDR color after direct, indirect, local, specular/transmission, volumetric, and color-grade/firefly clamp, before tone map/gamma | Current value includes RT branches; target cache resolve must assemble the same contract without RT on cache-hit frames | DLSS/RR `pInColor`; standard DLSS color input; fallback blit source |
+| Motion vectors, binding 13 | `motionVectors`, `rg16f`; `VK_FORMAT_R16G16_SFLOAT` | Pixel-space previous-current vector, clamped to launch size; sky writes zero | G-buffer/camera-derived; no RT required if first-hit position is known | DLSS/RR and standard DLSS motion input; native MV scale is 1.0 x/y |
+| Linear depth, binding 14 | `linearDepthImage`, `r16f`; `VK_FORMAT_R16_SFLOAT` | Camera-forward linear depth in scene units; sky writes `10000.0` | G-buffer/depth-derived; no RT required if first hit is known | DLSS/RR and standard DLSS depth input, created as linear depth |
+| Previous reservoir, binding 15 | Injected `prevReservoirImage`, `rgba32f` | Previous frame ping-pong image for temporal/spatial reuse | Read-only in `ray0.rgen`; must remain coherent when RT is skipped | Not consumed by NGX |
+| Diffuse albedo/metallic, binding 16 | `DiffuseAlbedoMetallic`, `rgba8`; `VK_FORMAT_R8G8B8A8_UNORM` | RGB clamped albedo, A metallic; sky writes zero | G-buffer/material-derived; no RT required when first-hit G-buffer is valid | DLSS/RR diffuse albedo guide |
+| Specular albedo, binding 17 | `SpecularAlbedo`, `rgba8`; `VK_FORMAT_R8G8B8A8_UNORM` | RGB F0 clamped 0..1, A 1.0; sky writes zero | G-buffer/material-derived | DLSS/RR specular albedo guide |
+| Normal/roughness, binding 18 | `NormalRoughness`, `rgba16f`; `VK_FORMAT_R16G16B16A16_SFLOAT` | Current shader writes `normal * 0.5 + 0.5` in RGB and roughness 0.04..1 in A; sky writes up normal and roughness 1 | G-buffer/material-derived | DLSS/RR normals plus packed roughness; Part 2 should verify whether NGX expects encoded or signed normals |
+| Specular hit depth, binding 19 | `SpecularHitDepth`, `r16f`; `VK_FORMAT_R16_SFLOAT` | First written as linear depth, then overwritten with `specularHitDistanceGuide`; default view distance, reflection miss `10000.0`, refraction uses min reflection/refraction distance | RT-required today only for reflection/refraction hit distance; can be cache/history/fallback-derived | DLSS/RR `pInSpecularHitDistance` |
+| First-hit depth, binding 20 | `FirstHitDepth`, `r16f`; `VK_FORMAT_R16_SFLOAT` | Linear first-hit depth; sky writes `10000.0` | G-buffer/depth-derived; primary RT fallback only when G-buffer is invalid | Allocated and bound, but not passed to current Java/native DLSS/RR evaluation |
+| Blocklight detail, binding 21 | `blocklightDetailImage`, `rgba16f`; `VK_FORMAT_R16G16B16A16_SFLOAT` | RGB local/emissive lighting detail, A normalized local-light/detail strength; starts at zero per pixel | Current RGB can include RT blocklight and section-light sparse RT; can become cache/table/debug output | No reader found outside raygen/descriptor binding in current tree |
+| Section probe RT cache, binding 24 | `SectionLightProbeRtCacheBuffer`, `std430` coherent buffer; Java name is probe feedback buffer | Six packed RGB9E5 radiance faces plus ready/in-flight state and face mask per probe cell | This is a cache-fill output. Existing read/write helpers are the foothold for Part 5 | Not consumed by NGX |
 
-- [ ] Add or verify named CPU timers around every major box in the per-frame diagram.
-- [ ] Add/verify Vulkan timestamps for BLAS, TLAS, RT passes, reconstruction/upscale, copy/blit, and meaningful barriers.
-- [ ] Record timestamp period/valid bits, query reset/readback policy, queue identity, and the submission timeline value associated with every GPU interval; never subtract timestamps from unrelated queues as if they shared one clock domain.
-- [ ] If the user explicitly re-enables instrumentation, estimate or measure timer overhead; otherwise keep this as a source-flow review item.
-- [ ] Record host wait time, queue wait dependencies, GL semaphore signal/wait duration, and pending-submission retirement.
-- [ ] Record per-frame allocation counts and bytes for command pools/buffers, semaphores, descriptors, views, images, uploads, and temporary collections.
-- [ ] Record counts for chunks rebuilt, geometry ranges/bytes, lights scanned, BLAS queued/completed/installed/stale, TLAS instances, captured entities, and probe pages.
-- [ ] Measure startup, shader compile/reflection/pipeline build, shader reload, resize reallocation, and shutdown latency.
-- [ ] Produce a ranked cost table and choose the top two steady-state and top two stutter costs.
-- [ ] If the user explicitly re-enables captures, export a per-frame row containing frame/capture ID, scene, dimensions, settings hash, CPU stages, GPU stages, wait durations, work counts, allocations, and queue depths so spikes can be correlated instead of compared as separate summaries.
+Part 1 shader branch map (`code-verified`):
 
-Exit condition: optimization order is driven by a complete CPU/GPU/wait/allocation cost map.
+- Primary hit fallback: `ray0.rgen` samples hybrid G-buffer first and calls
+  `traceRayEXT` only when `validHybridSample(...)` fails.
+- Visibility helper: `alphaAwareVisibility(...)` uses `rayQueryEXT`; direct sun,
+  ReSTIR final visibility, volumetric shadows, indirect-hit shadow checks,
+  reflection-hit shadow checks, and section-light sparse validation route through
+  it.
+- ReSTIR/sun history: injected `restir.glsl` declares current/previous reservoir
+  images and writes either ReSTIR reservoirs or sun-shadow history.
+- Indirect diffuse: the bounce loop traces up to `INDIRECT_BOUNCES` clamped to
+  three bounces, then may cast a shadow visibility query at the bounce hit.
+- Reflection: reflective non-refractive surfaces trace up to
+  `METAL_MAX_BOUNCES`, update `specularHitDistanceGuide` on the first bounce, and
+  may query sun visibility at reflected hits.
+- Refraction/transmission: refractive surfaces call `traceSimpleRadiance(...)`
+  for reflected and refracted directions, then write the min distance as the
+  specular guide.
+- RT blocklight: `sampleBlockLightRT(...)` uses `rayQueryEXT` to find emissive
+  block surfaces when `RT_BLOCKLIGHT_PROBES` and `BLOCKLIGHT_SAMPLES` allow it.
+- Section-light sparse/probe RT: `sampleSectionLightSparseRt(...)` traces
+  candidate light visibility; `sampleSectionLightProbeRtCell(...)` fills probe
+  faces; cache read/write helpers manage ready/in-flight state. The current
+  surface-cache branch calls sparse RT directly; Part 5 should audit whether the
+  unused surface claim/complete helpers should gate repeated work.
 
-# Part 2 - Build, Startup, and Shader Compilation
+Exit condition met: a no-RT cache resolve must still write radiance,
+motion vectors, linear depth, diffuse/metallic, specular albedo,
+normal/roughness, specular hit distance, first-hit depth, reservoir/history when
+the ReSTIR or sun-history path is active, blocklight detail if retained, and
+valid section-probe cache state or fallback/debug values.
 
-Status: **not started**
+### Part 2 - Split Full RT Pass From Cache Resolve
 
-- [ ] Measure Gradle shaderpack sync/drift validation and avoid redundant copying or hashing without weakening correctness.
-- [ ] Measure Vulkan instance/device, extension discovery, allocator, queue, and NGX initialization separately.
-- [ ] Audit repeated config loads and capability probes during startup and first frame.
-- [ ] Measure shader preprocessing, shaderc compilation, SPIR-V reflection, pipeline/SBT construction, and descriptor layout creation per stage.
-- [ ] Cache only artifacts whose key includes all source, include, define, capability, shaderpack, and driver-relevant inputs.
-- [ ] Confirm cache invalidation and shader error diagnostics remain correct.
-- [ ] Verify startup with DLSS unsupported, disabled, enabled, and native library failure.
+Status: **complete**
 
-Exit condition: startup/reload becomes faster or more predictable without stale shaders or capability mistakes.
+- [x] Design a `CacheResolve` path that can write the same frame outputs without
+  calling `traceRays`.
+- [x] Decide whether resolve is compute shader, raster fullscreen pass, or a
+  minimal raygen with RT disabled by specialization constant.
+- [x] Add a temporary debug switch:
+  `full_rt_reference`, `cache_fill`, `cache_resolve_only`.
+- [x] Ensure the full RT reference path remains available for visual comparison.
+- [x] Preserve descriptor layout compatibility or introduce a versioned layout
+  migration.
 
-# Part 3 - Sodium Chunk Capture and Light Extraction
+Part 2 implementation notes (`code-verified`):
 
-Status: **not started**
+- `CacheResolvePass` is a compute pass, not a raygen. It dispatches 8x8 compute
+  workgroups and never calls `traceRays`.
+- `cache_resolve_only` skips TLAS build/entity capture and writes radiance,
+  current reservoir clear, motion vectors, linear depth, diffuse/metallic,
+  specular albedo, encoded normal/roughness, specular hit depth, first-hit
+  depth, and blocklight detail from the hybrid G-buffer plus fallback lighting.
+- `cache_fill` runs the existing full RT pass first, preserving current
+  cache-fill side effects such as section-probe RT cache writes, then runs the
+  compute resolve pass without clearing full-RT reservoir writes. Until real
+  caches exist, this mode intentionally resolves from G-buffer fallback lighting
+  rather than full RT radiance.
+- `full_rt_reference` is the default and keeps the previous full-screen RT path
+  available for visual comparison.
+- The full RT descriptor layout is unchanged. The compute resolve owns a
+  separate reflected descriptor layout and pipeline.
 
-- [ ] Profile `MixinChunkRenderRebuildTask` geometry capture and `SectionLightExtractor.scan` independently.
-- [ ] Check duplicated traversal of chunk blocks/meshes and share immutable results only when ownership permits.
-- [ ] Avoid RT extraction when no compatible RT shaderpack/path is active.
-- [ ] Ensure cancelled or superseded chunk builds stop avoidable extra work and release data safely.
-- [ ] Bound allocations/copies in `SodiumResultAdapter`, geometry records, and section-light tables.
-- [ ] Provide manual checkpoints for initial world load, fast flight, mass block updates, dimension switch, and shaderpack disable.
+Exit condition met: `cache_resolve_only` can compose one frame from resolve
+outputs without mandatory full-screen RT. Runtime visual quality remains
+user-observed/pending because the resolve path is still fallback lighting, not a
+real radiance/reflection/refraction cache hit.
 
-Exit condition: chunk worker overhead and P95/P99 traversal spikes improve with identical geometry/light results.
-
-# Part 4 - BLAS Upload, Build, Compaction, and Installation
-
-Status: **not started**
-
-- [ ] Profile enqueue delay, CPU batching, upload, GPU build, query/readback, compaction, queue waits, and install delay.
-- [ ] Audit `BLASBuildPolicy`, batch sizing, worker scheduling, scratch reuse, and memory pool fragmentation.
-- [ ] Reject stale/retired/superseded builds as early as safely possible.
-- [ ] Confirm the 32-section install budget balances latency against frame spikes; tune only from queue-depth evidence.
-- [ ] Reduce unnecessary host waits and queue idle operations while preserving dependency ordering.
-- [ ] Verify geometry buffers and acceleration structures retire only after their last GPU use.
-- [ ] Provide manual checkpoints for sustained chunk churn and shutdown with pending batches.
-
-Exit condition: BLAS throughput/latency or update stutter improves without stale geometry, leaks, or device loss.
-
-# Part 5 - Entity and Transient Geometry Capture
-
-Status: **not started**
-
-- [ ] Profile entity enumeration, mesh capture, texture sharing, vertex/index upload, entity BLAS creation, and transient retirement.
-- [ ] Verify adaptive capture throttling responds to measured load without visible popping beyond accepted criteria.
-- [ ] Avoid recapturing unchanged eligible entities when identity, pose, material, and texture state make reuse safe.
-- [ ] Bound entity/particle capture work and memory under dense scenes.
-- [ ] Audit atlas/custom texture reference churn and duplicate interop resources.
-- [ ] Provide manual checkpoints for animated entities, particles, teleport, world unload, shader reload, and disabled entity capture.
-
-Exit condition: entity-heavy frame time/stutter improves without stale transforms, missing geometry, or unsafe texture lifetimes.
-
-# Part 6 - TLAS Instances, Build, and Reuse
-
-Status: **not started**
-
-- [ ] Profile CPU instance encoding, pointer arena/instance-buffer updates, GPU TLAS build, scratch allocation, and queued BLAS waits.
-- [ ] Separate persistent section instances from transient entity instances in measurements.
-- [ ] Verify build-vs-update mode choices and flags using actual topology-change patterns.
-- [ ] Reuse rotating TLAS/scratch slots only when prior submissions are complete.
-- [ ] Audit instance masks, custom indices, SBT offsets, transforms, and stale section removal.
-- [ ] Provide manual checkpoints for static camera, moving entities, chunk churn, mass unload, and world switch.
-
-Exit condition: TLAS CPU/GPU time or wait time improves with identical visible instances and safe slot reuse.
-
-# Part 7 - Per-Frame Java Orchestration and Allocation Churn
-
-Status: **not started**
-
-- [ ] Profile `MixinIrisRenderingPipeline.runRayTracing` and `VulkanPipeline.renderPostShadows` by substage.
-- [ ] Audit repeated `DLSSConfig.load`, shaderpack detection, requirement checks, image/view wrapping, lists/arrays, and temporary reference objects.
-- [ ] Measure command-pool/buffer and shared binary-semaphore creation per frame before considering reuse.
-- [ ] Reuse frame-local objects only with explicit frame-in-flight and completion rules.
-- [ ] Check UBO allocation/map/unmap/flush behavior and persistent mapping opportunities supported by the allocator.
-- [ ] Ensure exceptions and device-loss paths still close every acquired reference.
-
-Exit condition: CPU frame time/allocation pressure improves without cross-frame aliasing or resource leaks.
-
-# Part 8 - OpenGL/Vulkan Interop and Synchronization
-
-Status: **not started**
-
-- [ ] Measure `glSignal`, Vulkan submit wait, Vulkan completion signal, and `glWait` independently.
-- [ ] Audit the exact image set and layouts returned by `HybridInterop.collect`; avoid synchronizing unused resources.
-- [ ] Verify entity textures, G-buffers, outputs, atlases, and custom textures have correct ownership and visibility.
-- [ ] Identify queue bubbles caused by early/late signal placement or overbroad stage/access masks.
-- [ ] Consolidate transitions/barriers only when equivalent resource hazards are proven.
-- [ ] Provide manual checkpoints for NVIDIA/other supported vendors, resize, minimize/restore, shader reload, and exception recovery.
-
-Exit condition: interop wait/bubble time improves with validation-clean ownership and no flicker/corruption.
-
-# Part 9 - Frame Images, Descriptors, Barriers, and Pass Graph
-
-Status: **not started**
-
-- [ ] Profile `RtxFrameImages.ensureAllocated`, layout initialization, descriptor allocation/update, set binding, and pass-to-pass barriers.
-- [ ] Confirm frame images reallocate only when render/output dimensions or required formats actually change.
-- [ ] Cache descriptor sets only when every bound resource lifetime and dynamic offset remains valid.
-- [ ] Make `RtxPassGraph` resource reads/writes explicit enough to derive minimal correct transitions.
-- [ ] Avoid recreating image views for stable resources when `SharedImageViewTracker` can safely retain them.
-- [ ] Audit fallback/empty descriptor sets and optional bindings for needless work and null-resource safety.
-- [ ] Validate multi-pass shaderpacks, legacy binding layouts, custom textures, and Iris SSBOs.
-
-Exit condition: encoding/descriptor/barrier overhead decreases with all reflected layouts still supported.
-
-# Part 10 - Ray-Tracing Shaders and GPU Traversal
-
-Status: **not started**
-
-- [ ] Profile raygen, closest-hit, any-hit, miss, and each pass independently where tooling permits.
-- [ ] Record invocation/ray counts for primary, sun shadow, indirect, reflection/refraction, blocklight, section-light visibility, probe fill, and volumetric work.
-- [ ] Inspect register pressure, occupancy, divergence, memory transactions, and traversal cost rather than source size alone.
-- [ ] Remove disabled/debug-only work from release permutations while retaining supported modes.
-- [ ] Add early exits before expensive ray queries, grid walks, gathers, or BRDF paths whose contribution is provably zero.
-- [ ] Audit ray flags, cull masks, distance bounds, SBT selection, alpha handling, and duplicated traversal.
-- [ ] Hoist invariant calculations and repeated buffer/image reads where generated code confirms duplication.
-- [ ] Preserve sky/miss sidecar writes and all DLSS/RR guide contracts.
-- [ ] Compare still quality and temporal behavior during motion.
-
-High-cost candidates to measure, not assume:
-
-- `INDIRECT_BOUNCES=3` in the current tracked/default shader settings
-- `BLOCKLIGHT_SAMPLES=8` when `RT_BLOCKLIGHT_PROBES` is active
-- `SECTION_LIGHT_SPARSE_RT_SAMPLES=8` only on the conditional sparse/cached section-light paths that use it
-- Section-grid search radius 2, potentially a `5 x 5 x 5` neighborhood
-- Six-face trilinear probe gathers, documented as up to 48 reads
-- Reflection/refraction continuation rays
-- `VOLUMETRIC_SAMPLES=8` in the Balanced profile, plus conditional visibility rays; other profiles select 4/12/24
-- Large live state/control flow in `ray0.rgen`
-
-Exit condition: GPU/RT time improves outside variance in multiple scenes without unacceptable noise or material/lighting regressions.
-
-# Part 11 - Section Lights, Probe Workers, GPU Cache, and Feedback
-
-Status: **not started**
-
-- [ ] Profile CPU extraction/update, neighbor invalidation, worker jobs, sorting, directory generation, uploads, feedback clearing, and shader sampling.
-- [ ] Record active lights/pages, dirty backlog, build latency, eviction, directory/hash probe failures, cache hits, atomics, and uploaded bytes.
-- [ ] Avoid rebuilding/dirtying unchanged pages and repeated neighbor cascades.
-- [ ] Audit worker count, scratch buffers, synchronization, slot eviction policy, and world-change cleanup.
-- [ ] Reduce GPU cache population stampedes and redundant exact-surface visibility work without breaking ready/in-flight state transitions.
-- [ ] Change trilinear/confidence/source-shape work only after bandwidth/cost evidence.
-- [ ] Provide manual checkpoints for walls/leaks, page boundaries, multiple emitters, chunk loading, darkness, and cache warm-up motion.
-
-Exit condition: CPU/GPU probe cost or warm-up improves without light leaks, missing lights, square halos, or stale pages.
-
-# Part 12 - Resolution, DLSS/RR, FSR, and Final Composition
-
-Status: **not started**
-
-- [ ] Profile resolution selection, resource prepare/recreate, parameter validation, native evaluation, transitions, and final blit separately.
-- [ ] Verify render/output dimensions, alignment, formats, jitter, motion scale, exposure, reset flags, matrices, and delta time.
-- [ ] Avoid repeated native/config initialization and resource recreation when dimensions/mode are stable.
-- [ ] Audit copies/blits that can be avoided through safe direct output binding.
-- [ ] Validate fallback after DLSS/RR failure and temporal reset when mode, scale, world, or camera continuity changes.
-- [ ] Provide manual checkpoints for DLSS RR, standard DLSS, FSR, disabled/noisy output, DLAA/full resolution, and unsupported hardware.
-- [ ] Inspect every guide debug view for NaN/Inf, invalid ranges, edges, disocclusion, and camera motion.
-
-Exit condition: reconstruction/composition time or resource churn improves without ghosting, boundary artifacts, exposure shifts, or broken fallback.
-
-# Part 13 - Memory, Pools, Uploads, and Resource Lifetimes
-
-Status: **not started**
-
-- [ ] Record heap, native, device-local, host-visible, shared-image, AS, descriptor, scratch, and upload memory over time.
-- [ ] Profile allocation/free counts, pool growth, fragmentation, mapped flushes, staging copies, and delayed retirement.
-- [ ] Audit `VRef` ownership at every acquire/addRef/close boundary and all exception paths.
-- [ ] Right-size reusable buffers with measured high-water marks and bounded shrink/eviction behavior.
-- [ ] Verify frame-in-flight resources are never recycled before queue completion.
-- [ ] Provide manual checkpoints for long sessions with chunk churn, repeated resize, shader reload, dimension switch, and DLSS mode switching.
-
-Exit condition: memory footprint/churn improves or remains bounded with no leaks, use-after-free, or premature retirement.
-
-# Part 14 - Configuration, Reload, Resize, World Change, and Recovery
-
-Status: **not started**
-
-- [ ] Measure and deduplicate config file reads, shaderpack detection, option propagation, and pipeline rebuild triggers.
-- [ ] Ensure a setting changes only the minimum resources/pipelines/history that actually depend on it.
-- [ ] Validate temporal reset ownership across `UBODataEncoder`, `JitterManager`, reservoirs, and `DLSSDProcessor`.
-- [ ] Audit shader reload queue-idle scope and replace only where narrower synchronization is proven safe.
-- [ ] Verify resize/minimize, camera teleport, dimension/world switch, device loss, native DLSS failure, and shader compilation failure.
-- [ ] Confirm fallback leaves Iris/Minecraft usable and does not leak the old pipeline.
-
-Exit condition: lifecycle transitions are faster and deterministic with no stale history or partially destroyed state.
-
-# Part 15 - Shutdown and Destruction
+### Part 3 - Build Cache Request Lists
 
 Status: **in progress**
 
-- [ ] Map destruction order for active pipelines, DLSS/NGX, probe workers, pending BLAS jobs, TLAS/BLAS, command queues, images/buffers/views, semaphores, and Vulkan context.
-- [ ] Ensure worker producers stop before consumers/allocators are destroyed.
-- [x] Retain a BLAS worker thread handle, stop accepting work, define drain-versus-cancel behavior, wake the worker, and join it before closing its query pool, decode pipeline, AS pool, queues, or device.
-- [ ] Shut down the probe executor before freeing state its running tasks can publish into; verify interruption and late-result handling instead of relying on `shutdownNow` alone.
-- [ ] Drain or fail pending/in-flight `CommandSubmissionRequest` futures and release their retained command-buffer/semaphore references on every shutdown and device-loss path.
-- [ ] Drain only queues/submissions needed for safe retirement; retain full idle waits if narrower proof is absent.
-- [ ] Identify the unique owner that destroys `CommandManager`, `SyncManager`, allocators, Vulkan device, debug messenger, surface, and instance; add explicit idempotent teardown where no owner exists.
-- [ ] Verify idempotent cleanup after partial initialization and device loss.
-- [x] Provide manual checkpoints for repeated launch/quit, world join/leave, shader reload then quit, and quit during heavy chunk work.
-- [ ] Check logs and native memory for late work, double closes, leaked resources, and hangs.
+- [x] Define request keys for section probe cells, diffuse radiance entries,
+  reflection entries, and refraction entries.
+- [x] Generate section-probe requests from section dirty queues.
+- [ ] Generate visible G-buffer pixel requests.
+- [ ] Generate reflection/refraction surface requests.
+- [ ] Ingest feedback-buffer requests.
+- [x] Deduplicate requests by stable key before dispatch.
+- [x] Prioritize visible, high-error, high-luma, and near-camera requests.
+- [x] Cap request count per frame and carry backlog across frames.
 
-Manual checkpoint for the retained BLAS shutdown change: start the existing
-`ray-tracing-test-place` world, fly fast enough to trigger chunk/BLAS work, then
-quit while chunks are still loading. Repeat with a warmed static scene, world
-join/leave, and shader reload then quit. User-owned observations to record:
-whether shutdown hangs, whether logs contain `[BLAS Builder] Worker stopped during
-shutdown`, and whether there are late BLAS errors or resource double-close warnings.
+Part 3 implementation notes (`code-verified`):
 
-Exit condition: shutdown is bounded, clean, and safe under normal and failure paths.
+- `CacheRequestKey` now defines stable key shapes for section-probe cells,
+  diffuse radiance entries, reflection entries, and refraction entries.
+- `CacheRequestQueue` deduplicates requests by stable key, merges duplicate
+  requests by retaining stronger visibility/error/luma/near-camera priority,
+  caps backlog size, and drains sorted batches up to a per-frame budget.
+- `SectionLightManager` now tracks dirty section-probe RT request cursors per
+  probe page, emits at most the caller's budget of section-probe cell requests
+  per frame, and carries un-emitted cells across frames without expanding every
+  dirty page into request objects at once.
+- `VulkanPipeline` owns the central request queue, collects section-probe
+  requests in cache modes, clears pending request state on world changes and
+  pipeline destroy, and logs throttled request stats.
+- `cache_resolve_only` gathers pending requests but does not drain them as a
+  processed batch because no RT-capable fill pass runs in that mode.
+- `cache_fill` drains a bounded request batch, but the current shader still uses
+  the transitional full-screen RT pass. The drained list is not yet bound to a
+  request-driven cache-fill shader.
 
-# Part 16 - Quality Scaling and Final Integration
+Exit condition not yet met: request lists exist for section-probe dirty work,
+but visible G-buffer, reflection/refraction, and feedback-buffer request sources
+are still pending, and RT work is not yet driven by the request list.
+
+### Part 4 - Version and Invalidate Caches
 
 Status: **not started**
 
-- [ ] Keep the original visual target as the no-quality-loss reference.
-- [ ] If requested, define explicit Low/Medium/High/Ultra budgets separately from algorithmic optimizations.
-- [ ] Ask the user to manually review the final combined changes in the flows they care about.
-- [ ] Record user-observed performance, smoothness, lighting, material, stability, startup/reload, resize, and shutdown results without declaring them independently.
-- [ ] Compile all active RT stages and relevant feature permutations.
-- [ ] Run `./gradlew validateVulkaniteShaderpackDrift` only if the user explicitly allows validation commands.
-- [ ] Inspect the complete diff for generated-file edits, unrelated changes, stale comments, descriptor mismatches, unsafe indices, and unbounded loops.
-- [ ] Record every rejected experiment and every user-confirmed retained win.
+- [ ] Add per-section geometry and light versions where they do not already
+  exist.
+- [ ] Add material/PBR atlas versioning or conservative invalidation.
+- [ ] Track world id, dimension id, shaderpack generation, sky/time generation,
+  and cache layout generation.
+- [ ] Store enough version data with each cache entry to reject stale hits.
+- [ ] Audit chunk removal, BLAS stale result rejection, shader reload, world
+  switch, resize, and DLSS/RR mode changes.
 
-Completion target: user-confirmed improvement or clearly documented manual-flow cleanup, no critical visual/synchronization/lifetime regression, and enough source/diff context that another agent can continue.
+Exit condition: cache hits can be accepted or rejected by explicit validity data.
 
-# Status Board
+### Part 5 - Section Blocklight Probe Cache First
+
+Status: **not started**
+
+- [ ] Use the existing section-light probe RT cache as the first cache-first
+  implementation target.
+- [ ] Verify ready/in-flight state transitions in `ray0.rgen` and
+  `SectionLightManager`.
+- [ ] Prevent sparse RT validation from running on already-ready cache cells.
+- [ ] Use feedback to request only missing/stale probe faces or surface cells.
+- [ ] Add debug views for ready, in-flight, stale, fallback, and validated cells.
+- [ ] Manual checkpoint: user checks walls, caves, page boundaries, several
+  nearby emitters, fast chunk loading, and darkness after warm-up.
+
+Exit condition: blocklight can reach a cache-hit state where steady frames avoid
+repeating the same validation rays.
+
+### Part 6 - Diffuse Radiance Cache
+
+Status: **not started**
+
+- [ ] Choose backing structure: section-local grid, sparse world hash, or probe
+  extension. Prefer simple world/section cache before neural approaches.
+- [ ] Fill entries from RT requests, not full-screen pixels.
+- [ ] Resolve diffuse indirect from cache plus direct/ambient terms.
+- [ ] Define fallback for empty entries and progressive warm-up behavior.
+- [ ] Avoid light leaks with normal bias, visibility/distance confidence, and
+  neighbor invalidation.
+- [ ] Manual checkpoint: interiors, thin walls, caves, sun changes, block updates,
+  chunk streaming, and camera motion.
+
+Exit condition: diffuse indirect no longer requires full-frame RT after warm-up.
+
+### Part 7 - Reflection and Refraction Cache
+
+Status: **not started**
+
+- [ ] Split surface classification from ray tracing: identify reflective and
+  refractive pixels cheaply from G-buffer/material data.
+- [ ] Reuse screen-space history where valid before requesting world-space RT.
+- [ ] Cache stable material/surface results with roughness, normal, material id,
+  medium, and depth/position validity.
+- [ ] Trace only misses, disocclusions, invalid entries, or high-error surfaces.
+- [ ] Preserve specular hit-distance guide validity for DLSS/RR.
+- [ ] Manual checkpoint: water, glass, ice, metals, grazing angles, camera motion,
+  and fast lighting changes.
+
+Exit condition: reflection/refraction rays are sparse validation work, not a
+per-pixel steady-state loop.
+
+### Part 8 - Frame Orchestration and RT Gating
+
+Status: **not started**
+
+- [ ] Add a frame decision before `passGraph.execute`: `NO_RT`,
+  `CACHE_FILL_ONLY`, `FULL_RT_REFERENCE`, or `DISABLED`.
+- [ ] Skip `RtxPassGraph.execute` when cache state and debug mode allow `NO_RT`.
+- [ ] Ensure resource transitions, semaphores, command buffers, and final
+  composition still run correctly when RT is skipped.
+- [ ] Keep queue lifetime and retained resource references safe for both RT and
+  no-RT frames.
+- [ ] Record counters: RT dispatches skipped, cache requests processed, backlog,
+  hit rate, stale rejects, fallback pixels.
+
+Exit condition: Vulkanite can present valid frames without tracing rays every
+frame.
+
+### Part 9 - Descriptor, Image, and Pipeline Cleanup
+
+Status: **not started**
+
+- [ ] Stop allocating/updating descriptor sets for RT passes on `NO_RT` frames.
+- [ ] Avoid recreating image views for stable resources.
+- [ ] Keep cache buffers/images resident across frames with explicit retirement.
+- [ ] Create separate descriptor layouts for cache fill and cache resolve if that
+  reduces per-frame binding churn.
+- [ ] Audit barriers between cache-fill writes, resolve reads, DLSS/RR reads, and
+  final blit.
+
+Exit condition: CPU encode and descriptor overhead also drops on cache-hit frames.
+
+### Part 10 - Shader Cost After Gating
+
+Status: **not started**
+
+- [ ] Optimize raygen/closest-hit/any-hit only after RT is no longer mandatory
+  every frame.
+- [ ] Profile or inspect remaining cache-fill rays by category: blocklight,
+  diffuse radiance, reflection, refraction, sun visibility, volumetric work.
+- [ ] Add early exits for zero contribution before any ray query or grid walk.
+- [ ] Remove debug-only and disabled work from release permutations while keeping
+  debug/reference modes available.
+- [ ] Preserve miss shader sky writes and all DLSS/RR guide contracts.
+
+Exit condition: remaining RTX-active frames are cheaper, bounded, and visually
+acceptable.
+
+### Part 11 - Reconstruction, Upscaling, and Guides
+
+Status: **not started**
+
+- [ ] Verify cache resolve writes every DLSS/RR guide with valid ranges.
+- [ ] Reset temporal state on mode, scale, world, camera cut, and invalid cache
+  transitions.
+- [ ] Confirm fallback after DLSS/RR failure does not force full RT unless the
+  debug/reference mode requests it.
+- [ ] Manual checkpoint: DLSS RR, standard DLSS, FSR, disabled/noisy output, and
+  unsupported hardware.
+
+Exit condition: reconstruction remains stable when RT is skipped on cache-hit
+frames.
+
+### Part 12 - Lifecycle, Reload, Resize, and Recovery
+
+Status: **not started**
+
+- [ ] Ensure shader reload invalidates cache layouts and pipelines safely.
+- [ ] Ensure resize recreates image-sized outputs but preserves valid world-space
+  caches.
+- [ ] Ensure world switch and dimension change clear or version all cache families.
+- [ ] Ensure device loss or native DLSS failure leaves Iris/Minecraft usable.
+- [ ] Keep manual checkpoints for startup, shader reload, resize, world switch,
+  and recovery.
+
+Exit condition: cache state does not survive across incompatible lifecycle
+changes.
+
+### Part 13 - Memory and Cache Budgets
+
+Status: **not started**
+
+- [ ] Define memory budgets for each cache family.
+- [ ] Evict by last use, distance, version mismatch, and low confidence.
+- [ ] Track device-local, host-visible, shared-image, AS, descriptor, scratch, and
+  upload memory.
+- [ ] Verify cache buffers are not freed while in use by submitted work.
+- [ ] Manual checkpoint: long session, chunk churn, repeated resize, shader
+  reload, dimension switch, and DLSS mode switching.
+
+Exit condition: cache memory stays bounded and lifetime-safe.
+
+### Part 14 - Shutdown and Destruction
+
+Status: **in progress**
+
+- [ ] Map destruction order for active pipelines, DLSS/NGX, probe workers,
+  pending BLAS jobs, TLAS/BLAS, command queues, cache buffers/images, semaphores,
+  and Vulkan context.
+- [x] Retain a BLAS worker thread handle, stop accepting work, wake the worker,
+  cancel queued jobs, and join before closing builder-owned BLAS resources.
+- [x] Shut down section probe workers before freeing state their tasks can publish
+  into.
+- [ ] Drain or fail pending `CommandSubmissionRequest` futures and release retained
+  command-buffer/semaphore references on shutdown and device-loss paths.
+- [ ] Identify the owner that destroys `CommandManager`, `SyncManager`,
+  allocators, Vulkan device, debug messenger, surface, and instance.
+- [ ] Verify partial initialization cleanup and idempotent destroy.
+- [x] Provide manual checkpoints for repeated launch/quit, world join/leave,
+  shader reload then quit, and quit during heavy chunk work.
+
+Manual checkpoint: start `ray-tracing-test-place`, fly fast enough to trigger
+chunk/BLAS/probe work, then quit while chunks are still loading. Repeat with a
+warmed static scene, world join/leave, and shader reload then quit. Record whether
+shutdown hangs and whether logs show `[BLAS Builder] Worker stopped during
+shutdown` and `[Vulkanite] Section probe workers stopped during shutdown` without
+late BLAS/probe errors, probe timeout warnings, or double-close warnings.
+
+Exit condition: shutdown is bounded and clean for both RT and no-RT cache-hit
+frames.
+
+### Part 15 - Quality Scaling and Final Integration
+
+Status: **not started**
+
+- [ ] Keep full RT reference mode as the no-quality-loss comparison path.
+- [ ] Treat quality levels as explicit user-facing tradeoffs, not hidden
+  optimizations.
+- [ ] Ask the user to review final combined changes in the flows they care about.
+- [ ] Record user-observed performance, smoothness, lighting, material, stability,
+  startup/reload, resize, and shutdown results.
+- [ ] Compile active RT/cache-fill/cache-resolve stages and relevant permutations.
+- [ ] Run shaderpack drift validation only if the user explicitly allows it.
+- [ ] Inspect the complete diff for generated-file edits, unrelated changes,
+  stale comments, descriptor mismatches, unsafe indices, and unbounded loops.
+
+Completion target: user-confirmed improvement or clearly documented cache-first
+cleanup with no critical visual, synchronization, descriptor, or lifetime
+regression.
+
+## Status Board
 
 | Part | Owner | State | Result or blocker |
 |---|---|---|---|
-| 0 - Manual scope/targets | Codex | in progress | Machine/config snapshot, lifecycle cases, acceptance thresholds, manual-review mode, next area, and retained-change manual checkpoint recorded. |
-| 1 - Instrumentation/cost map | unassigned | not started | - |
-| 2 - Build/startup/shaders | unassigned | not started | - |
-| 3 - Chunk capture/lights | unassigned | not started | - |
-| 4 - BLAS | unassigned | not started | - |
-| 5 - Entity capture | unassigned | not started | - |
-| 6 - TLAS | unassigned | not started | - |
-| 7 - Frame orchestration | unassigned | not started | - |
-| 8 - GL/Vulkan interop | unassigned | not started | - |
-| 9 - Images/descriptors/pass graph | unassigned | not started | - |
-| 10 - RT shaders/traversal | unassigned | not started | - |
-| 11 - Section lights/probes | unassigned | not started | - |
-| 12 - DLSS/RR/FSR/composition | unassigned | not started | - |
-| 13 - Memory/lifetimes | unassigned | not started | - |
-| 14 - Reload/resize/recovery | unassigned | not started | - |
-| 15 - Shutdown | Codex | in progress | BLAS worker stop/join and builder-owned BLAS resource cleanup implemented; probe executor, pending command futures, and VContext teardown remain open. |
-| 16 - Final integration | unassigned | not started | - |
+| 0 - Manual scope | Codex | in progress | Manual mode and RT cache-fill contract recorded; current per-frame RT path source-verified. |
+| 1 - Current RT outputs | Codex | complete | Output contract, DLSS/RR consumers, and current trace branches mapped from source. |
+| 2 - Split RT/resolve | Codex | complete | Compute cache resolve path added with `full_rt_reference`, `cache_fill`, and `cache_resolve_only`; default remains full RT reference. |
+| 3 - Cache requests | Codex | in progress | Stable keys, dedupe/priority/backlog, and section-probe dirty queue requests added; visible pixel/reflection/refraction/feedback sources still pending. |
+| 4 - Cache versioning | unassigned | not started | Needed to avoid stale lighting. |
+| 5 - Section blocklight cache | unassigned | not started | First practical target because cache machinery already exists. |
+| 6 - Diffuse radiance cache | unassigned | not started | Main GI steady-state win. |
+| 7 - Reflection/refraction cache | unassigned | not started | Needed to stop per-pixel continuation rays. |
+| 8 - Frame RT gating | unassigned | not started | Skip `RtxPassGraph.execute` on cache-hit frames. |
+| 9 - Descriptors/images/pipelines | unassigned | not started | Removes CPU overhead on no-RT frames. |
+| 10 - Shader cost after gating | unassigned | not started | Optimize only remaining cache-fill RT work. |
+| 11 - Reconstruction/guides | unassigned | not started | Keep DLSS/RR valid when RT is skipped. |
+| 12 - Lifecycle/recovery | unassigned | not started | Cache invalidation across reload/resize/world changes. |
+| 13 - Memory/cache budgets | unassigned | not started | Keep cache memory bounded. |
+| 14 - Shutdown/destruction | Codex | in progress | BLAS worker and section probe shutdown improved; command futures and context teardown remain open. |
+| 15 - Final integration | unassigned | not started | User-observed outcome required. |
 
 Allowed states: `not started`, `in progress`, `blocked`, `complete`, `rejected`.
 
-# Evidence Ledger
-
-In manual-review mode, use this ledger for code-verified findings, retained diffs, and user-observed outcomes. Do not add automated benchmark/test results unless the user explicitly asks for the run.
+## Evidence Ledger
 
 | Date | Agent | Part | Build/scene/settings | Metric | Before | After | Delta | Correctness checks | Decision |
 |---|---|---:|---|---|---:|---:|---:|---|---|
 | 2026-06-20 | Codex | 0 | `979a61c`, current dirty tree | Runtime shaderpack mismatched files | 0 | 0 | 0 | pre-sync `git diff --no-index`; Gradle drift validation passed | Baseline sanity retained |
 | 2026-06-20 | Codex | 0 | runtime options | Minecraft FPS cap | 60 FPS | 260 FPS | +200 FPS headroom | VSync remains off; Vulkanite internal pacer code-verified disabled | Retained for uncapped baseline only |
-| 2026-06-20 | Codex | 15 | current dirty tree, manual review | BLAS shutdown ownership | worker had no retained stop/join path | cooperative cancel, wake, join, and owned-resource cleanup path | code-verified | source inspection; `git diff --check`; `./gradlew classes` | Retained pending user shutdown observation |
+| 2026-06-20 | User/Codex | 0 | manual review | RT runtime contract | plan implied normal per-frame RT | RTX should fill/validate radiance, reflection, refraction caches, then turn off | user-provided architecture clarification | document update only | Cache-first rewrite retained |
+| 2026-06-20 | Codex | 0 | source inspection | Full-frame RT dispatch | `passGraph.execute` called every eligible frame and reaches `traceRays` | target is gated RT with cache resolve | target | `VulkanPipeline`, `RtxPassGraph`, `RenderPassExecutor`, `ray0.rgen` inspected | Rewrite plan around gating and cache resolve |
+| 2026-06-20 | Codex | 1 | current dirty tree, manual review | RT output contract | Part 1 unmapped | `ray0.rgen` outputs and DLSS/RR consumers mapped; no instrumentation added | code-verified | `ray0.rgen`, injected `restir.glsl`, `RtxFrameImages`, `RenderPassExecutor`, `DLSSDProcessor`, `DLSSBridge`, `dlss_wrapper.cpp`, G-buffer shaders inspected; `git diff --check` | Part 2 can design cache resolve against explicit outputs |
+| 2026-06-20 | Codex | 2 | current dirty tree, manual review | No-RT frame composition path | `encodeRtxFrame` always reached `passGraph.execute` and `RenderPassExecutor.traceRays` when TLAS existed | `cache_resolve_only` skips TLAS/full RT and dispatches `CacheResolvePass`; `cache_fill` runs full RT then resolve; `full_rt_reference` remains default | code-verified | `VulkanPipeline`, `VulkaniteConfig`, `CacheResolvePass`; compute shader validated with `glslangValidator -V -S comp`; `git diff --check`; no-index whitespace check for new resolver file; `./gradlew classes` | Retained pending user visual/runtime observation |
+| 2026-06-20 | Codex | 3 | current dirty tree, manual review | Cache request list plumbing | Part 3 had no stable request keys or bounded backlog | Stable request keys, dedupe/priority queue, section-probe dirty request cursors, per-frame cap, and throttled request stats | code-verified | `SectionLightManager`, `SectionDirectionalProbePage`, `VulkanPipeline`, `cache/*`; `git diff --check`; `./gradlew classes` | Retained as infrastructure; not yet request-driven RT |
+| 2026-06-20 | Codex | 14 | current dirty tree, manual review | BLAS shutdown ownership | worker had no retained stop/join path | cooperative cancel, wake, join, and owned-resource cleanup path | code-verified | source inspection; `git diff --check`; `./gradlew classes` | Retained pending user shutdown observation |
+| 2026-06-20 | Codex | 14 | clean live tree at start of pass, manual review | Section probe executor shutdown ownership | `destroy()` cleared manager state then relied on `shutdownNow` while running tasks could still publish results | manager marks shutdown, cancels queued probe work, waits up to `vulkanite.probeShutdownJoinMs`, discards late results, then frees state | code-verified | source inspection; `git diff --check`; `./gradlew classes` | Retained pending user shutdown observation |
 | - | - | - | - | - | - | - | - | - | - |
 
-# Changed-File Ledger
+## Changed-File Ledger
 
 | Date | Agent | Part | Files | Purpose | Validation |
 |---|---|---:|---|---|---|
-| 2026-06-20 | document setup | planning | `plans/OPTIMIZATION_AGENT_FLOW.md` | Define complete optimization/handoff flow | `git diff --check` |
-| 2026-06-20 | Codex verification | planning | `plans/OPTIMIZATION_AGENT_FLOW.md` | Correct startup/reset/shutdown claims and add measurement/lifetime detail | source audit; no-index whitespace check; Gradle drift validation |
-| 2026-06-20 | Codex | 0 | `plans/OPTIMIZATION_AGENT_FLOW.md`, `plans/optimization-baseline/*` | Record Part 0 environment/config evidence and reproducible capture contract | `classes`; shaderpack sync/drift validation; `git diff --check` |
-| 2026-06-20 | Codex | 0 | `scripts/optimization/Capture-VulkaniteBaseline.ps1`, `scripts/optimization/Summarize-VulkaniteBaseline.ps1`, runtime `run/options.txt` | Automate config/telemetry/frame capture and remove the 60 FPS measurement cap | PowerShell syntax audit; runtime option/hash check; PresentMon empty-output behavior reproduced |
-| 2026-06-20 | Codex | 0 | `plans/OPTIMIZATION_AGENT_FLOW.md` | Switch the plan to manual-flow review and block new tests/captures unless explicitly requested | Markdown-only patch; no tests run by request |
-| 2026-06-20 | Codex | 15 | `src/main/java/me/cortex/vulkanite/acceleration/AccelerationBlasBuilder.java`, `src/main/java/me/cortex/vulkanite/acceleration/AccelerationManager.java`, `src/main/java/me/cortex/vulkanite/acceleration/blas/BLASBuildWorker.java`, `src/main/java/me/cortex/vulkanite/acceleration/blas/BLASBatchProcessor.java`, `src/main/java/me/cortex/vulkanite/acceleration/blas/BLASCompactor.java`, `src/main/java/me/cortex/vulkanite/acceleration/blas/BLASMemoryManager.java`, `src/main/java/me/cortex/vulkanite/lib/memory/AccelerationStructurePool.java`, `src/main/java/me/cortex/vulkanite/lib/memory/PoolLinearAllocator.java`, `src/main/java/me/cortex/vulkanite/lib/pipeline/VComputePipeline.java`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Stop/join BLAS worker on shutdown, cancel queued BLAS jobs, and release builder-owned BLAS resources after the worker stops | `git diff --check`; `./gradlew classes` |
+| 2026-06-20 | Codex | planning | `plans/OPTIMIZATION_AGENT_FLOW.md` | Rewrite optimization flow around cache-first RT gating, explicit cache validity, and non-RT steady-state resolve | Markdown-only patch; `git diff --check` |
+| 2026-06-20 | Codex | 1 | `plans/OPTIMIZATION_AGENT_FLOW.md` | Record current raygen outputs, DLSS/RR guide contract, trace branches, and no-instrumentation decision | Markdown-only patch; `git diff --check` |
+| 2026-06-20 | Codex | 2 | `src/main/java/me/cortex/vulkanite/client/rendering/CacheResolvePass.java`, `src/main/java/me/cortex/vulkanite/client/rendering/VulkanPipeline.java`, `src/main/java/me/cortex/vulkanite/client/config/VulkaniteConfig.java`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Add compute cache resolve path, temporary RTX/cache mode switch, resolve-only frame orchestration, and Part 2 handoff notes | `glslangValidator -V -S comp`; `git diff --check`; no-index whitespace check for new resolver file; `./gradlew classes` |
+| 2026-06-20 | Codex | 3 | `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequest.java`, `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequestBatch.java`, `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequestFamily.java`, `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequestKey.java`, `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequestQueue.java`, `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequestSource.java`, `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequestStats.java`, `src/main/java/me/cortex/vulkanite/client/lighting/SectionDirectionalProbePage.java`, `src/main/java/me/cortex/vulkanite/client/lighting/SectionLightManager.java`, `src/main/java/me/cortex/vulkanite/client/rendering/VulkanPipeline.java`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Add stable cache request keys, dedupe/priority/backlog queue, section-probe dirty request generation, request logging, and Part 3 status notes | `git diff --check`; `./gradlew classes` |
+| 2026-06-20 | Codex | 14 | `src/main/java/me/cortex/vulkanite/acceleration/AccelerationBlasBuilder.java`, `src/main/java/me/cortex/vulkanite/acceleration/AccelerationManager.java`, `src/main/java/me/cortex/vulkanite/acceleration/blas/BLASBuildWorker.java`, `src/main/java/me/cortex/vulkanite/acceleration/blas/BLASBatchProcessor.java`, `src/main/java/me/cortex/vulkanite/acceleration/blas/BLASCompactor.java`, `src/main/java/me/cortex/vulkanite/acceleration/blas/BLASMemoryManager.java`, `src/main/java/me/cortex/vulkanite/lib/memory/AccelerationStructurePool.java`, `src/main/java/me/cortex/vulkanite/lib/memory/PoolLinearAllocator.java`, `src/main/java/me/cortex/vulkanite/lib/pipeline/VComputePipeline.java`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Stop/join BLAS worker on shutdown, cancel queued BLAS jobs, and release builder-owned BLAS resources after the worker stops | `git diff --check`; `./gradlew classes` |
+| 2026-06-20 | Codex | 14 | `src/main/java/me/cortex/vulkanite/client/lighting/SectionLightManager.java`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Stop accepting section probe work during shutdown, cancel queued probe tasks, wait for running tasks, discard late results, and free probe state afterward | `git diff --check`; `./gradlew classes` |
 
-# Rejected Experiments
+## Rejected Experiments
 
 | Date | Agent | Part | Experiment | Why rejected | Evidence | Revisit condition |
 |---|---|---:|---|---|---|---|
-| 2026-06-20 | Codex | 0 | Creating/running automated benchmark worlds, scripted scenes, capture harnesses, or A/B tests | User wants manual flow review and will tell the IA whether a change is better or worse | User directive in chat | Only if the user explicitly re-enables automated testing |
+| 2026-06-20 | Codex | 0 | Creating/running automated benchmark worlds, scripted scenes, capture harnesses, or A/B tests | User wants manual flow review and user-owned visual/performance judgment | User directive in chat | Only if the user explicitly re-enables automated testing |
+| 2026-06-20 | Codex | planning | Treating raygen micro-optimization as the primary plan | Full-frame RT every eligible frame is the architecture problem | Source inspection and user clarification | Revisit after RT gating and cache resolve exist |
+| 2026-06-20 | Codex | planning | Neural radiance cache as first implementation | Too complex for the first cache-first step and likely vendor/runtime-heavy | Research review | Revisit only after simple world/section cache is insufficient |
+| 2026-06-20 | Codex | 3 | Adding a blocking GPU feedback readback to make feedback-buffer requests look complete | Current tree has no general readback helper, and forcing synchronous readback would add synchronization risk before the request model is consumed | Source inspection of `VCmdBuff`, `MemoryManager`, section feedback buffer ownership | Revisit with an async readback/staging design or GPU-side request compaction pass |
 
-# Agent Completion Protocol
+## Agent Completion Protocol
 
 Before ending a part, the agent must:
 
-1. Re-read the part and check only items supported by evidence.
-2. Update its Status line and the Status Board.
-3. Add every retained/reverted change and every user-observed result to the Evidence Ledger.
+1. Re-read the relevant part and check only items backed by evidence.
+2. Update its status and the Status Board.
+3. Add retained/reverted changes and user observations to the Evidence Ledger.
 4. Add retained edits to the Changed-File Ledger.
 5. Add failed ideas to Rejected Experiments.
-6. Record commands/checks, source observations, user observations, correctness risks, and limitations.
-7. Replace `Latest handoff` below with current facts.
-8. Tell the user what completed, what improved, what remains, and the exact next action.
+6. Record commands/checks, source observations, correctness risks, and
+   limitations.
+7. Replace `Latest handoff` with current facts.
+8. Tell the user what completed, what remains, and the exact next action.
 
-# Next-Agent Handoff
-
-## Latest handoff
+## Latest Handoff
 
 - Agent/date: Codex / 2026-06-20
-- Part/status: Part 15 / in progress
-- Completed checklist items: BLAS builder now retains the worker thread, stops accepting new jobs on destroy, cancels queued-but-not-started BLAS batches, wakes the worker without interrupting in-flight submission waits, drains pending render-thread submissions while joining, and releases builder-owned BLAS query/pipeline/AS-pool resources only after the worker stops. Manual shutdown checkpoints are recorded above.
-- Pre-existing dirty files that overlapped this part: the acceleration/BLAS, command, rendering, and plan files were already dirty before this pass; treat earlier BLAS batching, compaction, timestamp, and stale-result logic as pre-existing unless isolated by this handoff.
-- Files changed by this agent: `AccelerationBlasBuilder.java`, `AccelerationManager.java`, `BLASBuildWorker.java`, `BLASBatchProcessor.java`, `BLASCompactor.java`, `BLASMemoryManager.java`, `AccelerationStructurePool.java`, `PoolLinearAllocator.java`, `VComputePipeline.java`, and `plans/OPTIMIZATION_AGENT_FLOW.md`.
-- Commands/checks and results: `git status --short` recorded a broad pre-existing dirty tree; `git diff --check` passed with line-ending warnings only; `./gradlew classes` passed with two existing DLSS deprecation warnings and generic unchecked/deprecated notes. No benchmark worlds, captures, A/B tests, or shaderpack drift validation were run.
-- Before/after measurements with sample count: none; this was a lifecycle correctness cleanup, not a performance capture.
-- Visual and temporal correctness checks: no rendering path, shader settings, guide formats, or quality settings were changed. User still owns visual/performance observations.
-- Synchronization/lifetime checks: code-verified BLAS shutdown order is stop accepting work, request worker shutdown, wake blocked acquire/park paths, process pending submissions while joining, cancel queued jobs, wait queue idle, then close BLAS query pools, decode pipeline, allocator pools, and AS pool. If the worker does not join within `vulkanite.blasShutdownJoinMs` (default 5000 ms), builder-owned resources are deliberately retained rather than closed under a live worker.
-- Rejected experiments: automated benchmark worlds, scripted scenes, capture harnesses, and A/B tests remain rejected for the current workflow unless the user explicitly re-enables them.
-- Known risks, limitations, or blockers: probe executor shutdown, pending/in-flight `CommandSubmissionRequest` failure/drain semantics, and explicit `VContext`/`CommandManager`/`SyncManager`/device/instance teardown remain open Part 15 items. Runtime shutdown logs have not yet been observed by the user.
-- Exact next recommended action: user manually checks repeated launch/quit, world join/leave, shader reload then quit, and quitting during active chunk loading; record whether shutdown hangs and whether logs show `[BLAS Builder] Worker stopped during shutdown` without late BLAS or double-close warnings.
+- Part/status: Part 3 / in progress
+- Completed checklist items: stable request keys for section probe cells,
+  diffuse radiance entries, reflection entries, and refraction entries;
+  section-probe requests generated from section dirty queues; stable-key
+  dedupe; priority scoring for visible/error/luma/near-camera signals;
+  per-frame request cap with carried backlog.
+- Pre-existing dirty files that overlapped this part:
+  `plans/OPTIMIZATION_AGENT_FLOW.md` was already dirty at the start of this
+  pass.
+- Files changed by this agent:
+  `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequest.java`,
+  `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequestBatch.java`,
+  `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequestFamily.java`,
+  `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequestKey.java`,
+  `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequestQueue.java`,
+  `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequestSource.java`,
+  `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequestStats.java`,
+  `src/main/java/me/cortex/vulkanite/client/lighting/SectionDirectionalProbePage.java`,
+  `src/main/java/me/cortex/vulkanite/client/lighting/SectionLightManager.java`,
+  `src/main/java/me/cortex/vulkanite/client/rendering/VulkanPipeline.java`,
+  `plans/OPTIMIZATION_AGENT_FLOW.md`.
+- Commands/checks and results: `git status --short`; `rg --files`; targeted
+  `Get-Content`/`rg` reads for `VulkanPipeline`, `CacheResolvePass`,
+  `RenderPassExecutor`, `RtxPassGraph`, `VulkaniteConfig`,
+  `SectionLightManager`, `SectionDirectionalProbePage`, `Vulkanite`, memory/cmd
+  helpers, and section-probe shader claim/complete helpers in `ray0.rgen`;
+  `git diff --check` passed; first `./gradlew classes` failed on a missing
+  `Vec3d` import in the new helper; import was added; rerun
+  `./gradlew classes` passed with existing DLSS deprecation/unchecked warnings.
+- Before/after measurements with sample count: none.
+- Visual and temporal correctness checks: no runtime visual pass was run.
+  Source checks verify request generation, scoring, and lifecycle clearing only;
+  image quality remains user-observed.
+- Synchronization/lifetime checks: request state is CPU-side only; pending
+  central requests and section-probe request cursors are cleared on world change,
+  pipeline destroy, section removal, probe page removal, and probe page eviction.
+- Rejected experiments: no blocking GPU feedback readback was added because the
+  current tree has no general readback helper and forcing one would exceed the
+  source-backed Part 3 slice.
+- Known risks, limitations, or blockers: visible G-buffer pixel requests,
+  reflection/refraction surface requests, and feedback-buffer ingestion remain
+  pending; `cache_fill` drains a bounded batch but still runs the transitional
+  full-screen RT pass, so RT work is not yet truly request-driven; Part 4
+  validity/version data is still needed before cache hits can be trusted.
+- Exact next recommended action: add a GPU-visible request/feedback path that
+  turns visible cache misses and reflective/refractive surface classifications
+  into `CacheRequestKey`s, then bind the drained `cache_fill` batch to a sparse
+  section-probe cache-fill shader instead of the full-screen raygen.
 
-## Required handoff template
+## Required Handoff Template
 
 ```text
 Agent/date:
