@@ -1,0 +1,3 @@
+## 2024-05-18 - Eliminating Java Streams in Hot Rendering Paths
+**Learning:** In highly called methods like `VulkanPipeline.renderPostShadows`, utilizing Java Streams (e.g., `.stream().mapToInt().toArray()`) and enhanced loops creates substantial hidden per-frame garbage. Both lambda creation/capture and the underlying Iterator instantiation put unnecessary pressure on the GC, which can cause micro-stutters during rendering.
+**Action:** When working in hot rendering paths, always use explicit traditional loops with basic arrays or lists pre-sized correctly. For uniform data across arrays, utilize `Arrays.fill` rather than manual streaming or loops to map identical values, completely sidestepping allocations.
