@@ -257,11 +257,19 @@ public class VCmdBuff extends VObject {
     }
 
     public void encodeMemoryBarrier() {
+        encodeMemoryBarrier(
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_ACCESS_MEMORY_WRITE_BIT,
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    }
+
+    public void encodeMemoryBarrier(int srcStage, int dstStage, int srcAccess, int dstAccess) {
         try (var stack = stackPush()) {
             var barrier = VkMemoryBarrier.calloc(1, stack);
-            barrier.get(0).sType$Default().srcAccessMask(VK_ACCESS_MEMORY_WRITE_BIT)
-                    .dstAccessMask(VK_ACCESS_MEMORY_READ_BIT);
-            vkCmdPipelineBarrier(this.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            barrier.get(0).sType$Default().srcAccessMask(srcAccess)
+                    .dstAccessMask(dstAccess);
+            vkCmdPipelineBarrier(this.buffer, srcStage, dstStage,
                     0, barrier, null, null);
         }
     }

@@ -11,6 +11,7 @@ import me.cortex.vulkanite.client.rendering.cache.CacheRequestFamily;
 import me.cortex.vulkanite.client.rendering.cache.CacheRequestQueue;
 import me.cortex.vulkanite.client.rendering.cache.CacheRequestStats;
 import me.cortex.vulkanite.client.rendering.cache.DiffuseRadianceCache;
+import me.cortex.vulkanite.client.rendering.cache.SpecularTransportCache;
 import me.cortex.vulkanite.compat.IVGImage;
 import me.cortex.vulkanite.compat.RaytracingShaderSet;
 import me.cortex.vulkanite.lib.base.VContext;
@@ -52,6 +53,7 @@ import java.util.Objects;
 import java.util.Set;
 
 import static org.lwjgl.util.vma.Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
 import static org.lwjgl.vulkan.VK10.*;
 
 /**
@@ -75,7 +77,7 @@ public class VulkanPipeline {
     private static final int[] EMPTY_GL_SEMAPHORE_IDS = new int[0];
     private static final int MAX_CACHE_REQUEST_BACKLOG = 16_384;
     private static final int MAX_CACHE_REQUESTS_PER_FRAME = 256;
-    private static final long CACHE_REQUEST_LOG_INTERVAL_NANOS = 5_000_000_000L;
+    private static final long FRAME_PATH_LOG_INTERVAL_NANOS = 5_000_000_000L;
 
     public record CustomTexture(String name, VRef<VGImage> image) {
     }
@@ -101,6 +103,7 @@ public class VulkanPipeline {
     private final CacheResolvePass cacheResolvePass;
     private final CacheFeedbackPass cacheFeedbackPass;
     private final DiffuseRadianceCache diffuseRadianceCache = new DiffuseRadianceCache();
+    private final SpecularTransportCache specularTransportCache = new SpecularTransportCache();
     private final CacheRequestQueue cacheRequestQueue = new CacheRequestQueue(MAX_CACHE_REQUEST_BACKLOG);
     private final RtxFrameImages frameImages = new RtxFrameImages();
     private final DLSSDProcessor dlssdProcessor;
@@ -112,6 +115,7 @@ public class VulkanPipeline {
     private String currentShaderpackName;
     private boolean shaderpackInitialized;
     private boolean entityCacheStateActive;
+    private boolean entityCaptureInitialized;
     private net.minecraft.world.World lastWorld;
     private net.minecraft.util.math.Vec3d lastCameraPos;
     private boolean dlssTemporalPathActive;
@@ -119,7 +123,10 @@ public class VulkanPipeline {
     private int entityCaptureFrame;
     private int transientCaptureThrottle = 1;
     private RtxCacheMode lastLoggedRtxCacheMode;
-    private long lastCacheRequestLogNanos;
+    private long lastFrameOrchestrationLogNanos;
+    private long referenceRtDispatches;
+    private long cacheFillDispatches;
+    private long rtDispatchesSkipped;
     private boolean destroyed;
 
     public VulkanPipeline(VContext ctx, AccelerationManager accelerationManager, RaytracingShaderSet[] passes,
@@ -309,12 +316,28 @@ public class VulkanPipeline {
         VRef<VSemaphore> vulkanDoneSemaphore = null;
         VRef<VAccelerationStructure> tlas = null;
         VRef<me.cortex.vulkanite.lib.cmd.VCmdBuff> cmdRef = null;
+        CacheRequestBatch frameRequestBatch = null;
+        RtxFrameDecision frameDecision = RtxFrameDecision.DISABLED;
 
         try {
             RtxCacheMode rtxCacheMode = VulkaniteConfig.getInstance().getRtxCacheMode();
             logRtxCacheMode(rtxCacheMode);
-            beginCompatibilityFrame(rtxCacheMode.requiresTlas(), camera);
-            List<VRef<VGImage>> entityTextureImages = accelerationManager.getEntityTextureImages();
+            beginCommandFrame();
+            boolean dlssRuntimeEligible = dlssdProcessor.canUseConfiguredRenderScale(mc, dlssConfig);
+            if (CacheInvalidationTracker.global().recordDlssMode(dlssConfig, dlssRuntimeEligible)) {
+                resetTemporalHistory();
+            }
+            recordSkyGeneration();
+            int frameIndex = SystemTimeUniforms.COUNTER.getAsInt();
+            frameRequestBatch = collectCacheRequests(camera, frameIndex, rtxCacheMode);
+            frameDecision = RtxFrameDecision.decide(rtxCacheMode, frameRequestBatch.hasWork());
+            updateTransientEntityGeometry(
+                    frameDecision.needsTlas(),
+                    frameDecision == RtxFrameDecision.NO_RT,
+                    camera);
+            List<VRef<VGImage>> entityTextureImages = frameDecision.usesRayTracing()
+                    ? accelerationManager.getEntityTextureImages()
+                    : List.of();
             HybridInterop.ImageBatch imageBatch;
             try {
                 imageBatch = HybridInterop.collect(vgOutImgs, gbufferViews, entityTextureImages);
@@ -335,16 +358,21 @@ public class VulkanPipeline {
             }
             var cmd = cmdRef.get();
 
-            if (rtxCacheMode.requiresTlas()) {
+            if (frameDecision.needsTlas()) {
                 profiler.push("build_tlas");
                 tlas = accelerationManager.buildTLAS(0, cmd);
                 profiler.pop();
             }
 
-            if (tlas != null || !rtxCacheMode.usesFullRtPass()) {
+            if (frameDecision.needsTlas() && tlas == null) {
+                frameDecision = RtxFrameDecision.DISABLED;
+            }
+
+            if (frameDecision != RtxFrameDecision.DISABLED) {
                 profiler.push("encode_rtx");
                 encodeRtxFrame(cmd, tlas, vgOutImgs, outImgs, camera, ssbos, celestialUniforms,
-                        gbufferViews, renderWidth, renderHeight, rtxCacheMode);
+                        gbufferViews, renderWidth, renderHeight,
+                        frameDecision, frameRequestBatch, frameIndex);
                 profiler.pop();
             } else {
                 updateTemporalPathState(false);
@@ -355,14 +383,19 @@ public class VulkanPipeline {
             long execution = ctx.cmd.submit(
                     0, cmdRef, Arrays.asList(glReadySemaphore), Arrays.asList(vulkanDoneSemaphore), null);
             cacheFeedbackPass.markEncodedFeedbackSubmitted(execution);
+            recordFrameDecision(frameDecision);
             vulkanDone.get().glWait(EMPTY_GL_SEMAPHORE_IDS, imageBatch.glIds(), imageBatch.glLayouts());
         } catch (DeviceLostException e) {
             cacheFeedbackPass.discardEncodedFeedback();
+            cacheFeedbackPass.invalidateScreenHistory();
+            requeueFailedCacheFill(frameDecision, frameRequestBatch);
             LOGGER.error("Device lost during hybrid RTX frame", e);
             Vulkanite.IS_ENABLED = false;
             throw e;
         } catch (Exception e) {
             cacheFeedbackPass.discardEncodedFeedback();
+            cacheFeedbackPass.invalidateScreenHistory();
+            requeueFailedCacheFill(frameDecision, frameRequestBatch);
             LOGGER.error("Hybrid RTX frame failed", e);
             updateTemporalPathState(false);
         } finally {
@@ -388,13 +421,26 @@ public class VulkanPipeline {
     }
 
     private void beginCompatibilityFrame(boolean captureEntityGeometry, Camera camera) {
+        beginCommandFrame();
+        updateTransientEntityGeometry(captureEntityGeometry, false, camera);
+    }
+
+    private void beginCommandFrame() {
         ctx.cmd.processPendingSubmissions();
         ctx.cmd.newFrame();
+    }
+
+    private void updateTransientEntityGeometry(
+            boolean captureEntityGeometry,
+            boolean retainWhenRayTracingIsSkipped,
+            Camera camera) {
         VulkaniteConfig config = VulkaniteConfig.getInstance();
         boolean captureTransientGeometry = config.rtxEntityCaptureEnabled;
         if (captureEntityGeometry && supportsEntities && captureTransientGeometry) {
             int interval = Math.max(1, config.rtxEntityCaptureInterval) * transientCaptureThrottle;
-            if ((entityCaptureFrame++ % interval) == 0) {
+            entityCaptureFrame = Math.min(Integer.MAX_VALUE, entityCaptureFrame + 1);
+            if (!entityCaptureInitialized || entityCaptureFrame >= interval) {
+                entityCaptureFrame = 0;
                 long start = System.nanoTime();
                 EntityCapture.Frame capturedEntities = capture.capture(
                         CapturedRenderingState.INSTANCE.getTickDelta(),
@@ -407,6 +453,7 @@ public class VulkanPipeline {
                         Math.max(MIN_ENTITY_CAPTURE_RADIUS, config.rtxEntityCaptureRadius));
                 accelerationManager.setEntityData(capturedEntities);
                 entityCacheStateActive = capturedEntities != null;
+                entityCaptureInitialized = true;
                 CacheInvalidationTracker.global().recordEntityGeometryChanged();
                 long duration = System.nanoTime() - start;
                 if (duration > TRANSIENT_CAPTURE_BUDGET_NS) {
@@ -415,9 +462,15 @@ public class VulkanPipeline {
                     transientCaptureThrottle--;
                 }
             }
+        } else if (retainWhenRayTracingIsSkipped && supportsEntities && captureTransientGeometry) {
+            // Cache-hit frames do not need fresh transient BLAS data. Age the capture
+            // interval so the next bounded fill refreshes it, but keep the last capture
+            // resident instead of invalidating and rebuilding it on every RT/no-RT edge.
+            entityCaptureFrame = Math.min(Integer.MAX_VALUE, entityCaptureFrame + 1);
         } else {
             entityCaptureFrame = 0;
             transientCaptureThrottle = 1;
+            entityCaptureInitialized = false;
             if (entityCacheStateActive) {
                 accelerationManager.setEntityData(null);
                 entityCacheStateActive = false;
@@ -460,12 +513,10 @@ public class VulkanPipeline {
             VRef<VImageView>[] gbufferViews,
             int renderWidth,
             int renderHeight,
-            RtxCacheMode rtxCacheMode) {
+            RtxFrameDecision frameDecision,
+            CacheRequestBatch cacheRequestBatch,
+            int frameIndex) {
         DLSSConfig dlssConfig = DLSSConfig.load();
-        boolean dlssRuntimeEligible = dlssdProcessor.canUseConfiguredRenderScale(MinecraftClient.getInstance(), dlssConfig);
-        if (CacheInvalidationTracker.global().recordDlssMode(dlssConfig, dlssRuntimeEligible)) {
-            resetTemporalHistory();
-        }
         boolean dlssFrameActive = dlssdProcessor.prepareForFrame(
                 MinecraftClient.getInstance(), dlssConfig, frameImages, outImgs);
         updateTemporalPathState(dlssFrameActive);
@@ -483,27 +534,29 @@ public class VulkanPipeline {
 
         frameImages.initializeLayouts(cmd);
 
-        List<VRef<VImage>> sampledImages = collectSampledImages();
+        List<VRef<VImage>> sampledImages = frameDecision.usesRayTracing()
+                ? collectSampledImages()
+                : List.of();
         List<VRef<VImage>> gbufferImages = collectGbufferImages(gbufferViews);
         transitionImages(cmd, sampledImages, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         transitionImages(cmd, gbufferImages, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
         var sunPos = celestialUniforms.invokeGetSunPosition();
-        recordSkyGeneration();
-        int frameIndex = SystemTimeUniforms.COUNTER.getAsInt();
         int debugMode = mapDebugMode(dlssConfig.getDebugType());
-        CacheRequestBatch cacheRequestBatch = collectCacheRequests(camera, frameIndex, rtxCacheMode);
         VRef<VBuffer> sectionLightBuffer = null;
         VRef<VBuffer> sectionLightProbeBuffer = null;
         VRef<VBuffer> sectionLightProbeFeedbackBuffer = null;
         VRef<VBuffer> sectionLightProbeFillRequestBuffer = null;
         VRef<VBuffer> diffuseRadianceCacheBuffer = null;
         VRef<VBuffer> diffuseRadianceFillRequestBuffer = null;
+        VRef<VBuffer> specularTransportCacheBuffer = null;
+        VRef<VBuffer> specularTransportFillRequestBuffer = null;
         try {
-            if (rtxCacheMode.usesFullRtPass() || rtxCacheMode.usesCacheResolvePass()) {
+            if (frameDecision.usesRayTracing() || frameDecision.usesCacheResolve()) {
                 diffuseRadianceCacheBuffer = diffuseRadianceCache.ensureCacheGpuBuffer(ctx, cmd);
+                specularTransportCacheBuffer = specularTransportCache.ensureCacheGpuBuffer(ctx, cmd);
             }
-            if (rtxCacheMode.usesFullRtPass()) {
+            if (frameDecision.usesRayTracing()) {
                 var sectionLightManager = Vulkanite.INSTANCE.getSectionLightManager();
                 sectionLightBuffer = sectionLightManager.ensureGpuBuffer(ctx, cmd);
                 sectionLightProbeBuffer = sectionLightManager.ensureProbeGpuBuffer(ctx, cmd);
@@ -513,6 +566,8 @@ public class VulkanPipeline {
                         sectionLightManager.ensureProbeFillRequestGpuBuffer(ctx, cmd, cacheRequestBatch);
                 diffuseRadianceFillRequestBuffer =
                         diffuseRadianceCache.ensureFillRequestGpuBuffer(ctx, cmd, cacheRequestBatch);
+                specularTransportFillRequestBuffer =
+                        specularTransportCache.ensureFillRequestGpuBuffer(ctx, cmd, cacheRequestBatch);
             }
 
             RtxPassGraph.Frame frame = new RtxPassGraph.Frame(
@@ -543,8 +598,14 @@ public class VulkanPipeline {
                     dlssConfig.isReSTIREnabled() ? 1 : 0,
                     debugMode,
                     dlssConfig.getDebugCellIndex(),
+                    frameDecision.isCacheFillOnly() ? -1 : 0,
+                    frameImages.storageViews(frameIndex),
                     frameImages.currentReservoir(frameIndex),
                     frameImages.previousReservoir(frameIndex),
+                    frameImages.currentSpecularHistory(frameIndex),
+                    frameImages.previousSpecularHistory(frameIndex),
+                    frameImages.currentSpecularSurfaceHistory(frameIndex),
+                    frameImages.previousSpecularSurfaceHistory(frameIndex),
                     frameImages.diffuseAlbedoMetallic(),
                     frameImages.specularAlbedo(),
                     frameImages.normalRoughness(),
@@ -559,19 +620,39 @@ public class VulkanPipeline {
                     sectionLightProbeFillRequestBuffer,
                     diffuseRadianceCacheBuffer,
                     diffuseRadianceFillRequestBuffer,
+                    specularTransportCacheBuffer,
+                    specularTransportFillRequestBuffer,
                     frameImages.radiance(),
                     renderWidth,
-                    renderHeight);
-            if (rtxCacheMode.usesFullRtPass()) {
+                    renderHeight,
+                    frameDecision.isCacheFillOnly()
+                            ? Math.max(1, cacheRequestBatch.parallelDispatchWidth())
+                            : renderWidth,
+                    frameDecision.isCacheFillOnly() ? 1 : renderHeight);
+            if (frameDecision.usesRayTracing()) {
                 passGraph.execute(frame);
+                // Visible rays publish transport payloads and then mark entries ready.
+                // Make those writes visible to later compute consumers.
+                cmd.encodeMemoryBarrier(
+                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_SHADER_WRITE_BIT,
+                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             }
-            if (rtxCacheMode.collectsCacheRequests()) {
+            if (frameDecision.usesCacheResolve()) {
                 cacheFeedbackPass.execute(frame);
             }
-            if (rtxCacheMode.usesCacheResolvePass()) {
-                cacheResolvePass.execute(frame, rtxCacheMode == RtxCacheMode.CACHE_RESOLVE_ONLY);
+            if (frameDecision.usesCacheResolve()) {
+                cacheResolvePass.execute(frame, true);
+                cacheFeedbackPass.markScreenHistoryResolved();
             }
         } finally {
+            if (specularTransportFillRequestBuffer != null) {
+                specularTransportFillRequestBuffer.close();
+            }
+            if (specularTransportCacheBuffer != null) {
+                specularTransportCacheBuffer.close();
+            }
             if (diffuseRadianceFillRequestBuffer != null) {
                 diffuseRadianceFillRequestBuffer.close();
             }
@@ -601,8 +682,8 @@ public class VulkanPipeline {
         closeAll(gbufferImages);
     }
 
-    private CacheRequestBatch collectCacheRequests(Camera camera, int frameIndex, RtxCacheMode rtxCacheMode) {
-        if (!rtxCacheMode.collectsCacheRequests()) {
+    private CacheRequestBatch collectCacheRequests(Camera camera, int frameIndex, RtxCacheMode mode) {
+        if (!mode.collectsCacheRequests()) {
             cacheFeedbackPass.clearPendingFeedback();
             CacheRequestStats stats = cacheRequestQueue.snapshot();
             return new CacheRequestBatch(List.of(), stats.backlog(), stats);
@@ -617,19 +698,31 @@ public class VulkanPipeline {
                 cameraSection(camera),
                 frameIndex,
                 MAX_CACHE_REQUESTS_PER_FRAME);
+
         CacheRequestBatch batch;
-        if (rtxCacheMode == RtxCacheMode.CACHE_FILL) {
+        if (mode == RtxCacheMode.CACHE_ON_HIT) {
             batch = cacheRequestQueue.drainBatch(
                     MAX_CACHE_REQUESTS_PER_FRAME,
                     frameIndex,
                     request -> request.key().family() == CacheRequestFamily.SECTION_PROBE_CELL
-                            || request.key().family() == CacheRequestFamily.DIFFUSE_RADIANCE);
+                            || request.key().family() == CacheRequestFamily.DIFFUSE_RADIANCE
+                            || request.key().family() == CacheRequestFamily.REFLECTION
+                            || request.key().family() == CacheRequestFamily.REFRACTION);
         } else {
             CacheRequestStats stats = cacheRequestQueue.snapshot();
             batch = new CacheRequestBatch(List.of(), stats.backlog(), stats);
         }
-        logCacheRequestBatch(rtxCacheMode, batch, sectionRequests, feedbackRequests);
+        logCacheRequestBatch(mode, batch, sectionRequests, feedbackRequests);
         return batch;
+    }
+
+    private void requeueFailedCacheFill(RtxFrameDecision decision, CacheRequestBatch batch) {
+        if (decision != RtxFrameDecision.CACHE_FILL_ONLY || batch == null) {
+            return;
+        }
+        for (var request : batch.requests()) {
+            cacheRequestQueue.requeue(request);
+        }
     }
 
     private void logCacheRequestBatch(
@@ -638,25 +731,15 @@ public class VulkanPipeline {
             int sectionRequests,
             int feedbackRequests) {
         CacheRequestStats stats = batch.stats();
-        boolean hasActivity = batch.hasWork()
-                || sectionRequests > 0
-                || feedbackRequests > 0
-                || stats.backlog() > 0;
-        if (!hasActivity) {
+        long now = System.nanoTime();
+        if (now - lastFrameOrchestrationLogNanos < FRAME_PATH_LOG_INTERVAL_NANOS) {
             return;
         }
-
-        long now = System.nanoTime();
-        if (LOGGER.isTraceEnabled()) {
-            LOGGER.trace("[Vulkanite] Cache requests: mode={}, batch={}, section={}, feedback={}, backlog={}, enqueued={}, merged={}, drained={}, dropped={}",
-                    mode.configValue(), batch.size(), sectionRequests, feedbackRequests, stats.backlog(),
-                    stats.enqueued(), stats.merged(), stats.drained(), stats.dropped());
-        } else if (now - lastCacheRequestLogNanos >= CACHE_REQUEST_LOG_INTERVAL_NANOS) {
-            lastCacheRequestLogNanos = now;
-            LOGGER.info("[Vulkanite] Cache requests: mode={}, batch={}, section={}, feedback={}, backlog={}, enqueued={}, merged={}, drained={}, dropped={}",
-                    mode.configValue(), batch.size(), sectionRequests, feedbackRequests, stats.backlog(),
-                    stats.enqueued(), stats.merged(), stats.drained(), stats.dropped());
-        }
+        LOGGER.info("[Vulkanite] Cache requests: mode={}, batch={}, section={}, feedback={}, backlog={} (probe={}, diffuse={}, reflection={}, refraction={}), enqueued={}, merged={}, drained={}, dropped={}, throttled={}",
+                mode.configValue(), batch.size(), sectionRequests, feedbackRequests, stats.backlog(),
+                stats.sectionProbeBacklog(), stats.diffuseRadianceBacklog(),
+                stats.reflectionBacklog(), stats.refractionBacklog(),
+                stats.enqueued(), stats.merged(), stats.drained(), stats.dropped(), stats.throttled());
     }
 
     private static ChunkSectionPos cameraSection(Camera camera) {
@@ -665,13 +748,43 @@ public class VulkanPipeline {
         }
         Vec3d pos = camera.getPos();
         return ChunkSectionPos.from(
-                floorToSection(pos.x),
-                floorToSection(pos.y),
-                floorToSection(pos.z));
+                (int) Math.floor(pos.x) >> 4,
+                (int) Math.floor(pos.y) >> 4,
+                (int) Math.floor(pos.z) >> 4);
     }
 
-    private static int floorToSection(double coordinate) {
-        return (int) Math.floor(coordinate) >> 4;
+    private void recordFrameDecision(RtxFrameDecision decision) {
+        switch (decision) {
+            case FULL_RT_REFERENCE -> referenceRtDispatches++;
+            case CACHE_FILL_ONLY -> cacheFillDispatches++;
+            case NO_RT -> rtDispatchesSkipped++;
+            case DISABLED -> {
+            }
+        }
+
+        long now = System.nanoTime();
+        if (now - lastFrameOrchestrationLogNanos < FRAME_PATH_LOG_INTERVAL_NANOS) {
+            return;
+        }
+        lastFrameOrchestrationLogNanos = now;
+        String rtDispatch = switch (decision) {
+            case CACHE_FILL_ONLY -> "BOUNDED_REQUESTS";
+            case FULL_RT_REFERENCE -> "FULL_FRAME";
+            case NO_RT -> "SKIPPED";
+            case DISABLED -> "DISABLED";
+        };
+        CacheRequestStats requests = cacheRequestQueue.snapshot();
+        CacheFeedbackPass.Metrics metrics = cacheFeedbackPass.snapshotMetrics();
+        LOGGER.info("[Vulkanite] Frame RT path: decision={}, fillFrames={}, referenceFrames={}, noRtFrames={}, rtDispatch={}, backlog={}, cacheHits={}/{}, fallbackSamples={}",
+                decision,
+                cacheFillDispatches,
+                referenceRtDispatches,
+                rtDispatchesSkipped,
+                rtDispatch,
+                requests.backlog(),
+                metrics.cacheHits(),
+                metrics.cacheQueries(),
+                metrics.fallbackPixels());
     }
 
     private static AbstractTexture getBlockAtlasTexture() {
@@ -819,6 +932,7 @@ public class VulkanPipeline {
             cacheRequestQueue.clear();
             cacheFeedbackPass.clearPendingFeedback();
             diffuseRadianceCache.reset();
+            specularTransportCache.reset();
             Vulkanite.INSTANCE.getSectionLightManager().clear();
             resetTemporalHistory();
         }
@@ -855,6 +969,9 @@ public class VulkanPipeline {
 
     private void resetTemporalHistory() {
         UBODataEncoder.resetTemporalHistory();
+        if (cacheFeedbackPass != null) {
+            cacheFeedbackPass.invalidateScreenHistory();
+        }
         JitterManager.reset();
         JitterManager.setDLSSActive(false);
         if (dlssdProcessor != null) {
@@ -912,6 +1029,7 @@ public class VulkanPipeline {
             cacheRequestQueue.clear();
             cacheFeedbackPass.clearPendingFeedback();
             diffuseRadianceCache.reset();
+            specularTransportCache.reset();
             resetTemporalHistory();
         }
         shaderpackInitialized = true;
@@ -930,6 +1048,7 @@ public class VulkanPipeline {
         cacheFeedbackPass.clearPendingFeedback();
         dlssdProcessor.cleanup();
         diffuseRadianceCache.destroy();
+        specularTransportCache.destroy();
         cacheFeedbackPass.destroy();
         cacheResolvePass.destroy();
         renderPassExecutor.destroy();

@@ -1,25 +1,26 @@
-# Vulkanite Cache-First Optimization Plan
+# Vulkanite RTX Trace-Misses, Resolve-Hits Plan
 
-This is the shared source of truth for making Vulkanite lighting light. The goal is
-not to make the current full-frame RT shader a little faster. The goal is to stop
-using full-frame RT as steady-state lighting.
+This is the shared source of truth for the current Vulkanite RT flow.
 
-User clarification on 2026-06-20: RT/RTX is for validation and cache fill. RTX
-runs when radiance, reflection, or refraction data is missing, stale, or needs
-validation, writes or validates the cache, then turns off once cached data is
-usable.
+User override on 2026-06-22: RTX traces missing/stale transport, publishes it to
+the caches, and stops tracing once the visible working set is valid. Cache-hit
+frames use deferred compute resolve and issue no RT dispatch. Full-frame RT is
+retained only as the explicit `full_rt_reference` comparison mode. This latest
+instruction supersedes the earlier 2026-06-22 full-frame-every-frame override.
 
 ## Objective
 
-Make steady-state frames cheap by replacing per-frame full-resolution RT with:
+Make the live renderer cache-first and bounded:
 
-1. A bounded RTX cache-fill path for missing or stale lighting data.
-2. A non-RT cache resolve path that runs every eligible frame.
-3. Explicit cache validity and invalidation rules for world, geometry, lighting,
-   material, camera, shaderpack, resolution, and temporal state changes.
+1. Classify visible cache hits/misses from the deferred G-buffer without RT.
+2. Dispatch at most 256 request invocations only while missing/stale entries
+   exist; each invocation fills section, diffuse, reflection, or refraction data.
+3. Resolve the full visible frame and DLSS/RR guides from resident caches in
+   compute, including immediately after a fill dispatch.
+4. Skip TLAS construction and `traceRays` completely when the working set hits.
+5. Keep explicit cache validity, invalidation, fallback, and retry rules.
 
-Success means steady-state cache-hit frames avoid unnecessary `traceRays` work
-without using stale radiance, reflection, refraction, probe, or guide data.
+Success means RTX is validation/cache-fill work, not a permanent per-frame tax.
 
 ## Working Mode
 
@@ -60,6 +61,12 @@ way.
   https://research.nvidia.com/publication/2021-06_real-time-neural-radiance-caching-path-tracing
   Key idea: learn a radiance cache while rendering. Treat as future work unless
   the user explicitly wants neural-cache complexity.
+- Photonics (Minecraft mod and source):
+  https://modrinth.com/mod/photonics
+  https://github.com/Redi2Go/PhotonicEngine
+  Key idea in the Minecraft 1.20.1 `0.2.5` implementation: defer lighting from
+  surface buffers, spatially bin block lights, progressively finish their
+  visibility, and reuse indirect light through temporal and world-surface caches.
 - Minecraft PTGI:
   https://github.com/MahoganyTown/Minecraft-PTGI
   Useful comparison for path-traced GI plus SVGF/TAA, but not the main path to
@@ -69,55 +76,91 @@ way.
   Useful Minecraft-specific comparison for voxelization, ray-tested occlusion,
   and cheaper colored block lighting.
 
-## Current Code-Verified Problem
+### Photonics mod deferred-lighting investigation (2026-06-22)
 
-Current default/reference source flow still runs RT every eligible frame. Part 2
-adds a temporary `cache_resolve_only` path that skips `traceRays`, but the
-default remains `full_rt_reference` until request lists, cache validity, and
-quality checkpoints make cache-hit steady state trustworthy.
+The relevant project is Redi2Go's Photonics mod. The exact Minecraft 1.20.1
+`0.2.5` jar and its shaders were inspected (`code-verified` for Photonics;
+`inferred` when mapped to Vulkanite):
 
-- [VulkanPipeline.java](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/src/main/java/me/cortex/vulkanite/client/rendering/VulkanPipeline.java:454)
-  calls `passGraph.execute(...)` inside the per-frame render path.
+- Photonics lights deferred surface data rather than making local lighting part
+  of a monolithic final-color pass. Its history validation searches a 5x5
+  neighborhood and requires a close world position plus nearly identical normal.
+- Block lights are stored in 8-block spatial bins. A surface evaluates at most
+  20 unfinished local lights per frame and carries a cursor in temporal history,
+  so completed light work can be reused instead of starting from light zero.
+- Indirect light uses a distance-quantized world-surface key containing position
+  and axis-normal orientation. A small open-addressed hash cache atomically
+  accumulates samples; resolve gathers compatible tangent-plane entries and
+  avoids publishing cache entries on block edges to reduce cross-surface leaks.
+- Visibility is software voxel traced through hierarchical occupancy, including
+  sub-block voxel models. This is a useful alternative for stable block-light
+  occlusion when hardware RT would be disproportionately expensive.
+- This release does not implement the requested strict stop rule: temporal data
+  receives probabilistic refresh and indirect entries can continue accumulating
+  to 2048 samples. Vulkanite must retain explicit versioned completion and
+  `NO_RT` after convergence rather than copying that behavior.
+- Current Photonics branches add a ReSTIR DI pipeline with temporal reservoirs,
+  spatial reuse, accumulation, and denoising. That is newer than the 1.20.1
+  release and is relevant only for selecting among many unfinished lights, not
+  as justification for tracing valid cache hits.
+
+Decision for Vulkanite: build a separately keyed surface direct-light cache.
+Key it by section/cell, quantized surface position and normal, geometry version,
+and light-list generation. Store accumulated radiance plus a light cursor or
+coverage state. Section light bins identify relevant lights; only unfinished or
+invalid light slots may create RTX fill requests. Once coverage is complete and
+the versions still match, deferred resolve consumes the entry and the frame stays
+`NO_RT`. Use strict surface validation and edge rejection because the previous
+coarse probe-face reuse leaked across unrelated surfaces. Evaluate hierarchical
+voxel occupancy as the cheaper local-blocklight visibility backend in Part 10;
+do not replace Vulkanite's G-buffer with Photonics' full-screen primary software
+voxel tracing.
+
+## Current Code-Verified Flow
+
+`cache_on_hit` (and the legacy persisted alias `cache_fill`) now means automatic
+trace-misses/resolve-hits orchestration. The asynchronous deferred feedback pass
+adds only missing/stale visible entries to a bounded queue. A non-empty batch
+selects `CACHE_FILL_ONLY`, builds the TLAS, and dispatches at `batchSize x 1`.
+An empty batch selects `NO_RT`, skips TLAS and the RT pass graph, and runs compute
+resolve. `full_rt_reference` remains the only render-resolution RT path.
+
+- [VulkanPipeline.java](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/src/main/java/me/cortex/vulkanite/client/rendering/VulkanPipeline.java)
+  collects misses before the frame decision and calls `passGraph.execute(...)`
+  only for `CACHE_FILL_ONLY` or `FULL_RT_REFERENCE`.
 - [RtxPassGraph.java](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/src/main/java/me/cortex/vulkanite/client/rendering/RtxPassGraph.java:34)
   loops every reflected RT pass.
-- [RenderPassExecutor.java](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/src/main/java/me/cortex/vulkanite/client/rendering/RenderPassExecutor.java:448)
-  calls `traceRays(renderWidth, renderHeight, 1)`.
-- [ray0.rgen](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/shaderpacks/VulkaniteRT/shaders/ray0.rgen:3918)
-  still contains per-frame reflection/refraction/indirect/section-light RT work.
+- [RenderPassExecutor.java](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/src/main/java/me/cortex/vulkanite/client/rendering/RenderPassExecutor.java)
+  calls `traceRays(batchSize, 1, 1)` for bounded fills.
+- [ray0.rgen](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/shaderpacks/VulkaniteRT/shaders/ray0.rgen)
+  exits immediately after request population when the cache execution mode is
+  negative, before full-frame visibility or lighting work.
 - [ray0.rgen](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/shaderpacks/VulkaniteRT/shaders/ray0.rgen:1638)
   already has section-light probe RT cache read/write machinery, which should be
   treated as a foothold for the cache-first rewrite.
 - [CacheResolvePass.java](C:/Users/PCGAMER/Documents/GitHub/vulkanite-1.20.1/src/main/java/me/cortex/vulkanite/client/rendering/CacheResolvePass.java)
-  now provides a non-RT compute resolve/debug path for Part 2, but it is still
-  fallback lighting rather than a real cache-hit implementation.
+  reads diffuse/specular transport caches and writes the visible frame and
+  guides without RT.
 
 These are source observations, not performance measurements.
 
-## Target Architecture
+## Active Architecture
 
 ```mermaid
 flowchart TD
-    A[Minecraft/Iris raster compatibility pass] --> B[G-buffer and material inputs]
-    B --> C[Collect world, section, light, material, entity, camera versions]
-    C --> D[Build cache request lists]
-    D --> E{Any cache work needed within budget?}
-    E -->|yes| F[RTX cache-fill/validation pass]
-    F --> G[Write radiance/reflection/refraction/probe cache entries]
-    E -->|no| H[No RT dispatch this frame]
-    G --> I[Cache resolve pass]
-    H --> I
-    I --> J[Write radiance, DLSS/RR guides, depth, motion, hit-distance outputs]
-    J --> K[DLSS/RR, DLSS, FSR, or fallback]
-    K --> L[Compose to Iris target]
-    L --> M[Retire resources after queue completion]
+    A[Minecraft/Iris G-buffer] --> B[Deferred cache feedback]
+    B --> C{Missing or stale entries?}
+    C -->|yes| D[Build TLAS and bounded request RT fill]
+    C -->|no| E[Skip TLAS and RT]
+    D --> F[Publish cache entries]
+    F --> G[Deferred cache resolve and guides]
+    E --> G
+    G --> H[DLSS/RR, DLSS, FSR, or fallback]
+    H --> I[Compose to Iris target]
+    I --> J[Retire resources after queue completion]
 ```
 
-The important split is:
-
-- `Cache fill`: optional, bounded, RT-capable, driven by dirty/missing cache
-  requests.
-- `Cache resolve`: mandatory for rendered frames, non-RT if possible, samples
-  cache data and produces the same downstream outputs expected today.
+The invariant is simple: misses may trace; valid hits never trace.
 
 ## Cache Families
 
@@ -269,18 +312,18 @@ Part 2 implementation notes (`code-verified`):
   current reservoir clear, motion vectors, linear depth, diffuse/metallic,
   specular albedo, encoded normal/roughness, specular hit depth, first-hit
   depth, and blocklight detail from the hybrid G-buffer plus fallback lighting.
-- `cache_fill` runs the existing full RT pass, preserving current cache-fill
-  side effects such as section-probe RT cache writes, and keeps that pass's
-  radiance/guides for presentation. It still collects cache feedback but no
-  longer dispatches fallback resolve merely to overwrite and discard full-RT
-  frame products. Once real radiance caches exist, this mode can fill and then
-  resolve those caches explicitly.
-- `full_rt_reference` is the default and keeps the previous full-screen RT path
-  available for visual comparison.
+- Part 8 supersedes the transitional `cache_fill` behavior: it now dispatches
+  only a bounded request-sized fill and always runs compute resolve afterward.
+- `full_rt_reference` keeps the previous full-screen RT path available for
+  explicit visual comparison; `cache_fill` is now the default policy.
 - The full RT descriptor layout is unchanged. The compute resolve owns a
   separate reflected descriptor layout and pipeline.
 - Resolve fallback writes `10000.0` as unknown/miss specular hit distance;
   first-surface linear depth is not reused as a continuation-ray hit guide.
+- Resolve presentation is intentionally diagnostic: an empty diffuse/specular
+  cache presents flat G-buffer albedo, and an incomplete G-buffer also falls
+  back to any valid albedo attachment before using sky. This prevents fallback
+  lighting or Iris's compatibility frame from masquerading as a cache result.
 
 Exit condition met: `cache_resolve_only` can compose one frame from resolve
 outputs without mandatory full-screen RT. Runtime visual quality remains
@@ -467,9 +510,8 @@ Status: **in progress** (`source-complete`; manual checkpoint pending)
 Part 6 implementation notes (`code-verified`):
 
 - Backing structure selected: a sparse section-local world grid using the
-  existing feedback key shape. Feedback cells are `floor(absWorldPos * 0.5)`,
-  so each diffuse cell covers 2 blocks and `primarySectionKey()` maps 8 cells to
-  one 16-block chunk section.
+  existing feedback key shape. Diffuse cells are one block wide and
+  `primarySectionKey()` maps 16 cells to one 16-block chunk section.
 - Diffuse feedback keys now represent incident radiance by position and normal
   bucket, not surface material response. The feedback shader writes material
   bucket 0 for diffuse requests, and CPU ingestion enforces the same bucket
@@ -489,81 +531,271 @@ Part 6 implementation notes (`code-verified`):
   addressing. A live colliding entry is never evicted, and an already-ready key
   is immutable, so frame number and request order cannot continuously reshape
   warmed lighting.
-- Fill rays use a key-derived deterministic cosine sample from the normal-facing
-  side of the 2-block cell. Resolve binding 26 applies material response, keeps
-  direct/specular terms separate, and blends cached indirect at conservative
-  confidence over the existing ambient/blocklight fallback.
+- Feedback/fill records carry the actual visible-surface world position rather
+  than reconstructing an invented cell center. A fill traces and averages eight
+  deterministic cosine-weighted rays from that surface; reflection/refraction
+  fills use the same exact-origin contract. Resolve binding 26 applies material
+  response, keeps direct/specular terms separate, and gives valid multi-ray
+  entries strong confidence over the ambient/blocklight fallback.
 - Empty, stale, contended, or over-budget entries retain fallback lighting.
   Near-immediate cache-ray hits receive reduced confidence. World, shaderpack,
   scene geometry/light, material, sky bucket, and diffuse-family changes clear
   or version out the table conservatively.
+- The first resolve-only checkpoint exposed a prerequisite G-buffer regression:
+  `colortex1Format` through `colortex5Format` were written as properties even
+  though Iris 1.7.5 reads them as GLSL const directives. Runtime diagnostics
+  showed every sampled normal invalid and the Iris log showed all targets using
+  default `RGBA`. The terrain/entity fragment shaders now declare float formats
+  explicitly (`RGBA16F`, with `RGBA32F` world position), preventing signed
+  normals and unbounded world coordinates from being clamped by 8-bit targets.
+  Their OpenGL enum symbols are also declared explicitly because NVIDIA's core
+  GLSL compiler does not inject `RGBA16F`/`RGBA32F` identifiers.
+- The next float-target run exposed NaN normals. Terrain/entity vertex shaders
+  had hard-coded attribute locations that conflict with Iris's name-based
+  bindings; Iris 1.7.5 binds Sodium terrain normal/light/tangent at 10/4/13,
+  while the shader forced 4/3/5. The explicit locations are removed,
+  `vaTangent` is corrected to canonical `at_tangent`, and normal/TBN
+  normalization now has finite fallbacks.
+- Once geometry became valid, the resolve image was visibly offset from the
+  vanilla/Iris frame at DLSS render scale. Iris G-buffers remain 1920x1008 while
+  resolve ran at 1280x672, but resolve, feedback, and raygen used the low-res
+  integer pixel directly as the high-res texel. All three now map through
+  normalized screen UV, preserving full-frame correspondence across scales.
 
 Source-side exit condition is met. Manual checks remain pending, and Part 8 must
 still automate switching between RT fill and no-RT resolve frames.
 
 ### Part 7 - Reflection and Refraction Cache
 
-Status: **not started**
+Status: **in progress** (`source-complete`; manual checkpoint pending)
 
-- [ ] Split surface classification from ray tracing: identify reflective and
+- [x] Split surface classification from ray tracing: identify reflective and
   refractive pixels cheaply from G-buffer/material data.
-- [ ] Reuse screen-space history where valid before requesting world-space RT.
-- [ ] Cache stable material/surface results with roughness, normal, material id,
+- [x] Reuse screen-space history where valid before requesting world-space RT.
+- [x] Cache stable material/surface results with roughness, normal, material id,
   medium, and depth/position validity.
-- [ ] Trace only misses, disocclusions, invalid entries, or high-error surfaces.
-- [ ] Preserve specular hit-distance guide validity for DLSS/RR.
+- [x] Trace only misses, disocclusions, invalid entries, or high-error surfaces.
+- [x] Preserve specular hit-distance guide validity for DLSS/RR.
 - [ ] Manual checkpoint: water, glass, ice, metals, grazing angles, camera motion,
   and fast lighting changes.
 
 Exit condition: reflection/refraction rays are sparse validation work, not a
 per-pixel steady-state loop.
 
+Part 7 implementation notes (`code-verified`):
+
+- `SpecularTransportCache` owns a bounded 32,768-entry, generation-stamped GPU
+  hash and uploads at most 256 reflection/refraction fill records per fill
+  frame. Reflection and refraction share storage but retain distinct family
+  keys and invalidation generations.
+- Stable keys use one-block world cells, 64-bucket octahedral surface normals
+  and outgoing directions, roughness/material buckets, and refraction medium.
+  Refraction keys retain both reflected and transmitted direction buckets.
+- `CacheFeedbackPass` classifies reflective, water, glass, ice, crystal, and
+  thin-transparent surfaces from the G-buffer without RT. Ready world-cache
+  entries suppress duplicate requests before they enter the CPU backlog.
+- `cache_fill` uses bounded request records to trace continuation transport and
+  stores reflected/refracted incident radiance plus both hit distances. Its
+  per-pixel shading reads the cache and does not issue uncached continuation
+  rays. `full_rt_reference` keeps the previous per-pixel path for comparison.
+- `CacheResolvePass` reads the same cache without RT, applies per-pixel Fresnel,
+  tint, absorption, and roughness/metal response, and writes cached continuation
+  distance to `SpecularHitDepth`. Misses keep the explicit `10000.0` sentinel;
+  first-surface depth is never substituted.
+- World, shaderpack, sky, material, layout, temporal, scene geometry, and scene
+  light generations clear incompatible transport entries. Layout generation is
+  now 2 for bindings 28/29.
+- Two ping-pong screen-history pairs retain resolved specular radiance/hit
+  distance and a surface-validation record. Reprojection requires matching
+  one-block/material/direction key hash, normal dot at least 0.96, and linear
+  depth within `max(0.25, depth * 0.025)`; camera cuts, resize, mode changes,
+  and temporal resets disable history until a new resolve frame writes it.
+  Valid screen history suppresses a world-cache request and supplies resolve
+  fallback when the world entry is absent.
+
+The Part 7 exit condition is source-met, and Part 8 now provides same-session
+fill/resolve gating without discarding GPU caches. Manual material, motion,
+grazing-angle, and lighting-change checks remain pending.
+
 ### Part 8 - Frame Orchestration and RT Gating
 
-Status: **not started**
+Status: **in progress** (`source-complete`; manual runtime checkpoint pending)
 
-- [ ] Add a frame decision before `passGraph.execute`: `NO_RT`,
+- [x] Add a frame decision before `passGraph.execute`: `NO_RT`,
   `CACHE_FILL_ONLY`, `FULL_RT_REFERENCE`, or `DISABLED`.
-- [ ] Skip `RtxPassGraph.execute` when cache state and debug mode allow `NO_RT`.
-- [ ] Ensure resource transitions, semaphores, command buffers, and final
+- [x] Skip `RtxPassGraph.execute` when cache state and debug mode allow `NO_RT`.
+- [x] Ensure resource transitions, semaphores, command buffers, and final
   composition still run correctly when RT is skipped.
-- [ ] Keep queue lifetime and retained resource references safe for both RT and
+- [x] Keep queue lifetime and retained resource references safe for both RT and
   no-RT frames.
-- [ ] Record counters: RT dispatches skipped, cache requests processed, backlog,
+- [x] Record counters: RT dispatches skipped, cache requests processed, backlog,
   hit rate, stale rejects, fallback pixels.
 
 Exit condition: Vulkanite can present valid frames without tracing rays every
 frame.
 
+Part 8 implementation notes (`code-verified`):
+
+- `RtxFrameDecision` maps explicit reference/debug modes and turns the default
+  `cache_fill` policy into `CACHE_FILL_ONLY` only when a drained bounded request
+  batch exists; otherwise the same session selects `NO_RT`.
+- `CACHE_FILL_ONLY` raygen exits after section, diffuse, and specular request
+  population. Its dispatch is `batch.size() x 1` (at most 256 invocations), not
+  render resolution. Compute resolve then writes the full frame and guides.
+- Diffuse feedback now checks generation-stamped resident cache entries before
+  requesting them. This closes the perpetual-request loop that would otherwise
+  prevent the gate from settling. Reflection/refraction resident and screen
+  history checks contribute to the same hit/fallback counters.
+- `NO_RT` skips TLAS construction and `RtxPassGraph.execute`, but retains the
+  normal GL/Vulkan image collection, binary semaphore signal/wait, command
+  submission, feedback, cache resolve, composition, and image transitions.
+- Cache-fill writes are made visible before feedback/resolve with an explicit
+  ray-tracing-shader to compute-shader memory dependency. Failed pre-submit fills
+  requeue their requests, cache buffers stay pipeline-resident, and the existing
+  submission/descriptor retention path owns per-frame references.
+- Throttled logs report full-reference frames, bounded fill frames, no-RT frames,
+  request-sized dispatches, processed requests and backlog by family, stale
+  rejects, and explicitly coarse sampled cache/fallback metrics.
+- The retention audit found a saturated fixed-probe tail: after reaching a 99%
+  sampled hit rate, 1-10 unadmittable keys still forced a fill on nearly every
+  frame. Unconditional oldest-entry replacement caused visible reflection-cache
+  ping-pong and was rejected. Replacement is now limited to entries untouched
+  by coarse feedback for 120 frames; drained keys
+  now receive a one-second, version-aware retry cooldown so failed admissions
+  degrade consistently instead of forcing RT and composition changes every
+  frame. Logs split dispatched requests by family and count throttled retries.
+  World-space specular entries no longer inherit temporal-history invalidation;
+  camera cuts still invalidate screen history.
+- First activation of a newly streamed section no longer advances the global
+  diffuse/specular scene generation. The new section has no prior owned entries
+  to invalidate, while rebuilds, removals, and reactivations of known sections
+  retain conservative global invalidation. This prevents initial chunk streaming
+  from repeatedly clearing all otherwise-valid resident transport.
+- Command-frame retirement now runs before request collection, while transient
+  entity capture runs only after the request-based frame decision. `NO_RT`
+  cache-hit frames retain and age the previous entity capture without rebuilding
+  it; the next bounded fill refreshes it when the configured interval is due.
+  No-RT interop also omits entity textures and RT-only sampled-image transitions.
+
+The gate exit condition is live-verified. The 2026-06-20 `cache_fill` session
+logged 41,581 `NO_RT` frames and 20,821 bounded fill frames (66.6% `NO_RT`),
+including an 8,261-frame stationary interval with no additional fill dispatch.
+Visual and temporal comparison against `full_rt_reference` remains pending.
+
 ### Part 9 - Descriptor, Image, and Pipeline Cleanup
 
-Status: **not started**
+Status: **complete** (`code-verified`; runtime timing remains user-owned)
 
-- [ ] Stop allocating/updating descriptor sets for RT passes on `NO_RT` frames.
-- [ ] Avoid recreating image views for stable resources.
-- [ ] Keep cache buffers/images resident across frames with explicit retirement.
-- [ ] Create separate descriptor layouts for cache fill and cache resolve if that
-  reduces per-frame binding churn.
-- [ ] Audit barriers between cache-fill writes, resolve reads, DLSS/RR reads, and
+- [x] Stop allocating/updating descriptor sets for RT passes on `NO_RT` frames.
+- [x] Avoid recreating image views for stable resources.
+- [x] Keep cache buffers/images resident across frames with explicit retirement.
+- [x] Audit whether separate fill/resolve layouts reduce binding churn.
+- [x] Audit barriers between cache-fill writes, resolve reads, DLSS/RR reads, and
   final blit.
 
 Exit condition: CPU encode and descriptor overhead also drops on cache-hit frames.
 
+Part 9 implementation notes (`code-verified`):
+
+- `NO_RT` never enters `RtxPassGraph` or `RenderPassExecutor`, so it allocates
+  and updates no RT descriptor sets and does not collect RT-only sampled images
+  or entity textures for interop.
+- `RtxFrameImages` now creates storage views once with each image allocation and
+  reuses them across `CacheFeedbackPass`, `CacheResolvePass`, and bounded/full RT
+  descriptors. Resize waits for queue idle, closes views before images, and
+  recreates the stable set. This removes about fifteen short-lived view objects
+  from every cache resolve and the corresponding view churn on fill frames.
+- Diffuse/specular cache buffers and frame images remain pipeline-resident.
+  Per-frame references are retained by command submission; pipeline destruction
+  owns their final close.
+- Fill and resolve already use distinct RT and compute pipelines/layouts. A
+  second RT layout just for bounded fill would not reduce `NO_RT` work because
+  that path skips the RT pipeline entirely; it would add a shader permutation
+  and layout migration, so the reflected RT layout remains shared with the
+  explicit full-reference mode.
+- The fill path has an explicit ray-tracing-shader write to compute read/write
+  dependency before feedback/resolve. Resolve retains its compute ordering
+  barriers, and the existing DLSS/composition transitions remain after resolve.
+
+Exit condition met in source. No automated timing or capture was run under the
+manual-review rule.
+
 ### Part 10 - Shader Cost After Gating
 
-Status: **not started**
+Status: **in progress** (`bounded-fill source optimization complete`; deferred
+surface-direct cache and manual runtime checkpoint pending)
 
-- [ ] Optimize raygen/closest-hit/any-hit only after RT is no longer mandatory
+- [x] Optimize raygen/closest-hit/any-hit only after RT is no longer mandatory
   every frame.
-- [ ] Profile or inspect remaining cache-fill rays by category: blocklight,
+- [x] Profile or inspect remaining cache-fill rays by category: blocklight,
   diffuse radiance, reflection, refraction, sun visibility, volumetric work.
-- [ ] Add early exits for zero contribution before any ray query or grid walk.
+- [x] Audit blocklight first using the Photonics pattern: spatial light bins,
+  surface-keyed accumulated RGB, and a versioned per-entry light cursor/coverage
+  state. Request RTX only for unfinished or stale light slots.
+- [x] Compare TLAS visibility fills with a hierarchical voxel-occupancy query for
+  local block lights; keep the result only if it removes the existing hard
+  probe-cell patches without leaking across walls or block edges.
+- [x] Treat newer Photonics ReSTIR DI as optional many-light miss selection, not
+  a steady-state pass: valid completed entries must still select `NO_RT`.
+- [x] Add early exits for zero contribution before any ray query or grid walk.
 - [ ] Remove debug-only and disabled work from release permutations while keeping
   debug/reference modes available.
-- [ ] Preserve miss shader sky writes and all DLSS/RR guide contracts.
+- [x] Preserve miss shader sky writes and all DLSS/RR guide contracts.
+- [ ] Manual checkpoint: compare bounded-fill frame time, local-light stability,
+  caves/walls, transparent materials, and convergence to sustained `NO_RT`.
 
 Exit condition: remaining RTX-active frames are cheaper, bounded, and visually
 acceptable.
+
+Part 10 implementation notes (`code-verified` unless stated otherwise):
+
+- The request-only raygen has three compact request streams: section probes,
+  diffuse radiance, and combined reflection/refraction transport. One launch
+  index can service one entry from every stream, so `CacheRequestBatch` now
+  dispatches the maximum family-stream length instead of their sum. A balanced
+  mixed batch can therefore use about one third as many raygen invocations while
+  still processing every request.
+- Section-only invocations now return before transforming the sun direction or
+  computing sun color. Zero-emission section lights are rejected before
+  distance, attenuation, candidate sorting, and visibility work. Empty-light
+  probe cells publish a completed black value without issuing a ray.
+- Bounded-fill ray inventory: a section-probe cell traces at most eight selected
+  local-light visibility rays; a diffuse entry traces eight deterministic
+  continuation rays and only sun-tests a hit with nonzero sun contribution; a
+  reflection entry traces one continuation; a refraction entry traces reflection
+  plus transmission. Full-frame blocklight discovery, primary visibility,
+  ReSTIR sun work, and volumetric marching occur only in
+  `full_rt_reference`, not in request-only dispatches. Volumetric shadow queries
+  now also stop when sun radiance is effectively black.
+- Ready-state claims remain before all bounded ray work. An already-ready
+  section, diffuse, reflection, or refraction key returns without tracing; an
+  empty visible batch still selects `NO_RT` and skips TLAS construction.
+- Closest-hit and any-hit inspection found no safe fill-only removal: diffuse and
+  specular continuation fills require textured albedo, normal, emission, alpha,
+  and material data, while local-light visibility already uses the lean
+  alpha-aware ray-query path. The explicit miss shader and DLSS/RR sidecar writes
+  were left unchanged.
+- Photonics current `64tree` source at commit
+  `416fe6c3689a2d04f36e818c725e74597e170bf5` confirms a hierarchical 64-tree
+  voxel iterator for target-light visibility and a deferred ReSTIR DI path with
+  temporal reprojection, spatial reservoir reuse, accumulation, and denoising.
+  Those are useful miss-selection/visibility designs, but ReSTIR still traces
+  selected visibility every rendered frame and therefore does not provide
+  Vulkanite's strict completion rule by itself.
+- Vulkanite already has section-local light ranges and versioned all-face probe
+  completion. The Photonics audit reinforces the next local-light data change:
+  a separately keyed exact-surface direct-light cache with finite light
+  coverage. The earlier coarse probe-face surface reuse remains rejected because
+  it aliases unrelated surfaces across walls. This cache is intentionally still
+  pending rather than reviving that known-bad approximation.
+- A Photonics-style voxel hierarchy is not yet copied into Vulkanite
+  (`target`, not implemented): Vulkanite has no equivalent resident occupancy
+  tree, and building one only for local-light tests would add a second geometry
+  validity system. Keep TLAS alpha-aware visibility until a voxel hierarchy can
+  demonstrate correct thin geometry, transparency, and block-edge behavior.
+- `compileJava` and a Vulkan 1.2 `glslc` compile of the preprocessed active
+  `ray0.rgen` both pass. No automated capture or visual benchmark was run under
+  the manual-review rule.
 
 ### Part 11 - Reconstruction, Upscaling, and Guides
 
@@ -616,16 +848,16 @@ Status: **in progress**
 - [ ] Map destruction order for active pipelines, DLSS/NGX, probe workers,
   pending BLAS jobs, TLAS/BLAS, command queues, cache buffers/images, semaphores,
   and Vulkan context.
-- [x] Retain a BLAS worker thread handle, stop accepting work, wake the worker,
+- [] Retain a BLAS worker thread handle, stop accepting work, wake the worker,
   cancel queued jobs, and join before closing builder-owned BLAS resources.
-- [x] Shut down section probe workers before freeing state their tasks can publish
+- [] Shut down section probe workers before freeing state their tasks can publish
   into.
 - [ ] Drain or fail pending `CommandSubmissionRequest` futures and release retained
   command-buffer/semaphore references on shutdown and device-loss paths.
 - [ ] Identify the owner that destroys `CommandManager`, `SyncManager`,
   allocators, Vulkan device, debug messenger, surface, and instance.
 - [ ] Verify partial initialization cleanup and idempotent destroy.
-- [x] Provide manual checkpoints for repeated launch/quit, world join/leave,
+- [] Provide manual checkpoints for repeated launch/quit, world join/leave,
   shader reload then quit, and quit during heavy chunk work.
 
 Manual checkpoint: start `ray-tracing-test-place`, fly fast enough to trigger
@@ -663,14 +895,14 @@ regression.
 |---|---|---|---|
 | 0 - Manual scope | Codex | in progress | Manual mode and RT cache-fill contract recorded; current per-frame RT path source-verified. |
 | 1 - Current RT outputs | Codex | complete | Output contract, DLSS/RR consumers, and current trace branches mapped from source. |
-| 2 - Split RT/resolve | Codex | complete | Compute cache resolve path added with `full_rt_reference`, `cache_fill`, and `cache_resolve_only`; default remains full RT reference. |
+| 2 - Split RT/resolve | Codex | complete | Compute cache resolve path added with `full_rt_reference`, `cache_fill`, and `cache_resolve_only`; Part 8 later promoted `cache_fill` to the automatic default. |
 | 3 - Cache requests | Codex | complete | Stable request keys, dedupe/priority/backlog, section-probe dirty queue requests, visible G-buffer feedback, and reflection/refraction surface requests added. |
 | 4 - Cache versioning | Codex | complete | Explicit generation tracker and request stamps added for world, section, material, shaderpack, sky/time, layout, temporal, and guide validity. |
 | 5 - Section blocklight cache | Codex | in progress | Source-side path is complete: request-driven cell warm-up, no exact-surface/probe aliasing, default probe-volume cache shading, stale-slot invalidation, and cache-state debug view. Manual visual checkpoint remains. |
 | 6 - Diffuse radiance cache | Codex | in progress | Source-complete: bounded request-driven deterministic RT fills, generation-stamped hash entries, conservative fallback/confidence, and non-RT diffuse resolve. Manual visual checkpoint remains. |
-| 7 - Reflection/refraction cache | unassigned | not started | Needed to stop per-pixel continuation rays. |
-| 8 - Frame RT gating | unassigned | not started | Skip `RtxPassGraph.execute` on cache-hit frames. |
-| 9 - Descriptors/images/pipelines | unassigned | not started | Removes CPU overhead on no-RT frames. |
+| 7 - Reflection/refraction cache | Codex | in progress | Bounded request-only transport fills, validated screen history, and non-RT resolve are source-complete; manual checks require Part 8 same-session RT gating. |
+| 8 - Frame RT gating | Codex | in progress | Bounded `CACHE_FILL_ONLY`/`NO_RT` orchestration restored as the active architecture; prior live gate evidence remains, and the restored build needs the manual visual/log checkpoint. |
+| 9 - Descriptors/images/pipelines | Codex | complete | `NO_RT` skips RT descriptor work; stable frame-image views are reused by feedback, resolve, and RT; cache resources remain resident; barriers and layout split audited. |
 | 10 - Shader cost after gating | unassigned | not started | Optimize only remaining cache-fill RT work. |
 | 11 - Reconstruction/guides | unassigned | not started | Keep DLSS/RR valid when RT is skipped. |
 | 12 - Lifecycle/recovery | unassigned | not started | Cache invalidation across reload/resize/world changes. |
@@ -707,8 +939,21 @@ Allowed states: `not started`, `in progress`, `blocked`, `complete`, `rejected`.
 | 2026-06-20 | User/Codex | 5 | user observation, cache-state debug view | Ready RT-cache quality | Cache-state debug mode 6 showed green cells, but normal lighting still looked unacceptable | A trial shaded-surface validation/clamp for RT-cache probe-volume output caused unstable shadow shapes, so the RT-cache path was restored to skip uncached per-pixel sparse validation; runtime debug option remains normal lighting | code-verified; runtime recheck pending | `ray0.rgen` branch inspected; preprocessed raygen passed `glslangValidator -V --target-env vulkan1.2 -S rgen`; `validateVulkaniteShaderpackDrift` passed | Recheck same view with debug mode off; the durable fix needs a separate surface-keyed cache or stronger stable occlusion model |
 | 2026-06-20 | Codex | 6 | current dirty tree, manual review | Diffuse request/cache identity | Diffuse feedback keyed visible surfaces by material bucket, which would duplicate the same incident radiance for different albedo/material response | Diffuse feedback now uses a 2-block section-local incident-radiance key with normal bucket and material bucket 0; CPU ingestion enforces the same invariant | code-verified | `CacheFeedbackPass`, `CacheRequestKey`, `CacheInvalidationTracker`, and Part 6 checklist inspected; inline feedback compute shader passed `glslangValidator --stdin -S comp`; `./gradlew classes`; `git diff --check` | Fill storage/buffers and non-RT diffuse resolve remain pending |
 | 2026-06-20 | Codex | 6 | current dirty tree, manual review | Request-driven diffuse RT and non-RT resolve | Diffuse requests had no resident GPU storage, fill consumer, or resolve lookup; empty pages used fallback only | A bounded generation-stamped hash receives at most 256 deterministic request rays per fill frame; resolve reads ready entries and conservatively blends indirect radiance over fallback lighting | code-verified; manual scene check pending | Forced Java compile; raygen and compute GLSL validation; shaderpack drift validation; `git diff --check` | Source implementation retained; interiors, thin walls, sun/block changes, streaming, and motion remain user-owned checks |
+| 2026-06-20 | User/Codex | 6/8 | active `cache_fill`, 1920x1080 | Minecraft profiler `updateDisplay` share / frame rate | not provided | 90% / 10 FPS | user-observed | Latest log confirms `RTX cache mode: cache_fill`; source confirms this transitional mode still dispatches full-screen RT every frame | Not a cache-resolve performance result; switch local checkpoint to `cache_resolve_only`, keep Part 8 RT gating as the required architectural fix |
+| 2026-06-20 | User/Codex | 2/6 | active `cache_resolve_only` | Geometry visibility | full RT displayed geometry through primary-ray fallback | all geometry disappeared and resolver displayed sky | user-observed; root cause code-verified | G-buffer shaders declared locations 0-4 but omitted Iris `RENDERTARGETS: 1,2,3,4,5`; full raygen masked empty attachments by tracing primary rays, while compute resolve cannot | Add explicit attachment mapping to terrain/entities, sync runtime shaderpack, and repeat resolve-only checkpoint |
+| 2026-06-20 | User/Codex | 2/6 | resolve-only after explicit attachment mapping | Geometry visibility | attachment mapping corrected | geometry still missing | user-observed; second root cause code-verified | Iris 1.7.5 sampler bytecode selects `alt` for targets in `flippedAfterTranslucent`, but Vulkanite unconditionally created every G-buffer view from `main` | Select main/alt per Iris flip state and log the live set once; full client restart required for the mixin change |
+| 2026-06-20 | User/Codex | 2/6 | resolve-only after flip-aware views; live flip set `[]` | Geometry visibility | main-side selection confirmed correct | geometry still missing | user-observed; shared-image capability defect found in source | Iris render targets were created as storage/sampled/transfer images without `VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT`, despite being attached to OpenGL raster framebuffers | Add color-attachment usage, recreate render targets on restart, and emit asynchronous per-validity-clause G-buffer counters if the frame remains empty |
+| 2026-06-20 | User/Codex | 2/6 | resolve-only after color-attachment fix | G-buffer validity | all sampled normals invalid; world positions partially nonzero but clamped | float target formats and their GLSL enum symbols declared in shader source; runtime recheck pending | code-verified; user restart pending | Diagnostic counters reported `normal=0` continuously; Iris debug log reported `requestedFormat=RGBA` for colortex1-5; Iris 1.7.5 bytecode reads `colortexNFormat` as shader const directives, not `iris.properties` assignments; preprocessed fragment shaders compile without external format macros | Retain format fix; restart and require float-format logs plus nonzero valid-sample count before resuming Part 6 visual review |
+| 2026-06-20 | User/Codex | 2/6 | resolve-only with float G-buffer targets | G-buffer validity | first sampled frame was cleared/zero; subsequent frames had an aggregate non-finite input count for every sample | Iris-owned vertex attribute bindings restored and normalization made finite-safe; runtime recheck pending | code-verified; user shader reload pending | Iris logs confirmed float targets; feedback reported `finite=0`; Iris 1.7.5 bytecode binds Sodium normal/light/tangent at 10/4/13 while shaders forced 4/3/5; raw shaders compile with normal maps enabled | Retain binding fix; reload shaders and require nonzero valid samples/visible geometry |
+| 2026-06-20 | User/Codex | 2/6 | resolve-only, DLSS 1280x672 render over 1920x1008 Iris G-buffer | Screen-space alignment | resolved geometry offset/stretched and visually overlapped the vanilla frame | resolve, feedback, and raygen sample output-sized G-buffers through normalized screen UV | code-verified; runtime recheck pending | Runtime dimensions inspected; all three direct integer-coordinate reads found in source; embedded compute shaders and preprocessed raygen passed `glslangValidator`; forced Java compile and shaderpack drift validation passed | Retain mapping fix; restart client and review alignment |
+| 2026-06-20 | Codex | 7 | current dirty tree, manual review | Reflection/refraction continuation rays | `cache_fill` still ran the full per-pixel reflection/refraction loops and resolve-only had no specular transport result or valid hit-distance guide | 32,768-entry generation-stamped world cache, at most 256 request-only transport fills, cache-hit request suppression, validated ping-pong screen history, no-RT Fresnel/transmission resolve, and cached continuation hit distances | code-verified; manual scene check pending | Java compile/test (`NO-SOURCE`); preprocessed raygen and both embedded compute shaders passed Vulkan 1.2 `glslangValidator`; source/runtime raygen SHA-256 match; `git diff --check` | Source implementation retained; water/glass/ice/metal, grazing, motion, and lighting-change review remains user-owned |
+| 2026-06-20 | User/Codex | 2/7 | active `cache_resolve_only`; live diagnostics show albedo present but no valid position/normal samples | Resolve-only presentation | user observed the literal vanilla frame, so cache output could not be distinguished or tested | Vulkan presentation now runs after Iris composites, writes the active main/alt colortex side, and empty/incomplete cache state presents flat available albedo rather than fallback lighting or sky | runtime-verified | Iris 1.7.5 `finalizeLevelRendering` bytecode showed composite then final-pass ordering; live feedback counters showed `albedoNonzero=1326`, `position=0`, `normal=0`; extracted resolve shader and Java compilation passed; user confirmed flat albedo after restart | Presentation fix retained; continue Part 8 same-session fill/resolve gating so caches can populate before no-RT resolve |
+| 2026-06-20 | Codex | 8 | current dirty tree, manual review | Per-frame RT dispatch size/gating | `cache_fill` launched render-sized raygen every frame and diffuse feedback requested resident entries again | Default `cache_fill` selects at most a 256x1 request-only RT fill while work exists, otherwise skips RT and resolves from resident caches in the same session | code-verified; runtime checkpoint pending | `./gradlew compileJava --rerun-tasks`; `./gradlew test` (`NO-SOURCE`); preprocessed raygen and extracted feedback compute passed Vulkan 1.2 `glslangValidator`; source/runtime raygen SHA-256 match; `git diff --check` | Source implementation retained; restart and inspect gate log plus visual/frame pacing |
+| 2026-06-20 | Codex | 8 | current dirty tree, manual review | RT-only entity work on `NO_RT` frames | `cache_fill` prepared entity capture and synchronized RT-only entity/sample textures before the request-based frame decision | Command retirement precedes the decision; capture and RT-only sampled-image interop occur only for RT decisions, while `NO_RT` retains and ages the last capture for the next bounded fill | eliminated from the source path | Forced Java compilation; targeted lifecycle inspection; `git diff --check` | Retained; runtime pacing remains a manual checkpoint |
+| 2026-06-20 | Codex | 6-8 | current dirty tree, direct fill-contract audit | Diffuse cache ray origin/sample count | Fill discarded the requested surface position, reconstructed a coarse 2-block cell center, and stored one arbitrary ray | Feedback carries exact world position into one-block cache requests; fill averages eight deterministic rays from the real surface before publishing ready state | code-verified | Java compile; raygen and feedback/resolve compute shaders passed Vulkan 1.2 validation; request/SSBO layouts inspected byte-for-byte | Retained; manual lighting comparison pending |
 | 2026-06-20 | Codex | 14 | current dirty tree, manual review | BLAS shutdown ownership | worker had no retained stop/join path | cooperative cancel, wake, join, and owned-resource cleanup path | code-verified | source inspection; `git diff --check`; `./gradlew classes` | Retained pending user shutdown observation |
 | 2026-06-20 | Codex | 14 | clean live tree at start of pass, manual review | Section probe executor shutdown ownership | `destroy()` cleared manager state then relied on `shutdownNow` while running tasks could still publish results | manager marks shutdown, cancels queued probe work, waits up to `vulkanite.probeShutdownJoinMs`, discards late results, then frees state | code-verified | source inspection; `git diff --check`; `./gradlew classes` | Retained pending user shutdown observation |
+| 2026-06-22 | Codex | 8-9 | current dirty tree, manual review | Steady-state RT dispatch and stable view churn | `cache_on_hit` forced render-resolution RT every frame and cache resolve created about fifteen short-lived storage views per frame | non-empty miss batches dispatch at most `256x1`; empty batches select `NO_RT`; storage views persist from frame-image allocation until resize/destroy | code-verified; runtime checkpoint pending | forced Java compile; preprocessed raygen passed Vulkan 1.2 validation; source/runtime shader hashes match; source flow and destruction order inspected; `git diff --check` | Retained; restart and confirm fill-to-`NO_RT` transition plus visual behavior |
 | - | - | - | - | - | - | - | - | - | - |
 
 ## Changed-File Ledger
@@ -730,11 +975,26 @@ Allowed states: `not started`, `in progress`, `blocked`, `complete`, `rejected`.
 | 2026-06-20 | Codex | 5 | `run/shaderpacks/VulkaniteRT.txt`, `run/shaderpacks/VulkaniteRT.before-part5-correctness.txt`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Preserve the user's custom shader options and normalize local-light controls for a controlled correctness retest | Persisted values compared with tracked shader defaults |
 | 2026-06-20 | Codex | 5-6 | `shaderpacks/VulkaniteRT/shaders/lib/rt/settings.glsl`, `shaderpacks/VulkaniteRT/shaders/ray0.rgen`, `shaderpacks/VulkaniteRT/shaders/lang/en_us.lang`, runtime shaderpack copy, `src/main/java/me/cortex/vulkanite/client/rendering/CacheFeedbackPass.java`, `src/main/java/me/cortex/vulkanite/client/rendering/cache/CacheRequestKey.java`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Finish the Part 5 source-side cache-first default and start Part 6 with a section-local, material-independent diffuse incident-radiance request identity | `python preprocess_shader.py ...`; `glslangValidator -V --target-env vulkan1.2 -S rgen`; inline feedback shader `glslangValidator --stdin -S comp`; source/runtime shaderpack no-drift diff; `git diff --check`; `./gradlew classes` |
 | 2026-06-20 | Codex | 6 | `src/main/java/me/cortex/vulkanite/client/rendering/cache/DiffuseRadianceCache.java`, `CacheInvalidationTracker.java`, `VulkanPipeline.java`, `RtxPassGraph.java`, `RenderPassExecutor.java`, `PipelineDescriptorSets.java`, `CacheResolvePass.java`, `shaderpacks/VulkaniteRT/shaders/ray0.rgen`, runtime shaderpack copy, `plans/OPTIMIZATION_AGENT_FLOW.md` | Add bounded diffuse cache/fill buffers, deterministic request-only RT population, conservative non-RT indirect resolve, fallback/confidence behavior, invalidation, and lifecycle cleanup | `./gradlew compileJava --rerun-tasks`; `./gradlew test` (`NO-SOURCE`); preprocessed raygen and extracted compute shader passed `glslangValidator`; `validateVulkaniteShaderpackDrift`; `git diff --check` |
+| 2026-06-20 | Codex | 6/8 | `run/config/vulkanite.properties`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Record the 10 FPS full-screen fill-mode result and select no-RT resolve for the next manual restart | Effective config and latest mode log inspected; restart required because the running client does not hot-reload this file |
+| 2026-06-20 | Codex | 2/6 | `shaderpacks/VulkaniteRT/shaders/gbuffers_terrain.fsh`, `gbuffers_entities.fsh`, runtime shaderpack copies, `run/config/vulkanite.properties`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Route terrain/entity outputs explicitly to Iris `colortex1..5` so no-RT resolve receives geometry, then restore the resolve-only checkpoint | Preprocessed terrain/entity fragment shaders passed `glslangValidator -S frag`; `validateVulkaniteShaderpackDrift` passed |
+| 2026-06-20 | Codex | 2/6 | `src/main/java/me/cortex/vulkanite/mixin/iris/MixinIrisRenderingPipeline.java`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Create Vulkan G-buffer views from Iris's current post-translucent main/alt side instead of always sampling stale `main`; add one diagnostic flip-set log | Iris 1.7.5 `RenderTargets`/`IrisSamplers` bytecode inspected; forced and incremental Java compilation passed; `git diff --check` |
+| 2026-06-20 | Codex | 2/6 | `src/main/java/me/cortex/vulkanite/mixin/iris/MixinRenderTarget.java`, `CacheFeedbackPass.java`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Make shared Iris images valid color-attachment targets and add nonblocking G-buffer validation counters to identify any remaining empty attachment | Java compilation passed; extracted feedback compute shader passed Vulkan 1.2 `glslangValidator`; `git diff --check` |
+| 2026-06-20 | Codex | 2/6 | `shaderpacks/VulkaniteRT/shaders/gbuffers_terrain.fsh`, `gbuffers_entities.fsh`, `iris.properties`, matching runtime shaderpack copies, `plans/OPTIMIZATION_AGENT_FLOW.md` | Move Iris render-target format directives into GLSL so signed normals and world positions use floating-point attachments in resolve-only mode | Preprocessed terrain/entity fragment shaders passed `glslangValidator -S frag`; `validateVulkaniteShaderpackDrift`; `./gradlew classes`; `git diff --check` |
+| 2026-06-20 | Codex | 2/6 | `shaderpacks/VulkaniteRT/shaders/gbuffers_terrain.vsh`, `gbuffers_entities.vsh`, matching runtime shaderpack copies, `plans/OPTIMIZATION_AGENT_FLOW.md` | Remove vertex attribute locations that overrode Iris/Sodium bindings, use canonical tangent attribute, and prevent zero-vector normalization from emitting NaNs | Iris 1.7.5 binding/transform bytecode inspected; preprocessed vertex/fragment shaders passed `glslangValidator` with normal maps enabled; shaderpack drift validation and `./gradlew classes` passed |
+| 2026-06-20 | Codex | 2/6 | `CacheResolvePass.java`, `CacheFeedbackPass.java`, tracked/runtime `ray0.rgen`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Align output-resolution Iris G-buffer sampling with lower-resolution DLSS/RT dispatches using normalized screen UV | Both embedded compute shaders and preprocessed raygen passed Vulkan 1.2 `glslangValidator`; forced Java compile; shaderpack drift validation; `git diff --check` |
 | 2026-06-20 | Codex | 5 | `plans/OPTIMIZATION_AGENT_FLOW.md` | Record the user-provided normal-mode visual checkpoint screenshot and keep the manual Part 5 checkpoint pending pending debug-state and broader scene review | Markdown-only observation update; validation pending in this pass |
 | 2026-06-20 | Codex | 5 | `run/shaderpacks/VulkaniteRT.txt`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Record the user-provided compare-mode checkpoint and prepare cache-state debug mode 6 for the next manual view | Runtime options inspected; `ray0.rgen` compare/cache-state color mapping inspected; `git diff --check` |
 | 2026-06-20 | Codex | 5 | `shaderpacks/VulkaniteRT/shaders/ray0.rgen`, runtime shaderpack copy, `run/shaderpacks/VulkaniteRT.txt`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Reject the RT-cache surface-validation clamp after it caused unstable shadow shapes; restore the RT-cache path to skip uncached per-pixel sparse validation and leave normal-lighting debug mode active | Preprocessed raygen `glslangValidator -V --target-env vulkan1.2 -S rgen`; `validateVulkaniteShaderpackDrift`; `git diff --check` |
+| 2026-06-20 | Codex | 7 | `SpecularTransportCache.java`, `CacheRequestKey.java`, `CacheInvalidationTracker.java`, `VulkanPipeline.java`, `RtxPassGraph.java`, `RenderPassExecutor.java`, `PipelineDescriptorSets.java`, `RtxFrameImages.java`, `CacheFeedbackPass.java`, `CacheResolvePass.java`, tracked/runtime `ray0.rgen`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Add bounded request-only reflection/refraction transport fill, one-block/material/normal/direction/medium keys, cache-hit request suppression, validated ping-pong screen history, non-RT resolve, guide preservation, invalidation, and cleanup | `./gradlew test` (`NO-SOURCE`); preprocessed raygen and extracted feedback/resolve compute shaders passed Vulkan 1.2 `glslangValidator`; source/runtime raygen hashes match; `git diff --check` |
+| 2026-06-20 | Codex | 8 | `VulkaniteConfig.java`, `RtxFrameDecision.java`, `VulkanPipeline.java`, `RtxPassGraph.java`, `RenderPassExecutor.java`, `CacheFeedbackPass.java`, tracked/runtime `ray0.rgen`, `run/config/vulkanite.properties`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Add automatic per-frame RT gating, bounded request-sized fill dispatch, same-frame non-RT resolve, resident diffuse suppression, failure requeue, and orchestration/cache counters | Forced Java compile and tests; preprocessed raygen and extracted feedback compute passed Vulkan 1.2 `glslangValidator`; source/runtime raygen hashes match; `git diff --check` |
+| 2026-06-20 | Codex | 8 | `src/main/java/me/cortex/vulkanite/client/rendering/VulkanPipeline.java`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Move transient entity capture behind the frame gate and omit RT-only sampled-image interop on `NO_RT`, retaining aged capture state for the next fill | Forced Java compilation; targeted lifecycle inspection; `git diff --check` |
+| 2026-06-20 | Codex | 6-8 | `CacheRequest.java`, `CacheRequestKey.java`, `CacheInvalidationTracker.java`, `CacheFeedbackPass.java`, `DiffuseRadianceCache.java`, `SpecularTransportCache.java`, `CacheResolvePass.java`, tracked/runtime `ray0.rgen`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Preserve exact surface origins through feedback and fill uploads, use one-block diffuse keys, average eight diffuse rays, and raise confidence for valid multi-ray entries | Forced Java compilation; preprocessed raygen and both embedded compute shaders passed Vulkan 1.2 validation; shaderpack drift validation; `git diff --check` |
+| 2026-06-20 | Codex | 2/7 | `src/main/java/me/cortex/vulkanite/mixin/iris/MixinIrisRenderingPipeline.java`, `src/main/java/me/cortex/vulkanite/client/rendering/CacheResolvePass.java`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Present Vulkan after Iris composites into the active colortex side and make empty/incomplete cache output visibly flat albedo | Iris finalization bytecode inspected; extracted resolve compute shader passed Vulkan 1.2 `glslangValidator`; `./gradlew classes`; `git diff --check` |
 | 2026-06-20 | Codex | 14 | `src/main/java/me/cortex/vulkanite/acceleration/AccelerationBlasBuilder.java`, `src/main/java/me/cortex/vulkanite/acceleration/AccelerationManager.java`, `src/main/java/me/cortex/vulkanite/acceleration/blas/BLASBuildWorker.java`, `src/main/java/me/cortex/vulkanite/acceleration/blas/BLASBatchProcessor.java`, `src/main/java/me/cortex/vulkanite/acceleration/blas/BLASCompactor.java`, `src/main/java/me/cortex/vulkanite/acceleration/blas/BLASMemoryManager.java`, `src/main/java/me/cortex/vulkanite/lib/memory/AccelerationStructurePool.java`, `src/main/java/me/cortex/vulkanite/lib/memory/PoolLinearAllocator.java`, `src/main/java/me/cortex/vulkanite/lib/pipeline/VComputePipeline.java`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Stop/join BLAS worker on shutdown, cancel queued BLAS jobs, and release builder-owned BLAS resources after the worker stops | `git diff --check`; `./gradlew classes` |
 | 2026-06-20 | Codex | 14 | `src/main/java/me/cortex/vulkanite/client/lighting/SectionLightManager.java`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Stop accepting section probe work during shutdown, cancel queued probe tasks, wait for running tasks, discard late results, and free probe state afterward | `git diff --check`; `./gradlew classes` |
+| 2026-06-22 | Codex | architecture override | `VulkaniteConfig.java`, `RtxFrameDecision.java`, `VulkanPipeline.java`, `RtxPassGraph.java`, `RenderPassExecutor.java`, `CacheInvalidationTracker.java`, tracked/runtime `ray0.rgen`, `run/config/vulkanite.properties`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Replace G-buffer scan/request gating with full-frame primary RT and organic diffuse/specular/refraction/section-probe cache publication at visible hits; retain old request resources only for descriptor compatibility | Forced Java compile; preprocessed/injected raygen passed Vulkan 1.2 `glslangValidator`; shaderpack sync/drift validation; `git diff --check` |
+| 2026-06-22 | Codex | 8-9 | `VulkaniteConfig.java`, `RtxFrameDecision.java`, `VulkanPipeline.java`, `RtxPassGraph.java`, `RenderPassExecutor.java`, `RtxFrameImages.java`, `CacheFeedbackPass.java`, `CacheResolvePass.java`, tracked/runtime `ray0.rgen`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Restore trace-misses/resolve-hits gating, asynchronous deferred miss discovery, request-sized RT fill, same-frame compute resolve, failed-fill requeue, orchestration/cache metrics, and persistent frame-image views | Forced Java compile and tests (`NO-SOURCE`) passed; preprocessed raygen plus embedded feedback/resolve compute shaders passed Vulkan 1.2 `glslangValidator`; source/runtime raygen SHA-256 match; `git diff --check` passed with line-ending warnings only |
+| 2026-06-22 | Codex | 10 research | `plans/OPTIMIZATION_AGENT_FLOW.md` | Correct the research target to the Photonics Minecraft mod; inspect exact 1.20.1 `0.2.5` deferred lighting/cache shaders and separate them from the newer ReSTIR branch | Exact release shader inspection plus current source-branch comparison; plan-only change |
 
 ## Rejected Experiments
 
@@ -743,6 +1003,7 @@ Allowed states: `not started`, `in progress`, `blocked`, `complete`, `rejected`.
 | 2026-06-20 | Codex | 0 | Creating/running automated benchmark worlds, scripted scenes, capture harnesses, or A/B tests | User wants manual flow review and user-owned visual/performance judgment | User directive in chat | Only if the user explicitly re-enables automated testing |
 | 2026-06-20 | Codex | planning | Treating raygen micro-optimization as the primary plan | Full-frame RT every eligible frame is the architecture problem | Source inspection and user clarification | Revisit after RT gating and cache resolve exist |
 | 2026-06-20 | Codex | planning | Neural radiance cache as first implementation | Too complex for the first cache-first step and likely vendor/runtime-heavy | Research review | Revisit only after simple world/section cache is insufficient |
+| 2026-06-22 | User/Codex | architecture | Full-frame primary RT on every `cache_on_hit` frame | It continues tracing after the visible working set is cached, directly violating the requested stop-tracing invariant and making cache publication unable to remove the steady-state RT cost | User's latest instruction plus source inspection of the full-resolution `traceRays` path | Retain only as explicit `full_rt_reference` mode |
 | 2026-06-20 | Codex | 3 | Adding a blocking same-frame GPU feedback readback to make feedback-buffer requests look complete | Synchronous readback would add unnecessary frame sync risk before the request model is consumed | Source inspection of `VCmdBuff`, `MemoryManager`, section feedback buffer ownership; async `CacheFeedbackPass` retained instead | Revisit only if later cache-fill consumers require lower-latency feedback than previous-frame ingestion |
 | 2026-06-20 | Codex | 5 | Reusing exact-surface sparse-RT results in section probe-cell faces | A probe cell spans 2 blocks and represents radiance at its center; it cannot safely key exact-surface visibility. First-writer reuse crossed positions and walls and produced visible square seams | User screenshot; shader address path quantizes world position to the 8x8x8 section grid | Revisit only with separate surface storage keyed finely enough by world position, normal, material/source dependency, and validity generation |
 | 2026-06-20 | Codex | 5 | Running uncached per-pixel surface validation on ready RT-cache probe-volume lighting | It reduced trust in bad green cells but produced unstable shadow shapes because sparse validation samples are not stored in a stable surface-keyed cache | User observation after the trial; `ray0.rgen` validation branch inspected and restored to `SECTION_LIGHT_PROBE_RT_CACHE_ENABLE == 0` | Revisit only with a deterministic surface cache, temporal history, or stable voxel/visibility structure |
@@ -837,41 +1098,55 @@ Before ending a part, the agent must:
 
 ## Latest Handoff
 
-- Agent/date: Codex / 2026-06-20
-- Part/status: Part 6 / in progress (`source-complete`; manual checkpoint
-  pending).
-- Completed checklist items: bounded diffuse storage and fill uploads;
-  request-only deterministic RT population; generation-stamped collision-safe
-  entries; compute resolve with material response; conservative fallback,
-  confidence, invalidation, and destruction paths.
-- Pre-existing dirty files that overlapped this part: the rendering/cache flow,
-  `ray0.rgen`, and this plan were already dirty from Parts 2-6. Unrelated DLSS
-  cleanup files were left alone.
-- Files changed by this agent: `DiffuseRadianceCache.java`,
-  `CacheInvalidationTracker.java`, `VulkanPipeline.java`, `RtxPassGraph.java`,
-  `RenderPassExecutor.java`, `PipelineDescriptorSets.java`,
-  `CacheResolvePass.java`, tracked/runtime `ray0.rgen`, and this plan.
-- Commands/checks and results: forced Java compile passed; Gradle tests reported
-  `NO-SOURCE`; preprocessed raygen and extracted cache-resolve compute shader
-  passed Vulkan 1.2 `glslangValidator`; shaderpack drift validation passed;
-  `git diff --check` passed with line-ending warnings only.
-- Before/after measurements with sample count: none; manual-review mode was
-  preserved.
-- Visual and temporal correctness checks: pending. Fill samples are derived from
-  cache keys rather than frame IDs, ready entries are immutable, and live hash
-  collisions are not evicted. This specifically removes two sources of
-  constantly changing cached shapes.
-- Synchronization/lifetime checks: transfer uploads barrier into RT/compute
-  access; raygen completion publishes payload before ready state; frame-owned
-  references close after encoding; resident buffers close during pipeline
-  destruction.
-- Known risks and limitations: the 2-block cache remains coarse, so confidence
-  is deliberately limited. `cache_fill` and `cache_resolve_only` are still
-  separate transitional modes; automatic fill/resolve gating belongs to Part 8.
-- Exact next action: run the Part 6 manual checkpoint in interiors, caves, and
-  thin-wall/page-boundary views, then exercise sun changes, block updates,
-  chunk streaming, and camera motion. Keep the checkpoint open if shapes move
-  after entries become ready.
+- Agent/date: Codex / 2026-06-22
+- Part/status: Part 8 gate restored; Part 9 complete in source; manual runtime
+  checkpoint pending.
+- Completed checklist items: `cache_on_hit` again selects bounded
+  `CACHE_FILL_ONLY` only for a non-empty miss batch and otherwise selects
+  `NO_RT`. Deferred feedback ingestion, all four request families, same-frame
+  resolve, failed-fill requeue, cache metrics, and async submission ownership
+  are reconnected. RT descriptors/TLAS/entity texture interop are skipped on
+  `NO_RT`, and stable frame-image views are reused across feedback, resolve, and
+  RT instead of being recreated per frame. The Photonics mod review is recorded
+  above and feeds a surface direct-light-cache experiment into Part 10.
+- Pre-existing dirty files that overlapped this part: this plan and the full
+  retained Part 2-8 integration diff, including `VulkanPipeline.java`, cache
+  passes, request/cache classes, G-buffer shaders, mixins, and `ray0.rgen`.
+  Existing work was preserved.
+- Files changed by this agent: `VulkaniteConfig.java`, `RtxFrameDecision.java`,
+  `VulkanPipeline.java`, `RtxPassGraph.java`, `RenderPassExecutor.java`,
+  `RtxFrameImages.java`, `CacheFeedbackPass.java`, `CacheResolvePass.java`,
+  tracked/runtime `ray0.rgen`, and this plan.
+- Commands/checks and results: targeted source/diff/synchronization inspection;
+  `./gradlew compileJava --rerun-tasks` and tests (`NO-SOURCE`) passed;
+  preprocessed raygen and both embedded compute shaders passed
+  `glslangValidator -V --target-env vulkan1.2`; tracked/runtime raygen SHA-256
+  hashes match; `git diff --check` passed with line-ending warnings only.
+- Before/after measurements with sample count: none; manual-review mode remains
+  active and no automated captures or benchmark scenes were run.
+- Visual and temporal correctness checks: source contracts and raygen compilation
+  passed. The restored gate has not yet been run in this build; lighting,
+  material, motion, and full-reference comparison remain user-owned.
+- Synchronization/lifetime checks: command retirement still happens before
+  feedback ingestion; feedback slots become readable only after their queue
+  execution completes; failed pre-submit fills requeue. The RT-write to
+  compute-read/write barrier precedes feedback/resolve. Stable views close
+  before their images after queue idle on resize/destroy.
+- Rejected experiments: full-frame primary RT on every cache frame is superseded
+  because it cannot stop tracing after convergence. Photonics' probabilistic
+  refresh/long-running accumulation is not copied because Vulkanite requires an
+  explicit versioned completion state and `NO_RT` on valid hits.
+- Known risks, limitations, or blockers: one-block/normal cache identity can
+  still alias distinct coplanar surfaces inside one block, and the hit/fallback
+  counters sample the feedback grid rather than every resolve pixel. The hard
+  local-light patch and blocky wall-shadow observations remain unresolved until
+  the manual comparison; section probe lighting still lacks a separately keyed
+  stable surface-visibility cache.
+- Exact next action: implement the Part 10 blocklight audit first: add a
+  versioned surface direct-light cache with per-entry light coverage, fed by the
+  existing spatial section-light lists. After that, restart with
+  `rtxCacheMode=cache_on_hit`, confirm `decision=NO_RT` after coverage completes,
+  and compare the same cave/wall view with `full_rt_reference`.
 
 ## Required Handoff Template
 

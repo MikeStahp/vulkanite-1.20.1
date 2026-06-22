@@ -19,7 +19,7 @@ import java.util.Objects;
 public final class CacheInvalidationTracker {
     private static final Logger LOGGER = LoggerFactory.getLogger(CacheInvalidationTracker.class);
     private static final CacheInvalidationTracker GLOBAL = new CacheInvalidationTracker();
-    private static final long CACHE_LAYOUT_VERSION = 1L;
+    private static final long CACHE_LAYOUT_VERSION = 4L;
     private static final long SKY_TIME_BUCKET_TICKS = 100L;
 
     private final EnumMap<CacheRequestFamily, Long> familyGenerations =
@@ -153,7 +153,12 @@ public final class CacheInvalidationTracker {
             return;
         }
         long sectionKey = sectionPos.asLong();
-        SectionVersion section = sectionVersions.computeIfAbsent(sectionKey, key -> new SectionVersion());
+        SectionVersion section = sectionVersions.get(sectionKey);
+        boolean firstActivation = section == null;
+        if (firstActivation) {
+            section = new SectionVersion();
+            sectionVersions.put(sectionKey, section);
+        }
         if (!section.active) {
             section.active = true;
             geometryChanged = true;
@@ -161,11 +166,18 @@ public final class CacheInvalidationTracker {
         }
         if (geometryChanged) {
             section.geometryVersion = incrementInt(section.geometryVersion);
-            sceneGeometryGeneration++;
+            // A section's first activation has no prior entries in its keyspace
+            // to invalidate. Rebuilds and reactivations still invalidate the
+            // global transport generation conservatively.
+            if (!firstActivation) {
+                sceneGeometryGeneration++;
+            }
         }
         if (lightChanged) {
             section.lightVersion = incrementInt(section.lightVersion);
-            sceneLightGeneration++;
+            if (!firstActivation) {
+                sceneLightGeneration++;
+            }
         }
     }
 
@@ -335,8 +347,10 @@ public final class CacheInvalidationTracker {
     }
 
     private static boolean requiresTemporalVersion(CacheRequestFamily family) {
-        return family == CacheRequestFamily.REFLECTION
-                || family == CacheRequestFamily.REFRACTION;
+        // Reflection/refraction entries are world-space transport keyed by
+        // surface and continuation direction. Camera cuts invalidate screen
+        // history, not those reusable world-cache entries.
+        return false;
     }
 
     private static boolean requiresGuideVersion(CacheRequestFamily family) {

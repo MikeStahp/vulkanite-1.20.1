@@ -12,6 +12,9 @@ public record CacheRequest(
         float error,
         float luma,
         float distanceSquared,
+        float sampleX,
+        float sampleY,
+        float sampleZ,
         CacheEntryVersionStamp versionStamp) {
     public CacheRequest {
         if (key == null) {
@@ -22,6 +25,9 @@ public record CacheRequest(
         error = saturateFinite(error);
         luma = Math.max(0.0f, finiteOrZero(luma));
         distanceSquared = Math.max(0.0f, finiteOrZero(distanceSquared));
+        sampleX = finiteOrZero(sampleX);
+        sampleY = finiteOrZero(sampleY);
+        sampleZ = finiteOrZero(sampleZ);
         versionStamp = versionStamp == null ? CacheInvalidationTracker.global().capture(key) : versionStamp;
     }
 
@@ -34,8 +40,24 @@ public record CacheRequest(
             float error,
             float luma,
             float distanceSquared) {
-        this(key, source, frameIndex, priorityHint, visibility, error, luma, distanceSquared,
+        this(key, source, frameIndex, priorityHint, visibility, error, luma, distanceSquared, 0.0f, 0.0f, 0.0f,
                 CacheInvalidationTracker.global().capture(key));
+    }
+
+    public CacheRequest(
+            CacheRequestKey key,
+            CacheRequestSource source,
+            int frameIndex,
+            int priorityHint,
+            float visibility,
+            float error,
+            float luma,
+            float distanceSquared,
+            float sampleX,
+            float sampleY,
+            float sampleZ) {
+        this(key, source, frameIndex, priorityHint, visibility, error, luma, distanceSquared,
+                sampleX, sampleY, sampleZ, CacheInvalidationTracker.global().capture(key));
     }
 
     public static CacheRequest sectionProbeCell(
@@ -65,6 +87,9 @@ public record CacheRequest(
                 Math.max(error, other.error()),
                 Math.max(luma, other.luma()),
                 Math.min(distanceSquared, other.distanceSquared()),
+                otherScore >= currentScore ? other.sampleX() : sampleX,
+                otherScore >= currentScore ? other.sampleY() : sampleY,
+                otherScore >= currentScore ? other.sampleZ() : sampleZ,
                 other.frameIndex() >= frameIndex ? other.versionStamp() : versionStamp);
     }
 

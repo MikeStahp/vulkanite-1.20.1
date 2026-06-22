@@ -58,6 +58,8 @@ public class MixinIrisRenderingPipeline {
     private VContext ctx;
     @Unique
     private VulkanPipeline pipeline;
+    @Unique
+    private boolean loggedGbufferFlipState;
 
     @Unique
     private List<VulkanPipeline.CustomTexture> getCustomTextures() {
@@ -99,10 +101,17 @@ public class MixinIrisRenderingPipeline {
         ShaderpackSettingsHandler.detectAndApplyShaderpack(pipeline);
     }
 
-    @Inject(method = "finalizeLevelRendering", at = @At("HEAD"))
+    @Inject(
+            method = "finalizeLevelRendering",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lnet/irisshaders/iris/pipeline/CompositeRenderer;renderAll()V",
+                    shift = At.Shift.AFTER))
     private void finalizeLevelRendering(CallbackInfo ci) {
         // Keep OpenGL responsible for the complete compatibility frame, including
-        // entities, fluids, particles, and modded translucent render layers.
+        // entities, fluids, particles, and modded translucent render layers. Run
+        // after Iris composites so they cannot overwrite the Vulkan result before
+        // Iris copies colortex0 into the Minecraft framebuffer.
         Camera camera = MinecraftClient.getInstance().gameRenderer.getCamera();
         runRayTracing(camera);
     }
@@ -123,9 +132,11 @@ public class MixinIrisRenderingPipeline {
             buffers = ((ShaderStorageBufferHolderAccessor) shaderStorageBufferHolder).getBuffers();
         }
 
+        var flippedTargets = ((IrisRenderingPipeline) (Object) this).getFlippedAfterTranslucent();
         List<VRef<VGImage>> outImgs = new ArrayList<>();
         for (int i = 0; i < renderTargets.getRenderTargetCount(); i++) {
-            outImgs.add(((IRenderTargetVkGetter) renderTargets.getOrCreate(i)).getMain());
+            IRenderTargetVkGetter target = (IRenderTargetVkGetter) renderTargets.getOrCreate(i);
+            outImgs.add(flippedTargets.contains(i) ? target.getAlt() : target.getMain());
         }
 
         VRef<VImageView>[] gbufferViews = createGbufferViews();
@@ -185,15 +196,22 @@ public class MixinIrisRenderingPipeline {
 
     @Unique
     private VRef<VImageView> createRenderTargetView(int targetIndex, String label) {
-        var image = ((IRenderTargetVkGetter) renderTargets.getOrCreate(targetIndex)).getMain();
+        IRenderTargetVkGetter target = (IRenderTargetVkGetter) renderTargets.getOrCreate(targetIndex);
+        var flippedTargets = ((IrisRenderingPipeline) (Object) this).getFlippedAfterTranslucent();
+        if (!loggedGbufferFlipState) {
+            loggedGbufferFlipState = true;
+            LOGGER.info("[Vulkanite] Iris G-buffer flipped-after-translucent targets: {}", flippedTargets);
+        }
+        boolean flipped = flippedTargets.contains(targetIndex);
+        VRef<VGImage> image = flipped ? target.getAlt() : target.getMain();
         try {
             if (image == null || image.get() == null) {
                 LOGGER.warn("G-buffer {} colortex{} is null or invalid", label, targetIndex);
                 return null;
             }
 
-            LOGGER.trace("G-buffer {} colortex{} bound: {}x{}",
-                    label, targetIndex, image.get().width, image.get().height);
+            LOGGER.trace("G-buffer {} colortex{} bound from {}: {}x{}",
+                    label, targetIndex, flipped ? "alt" : "main", image.get().width, image.get().height);
             try (VRef<VImage> imageRef = new VRef<>(image.get())) {
                 return VImageView.create(Vulkanite.INSTANCE.getCtx(), imageRef);
             }

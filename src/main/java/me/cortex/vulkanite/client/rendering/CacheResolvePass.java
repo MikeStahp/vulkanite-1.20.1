@@ -17,7 +17,6 @@ import me.cortex.vulkanite.lib.shader.ShaderModule;
 import me.cortex.vulkanite.lib.shader.VShader;
 import me.cortex.vulkanite.lib.shader.reflection.ShaderReflection;
 
-import java.util.ArrayList;
 import java.util.List;
 
 import static org.lwjgl.vulkan.VK10.*;
@@ -78,34 +77,42 @@ final class CacheResolvePass {
             return;
         }
 
-        List<VRef<?>> resourcesToClose = new ArrayList<>(16);
         VRef<VDescriptorPool> pool = Vulkanite.INSTANCE.getPoolByLayout(setLayout);
         VRef<VDescriptorSet> set = null;
         try {
+            RtxFrameImages.StorageViews views = frame.storageViews();
             set = pool.get().allocateSet();
             DescriptorUpdateBuilder updater = new DescriptorUpdateBuilder(ctx, setReflection)
                     .set(set)
                     .uniform(0, frame.uboBuffer(), frame.uboOffset(), frame.uboSize());
 
-            updater.imageStore(6, createView(frame.currentReservoir(), resourcesToClose));
+            updater.imageStore(6, views.currentReservoir());
             bindGbuffer(updater, frame, 7, 0);
             bindGbuffer(updater, frame, 8, 1);
             bindGbuffer(updater, frame, 9, 2);
             bindGbuffer(updater, frame, 10, 3);
             bindGbuffer(updater, frame, 11, 4);
-            updater.imageStore(12, createView(frame.noisyOutput(), resourcesToClose));
-            updater.imageStore(13, createView(frame.motionVectors(), resourcesToClose));
-            updater.imageStore(14, createView(frame.linearDepth(), resourcesToClose));
-            updater.imageStore(16, createView(frame.diffuseAlbedoMetallic(), resourcesToClose));
-            updater.imageStore(17, createView(frame.specularAlbedo(), resourcesToClose));
-            updater.imageStore(18, createView(frame.normalRoughness(), resourcesToClose));
-            updater.imageStore(19, createView(frame.specularHitDepth(), resourcesToClose));
-            updater.imageStore(20, createView(frame.firstHitDepth(), resourcesToClose));
-            updater.imageStore(21, createView(frame.blocklightDetail(), resourcesToClose));
+            updater.imageStore(12, views.radiance());
+            updater.imageStore(13, views.motionVector());
+            updater.imageStore(14, views.linearDepth());
+            updater.imageStore(16, views.diffuseAlbedoMetallic());
+            updater.imageStore(17, views.specularAlbedo());
+            updater.imageStore(18, views.normalRoughness());
+            updater.imageStore(19, views.specularHitDepth());
+            updater.imageStore(20, views.firstHitDepth());
+            updater.imageStore(21, views.blocklightDetail());
             bindOptionalStorageBuffer(updater, frame.diffuseRadianceCacheBuffer(), 26);
+            bindOptionalStorageBuffer(updater, frame.specularTransportCacheBuffer(), 28);
+            updater.imageStore(30, views.previousSpecularHistory());
+            updater.imageStore(31, views.previousSpecularSurfaceHistory());
+            updater.imageStore(32, views.currentSpecularHistory());
+            updater.imageStore(33, views.currentSpecularSurfaceHistory());
             updater.apply();
 
             cmdPushConstants(frame, clearReservoir);
+            // Cache-fill raygen can publish transport entries earlier in this
+            // command buffer. Make those writes visible before compute lookup.
+            frame.cmd().encodeMemoryBarrier();
             frame.cmd().bindCompute(pipeline);
             frame.cmd().bindDSet(List.of(set));
             frame.cmd().pushConstants(0, pushConstants, VK_SHADER_STAGE_COMPUTE_BIT);
@@ -119,9 +126,6 @@ final class CacheResolvePass {
                 set.close();
             }
             pool.close();
-            for (VRef<?> ref : resourcesToClose) {
-                ref.close();
-            }
         }
     }
 
@@ -147,12 +151,6 @@ final class CacheResolvePass {
             view = gbufferViews[index];
         }
         updater.imageSampler(binding, view, sampler);
-    }
-
-    private VRef<VImageView> createView(VRef<VImage> image, List<VRef<?>> resourcesToClose) {
-        VRef<VImageView> view = VImageView.create(ctx, image);
-        resourcesToClose.add(view);
-        return view;
     }
 
     private void bindOptionalStorageBuffer(DescriptorUpdateBuilder updater, VRef<VBuffer> buffer, int binding) {
@@ -226,7 +224,27 @@ final class CacheResolvePass {
                 DiffuseRadianceCacheEntry diffuseRadianceCacheEntries[];
             };
 
+            struct SpecularTransportCacheEntry {
+                ivec4 key;
+                uvec4 metadata;
+                uvec4 payload;
+            };
+
+            layout(binding = 28, std430) readonly buffer SpecularTransportCacheBuffer {
+                uvec4 specularTransportCacheHeader;
+                SpecularTransportCacheEntry specularTransportCacheEntries[];
+            };
+
+            layout(binding = 30, rgba16f) readonly uniform image2D previousSpecularHistory;
+            layout(binding = 31, rgba16f) readonly uniform image2D previousSpecularSurfaceHistory;
+            layout(binding = 32, rgba16f) writeonly uniform image2D currentSpecularHistory;
+            layout(binding = 33, rgba16f) writeonly uniform image2D currentSpecularSurfaceHistory;
+
             const float UNKNOWN_SPECULAR_HIT_DISTANCE = 10000.0;
+            const float BLOCK_ID_WATER = 1000.0;
+            const float BLOCK_ID_GLASS = 1001.0;
+            const float BLOCK_ID_ICE = 1012.0;
+            const float BLOCK_ID_CRYSTAL = 1103.0;
 
             bool finiteVec4(vec4 value) {
                 return !any(isnan(value)) && !any(isinf(value));
@@ -312,11 +330,186 @@ final class CacheResolvePass {
                         radiance = unpackDiffuseRadiance(entry.payload.x);
                         float hitDistance = uintBitsToFloat(entry.payload.w);
                         float distanceConfidence = hitDistance < 0.08 ? 0.15 : 1.0;
-                        confidence = 0.45 * distanceConfidence;
+                        confidence = 0.85 * distanceConfidence;
                         return true;
                     }
                 }
                 return false;
+            }
+
+            bool isBlockId(float blockId, float expected) {
+                return abs(blockId - expected) < 0.5;
+            }
+
+            bool isRefractiveBlock(float blockId) {
+                return isBlockId(blockId, BLOCK_ID_WATER)
+                    || isBlockId(blockId, BLOCK_ID_GLASS)
+                    || isBlockId(blockId, BLOCK_ID_ICE)
+                    || isBlockId(blockId, BLOCK_ID_CRYSTAL);
+            }
+
+            int specularTransportMedium(float blockId) {
+                if (isBlockId(blockId, BLOCK_ID_WATER)) return 1;
+                if (isBlockId(blockId, BLOCK_ID_GLASS)) return 2;
+                if (isBlockId(blockId, BLOCK_ID_ICE)) return 3;
+                if (isBlockId(blockId, BLOCK_ID_CRYSTAL)) return 4;
+                return 0;
+            }
+
+            vec2 signNotZero(vec2 value) {
+                return vec2(value.x >= 0.0 ? 1.0 : -1.0, value.y >= 0.0 ? 1.0 : -1.0);
+            }
+
+            int specularTransportDirectionBucket(vec3 direction) {
+                direction = normalize(direction);
+                vec2 oct = direction.xy / max(abs(direction.x) + abs(direction.y) + abs(direction.z), 1e-6);
+                if (direction.z < 0.0) {
+                    oct = (vec2(1.0) - abs(oct.yx)) * signNotZero(oct);
+                }
+                ivec2 quantized = clamp(ivec2(round((oct * 0.5 + 0.5) * 7.0)), ivec2(0), ivec2(7));
+                return quantized.x | (quantized.y << 3);
+            }
+
+            int specularTransportMaterialBucket(float metallic, float roughness, float blockId, float surfaceAlpha) {
+                int bucket = int(round(clamp(roughness, 0.0, 1.0) * 31.0));
+                if (metallic > 0.5) bucket |= 32;
+                if (blockId > 0.0) bucket |= 64;
+                if (surfaceAlpha < 0.98 && !isBlockId(blockId, 1007.0)) bucket |= 128;
+                return clamp(bucket, 0, 255);
+            }
+
+            ivec4 specularTransportKey(
+                vec3 worldPosition,
+                vec3 normal,
+                float roughness,
+                float metallic,
+                float blockId,
+                float surfaceAlpha
+            ) {
+                int variant = specularTransportDirectionBucket(normal)
+                    | (int(round(clamp(roughness, 0.0, 1.0) * 15.0)) << 8)
+                    | (specularTransportMaterialBucket(metallic, roughness, blockId, surfaceAlpha) << 16);
+                return ivec4(ivec3(floor(worldPosition)), variant);
+            }
+
+            uint specularTransportCacheHash(ivec4 key, uint family, uint detail) {
+                uint value = uint(key.x) * 0x9e3779b9u;
+                value ^= uint(key.y) * 0x85ebca6bu;
+                value ^= uint(key.z) * 0xc2b2ae35u;
+                value ^= uint(key.w) * 0x27d4eb2du;
+                value ^= family * 0x165667b1u;
+                value ^= detail * 0xd3a2646cu;
+                return diffuseRadianceHashMix(value);
+            }
+
+            bool readSpecularTransportCache(
+                ivec4 key,
+                uint family,
+                uint detail,
+                out vec3 reflectedRadiance,
+                out vec3 refractedRadiance,
+                out float reflectionDistance,
+                out float refractionDistance
+            ) {
+                reflectedRadiance = vec3(0.0);
+                refractedRadiance = vec3(0.0);
+                reflectionDistance = UNKNOWN_SPECULAR_HIT_DISTANCE;
+                refractionDistance = UNKNOWN_SPECULAR_HIT_DISTANCE;
+                uint entryCount = specularTransportCacheHeader.x;
+                uint probeCount = min(specularTransportCacheHeader.z, 8u);
+                if (entryCount == 0u || probeCount == 0u) return false;
+
+                uint readyState = 0x80000000u | (specularTransportCacheHeader.y & 0x3fffffffu);
+                uint slot = specularTransportCacheHash(key, family, detail) % entryCount;
+                for (uint probe = 0u; probe < 8u; probe++) {
+                    if (probe >= probeCount) break;
+                    uint index = (slot + probe) % entryCount;
+                    SpecularTransportCacheEntry entry = specularTransportCacheEntries[index];
+                    if (entry.metadata.w == readyState
+                            && entry.metadata.x == family
+                            && entry.metadata.y == detail
+                            && all(equal(entry.key, key))) {
+                        reflectedRadiance = unpackDiffuseRadiance(entry.payload.x);
+                        refractedRadiance = unpackDiffuseRadiance(entry.payload.y);
+                        reflectionDistance = uintBitsToFloat(entry.payload.z);
+                        refractionDistance = uintBitsToFloat(entry.payload.w);
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            vec3 fresnelSchlickResolve(float cosTheta, vec3 f0) {
+                return f0 + (vec3(1.0) - f0) * pow(1.0 - clamp(cosTheta, 0.0, 1.0), 5.0);
+            }
+
+            vec3 waterTintResolve(vec3 albedo) {
+                return mix(vec3(0.02, 0.48, 0.65), max(albedo, vec3(0.02)), 0.18);
+            }
+
+            vec3 waterAbsorptionResolve(float distance) {
+                return exp(-(vec3(1.0) - vec3(0.02, 0.48, 0.65))
+                    * min(max(distance, 0.0), 48.0) * 0.14 * 0.22);
+            }
+
+            vec3 iceTintResolve(vec3 albedo) {
+                return mix(vec3(0.72, 0.90, 1.0), max(albedo, vec3(0.35)), 0.35);
+            }
+
+            vec3 iceAbsorptionResolve(float distance) {
+                return exp(-vec3(0.10, 0.035, 0.015)
+                    * min(max(distance, 0.0), 32.0) * 0.38);
+            }
+
+            vec2 encodeHistoryNormal(vec3 normal) {
+                normal = normalize(normal);
+                vec2 oct = normal.xy / max(abs(normal.x) + abs(normal.y) + abs(normal.z), 1e-6);
+                if (normal.z < 0.0) {
+                    oct = (vec2(1.0) - abs(oct.yx)) * signNotZero(oct);
+                }
+                return oct * 0.5 + 0.5;
+            }
+
+            vec3 decodeHistoryNormal(vec2 encoded) {
+                vec2 oct = encoded * 2.0 - 1.0;
+                vec3 normal = vec3(oct, 1.0 - abs(oct.x) - abs(oct.y));
+                if (normal.z < 0.0) {
+                    normal.xy = (vec2(1.0) - abs(normal.yx)) * signNotZero(normal.xy);
+                }
+                return normalize(normal);
+            }
+
+            bool readSpecularScreenHistory(
+                ivec2 previousPixel,
+                vec3 normal,
+                float linearDepth,
+                uint keySignature,
+                out vec3 radiance,
+                out float hitDistance
+            ) {
+                radiance = vec3(0.0);
+                hitDistance = UNKNOWN_SPECULAR_HIT_DISTANCE;
+                if (any(lessThan(previousPixel, ivec2(0)))
+                        || any(greaterThanEqual(previousPixel, imageSize(previousSpecularHistory)))) {
+                    return false;
+                }
+                vec4 history = imageLoad(previousSpecularHistory, previousPixel);
+                vec4 surface = imageLoad(previousSpecularSurfaceHistory, previousPixel);
+                if (!finiteVec4(history) || !finiteVec4(surface)
+                        || surface.z <= 0.0
+                        || history.a <= 0.0
+                        || history.a > UNKNOWN_SPECULAR_HIT_DISTANCE
+                        || uint(round(surface.w)) != (keySignature & 0x000007ffu)) {
+                    return false;
+                }
+                float depthTolerance = max(0.25, linearDepth * 0.025);
+                if (abs(surface.z - linearDepth) > depthTolerance
+                        || dot(decodeHistoryNormal(surface.xy), normal) < 0.96) {
+                    return false;
+                }
+                radiance = max(history.rgb, vec3(0.0));
+                hitDistance = history.a;
+                return true;
             }
 
             // Match ray0.rgen: normalized world-space normals use [0, 1] RGB.
@@ -366,6 +559,21 @@ final class CacheResolvePass {
                 imageStore(FirstHitDepth, pixel, vec4(10000.0));
                 imageStore(SpecularHitDepth, pixel, vec4(10000.0));
                 imageStore(blocklightDetailImage, pixel, vec4(0.0));
+                imageStore(currentSpecularHistory, pixel, vec4(0.0));
+                imageStore(currentSpecularSurfaceHistory, pixel, vec4(0.0));
+            }
+
+            void writeAlbedoFallbackSidecars(ivec2 pixel, vec3 albedo, vec4 materialRaw) {
+                writeSkySidecars(pixel);
+                vec3 f0 = finiteVec4(materialRaw)
+                    ? clamp(materialRaw.rgb, vec3(0.0), vec3(1.0))
+                    : vec3(0.04);
+                float roughness = finiteVec4(materialRaw)
+                    ? clamp(materialRaw.a, 0.04, 1.0)
+                    : 1.0;
+                imageStore(DiffuseAlbedoMetallic, pixel, vec4(albedo, 0.0));
+                imageStore(SpecularAlbedo, pixel, vec4(f0, 1.0));
+                imageStore(NormalRoughness, pixel, vec4(0.5, 1.0, 0.5, roughness));
             }
 
             void main() {
@@ -385,12 +593,21 @@ final class CacheResolvePass {
                 vec3 direction = normalize((cam.viewInverse * vec4(target, 0.0)).xyz);
                 vec3 origin = cam.viewInverse[3].xyz;
 
-                ivec2 g0 = clamp(pixel, ivec2(0), textureSize(gbufferWorldPos, 0) - 1);
+                // Iris G-buffers stay at output resolution while DLSS/RR may
+                // run this resolve at a lower render resolution. Map by screen
+                // UV instead of reading the upper-left render-sized rectangle.
+                vec2 gbufferUv = (vec2(pixel) + vec2(0.5)) / launchSize;
+                ivec2 g0 = clamp(ivec2(gbufferUv * vec2(textureSize(gbufferWorldPos, 0))),
+                    ivec2(0), textureSize(gbufferWorldPos, 0) - 1);
                 vec4 gPos = texelFetch(gbufferWorldPos, g0, 0);
-                vec4 gNormalRaw = texelFetch(gbufferNormal, clamp(pixel, ivec2(0), textureSize(gbufferNormal, 0) - 1), 0);
-                vec4 gAlbedoRaw = texelFetch(gbufferAlbedo, clamp(pixel, ivec2(0), textureSize(gbufferAlbedo, 0) - 1), 0);
-                vec4 gMaterialRaw = texelFetch(gbufferMaterial, clamp(pixel, ivec2(0), textureSize(gbufferMaterial, 0) - 1), 0);
-                vec4 gExtraRaw = texelFetch(gbufferExtra, clamp(pixel, ivec2(0), textureSize(gbufferExtra, 0) - 1), 0);
+                vec4 gNormalRaw = texelFetch(gbufferNormal,
+                    clamp(ivec2(gbufferUv * vec2(textureSize(gbufferNormal, 0))), ivec2(0), textureSize(gbufferNormal, 0) - 1), 0);
+                vec4 gAlbedoRaw = texelFetch(gbufferAlbedo,
+                    clamp(ivec2(gbufferUv * vec2(textureSize(gbufferAlbedo, 0))), ivec2(0), textureSize(gbufferAlbedo, 0) - 1), 0);
+                vec4 gMaterialRaw = texelFetch(gbufferMaterial,
+                    clamp(ivec2(gbufferUv * vec2(textureSize(gbufferMaterial, 0))), ivec2(0), textureSize(gbufferMaterial, 0) - 1), 0);
+                vec4 gExtraRaw = texelFetch(gbufferExtra,
+                    clamp(ivec2(gbufferUv * vec2(textureSize(gbufferExtra, 0))), ivec2(0), textureSize(gbufferExtra, 0) - 1), 0);
 
                 if (pc.clearReservoir != 0) {
                     imageStore(reservoirImage, pixel, vec4(0.0));
@@ -405,8 +622,16 @@ final class CacheResolvePass {
                 vec3 sunColor = vec3(pc.sunColorR, pc.sunColorG, pc.sunColorB) * 3.4;
 
                 if (!hit) {
-                    writeSkySidecars(pixel);
-                    imageStore(outputImage, pixel, vec4(skyColor(direction, lightDir, sunColor), 1.0));
+                    bool hasAlbedo = finiteVec4(gAlbedoRaw)
+                        && (gAlbedoRaw.a > 0.001 || any(greaterThan(abs(gAlbedoRaw.rgb), vec3(0.001))));
+                    if (hasAlbedo) {
+                        vec3 fallbackAlbedo = clamp(gAlbedoRaw.rgb, vec3(0.0), vec3(1.0));
+                        writeAlbedoFallbackSidecars(pixel, fallbackAlbedo, gMaterialRaw);
+                        imageStore(outputImage, pixel, vec4(fallbackAlbedo, 1.0));
+                    } else {
+                        writeSkySidecars(pixel);
+                        imageStore(outputImage, pixel, vec4(skyColor(direction, lightDir, sunColor), 1.0));
+                    }
                     return;
                 }
 
@@ -415,6 +640,7 @@ final class CacheResolvePass {
                 vec3 f0 = clamp(gMaterialRaw.rgb, vec3(0.0), vec3(1.0));
                 float roughness = clamp(gMaterialRaw.a, 0.04, 1.0);
                 float materialTag = gPos.w;
+                float blockId = materialTag >= 999.5 ? floor(materialTag + 0.5) : 0.0;
                 float metallic = materialTag >= 999.5 ? 0.0 : clamp(materialTag, 0.0, 1.0);
                 float ao = clamp(gExtraRaw.b, 0.0, 1.0);
                 float blocklight = clamp(gExtraRaw.r, 0.0, 1.0);
@@ -432,6 +658,7 @@ final class CacheResolvePass {
                     }
                 }
                 vec2 motion = validPrev ? clamp(prevUv * launchSize - pixelCenter, -launchSize, launchSize) : vec2(0.0);
+                ivec2 previousPixel = validPrev ? ivec2(prevUv * launchSize) : ivec2(-1);
 
                 vec3 cameraForward = -normalize(cam.viewInverse[2].xyz);
                 float linearDepth = max(dot(gPos.xyz, cameraForward), 0.0);
@@ -443,9 +670,6 @@ final class CacheResolvePass {
                 imageStore(SpecularAlbedo, pixel, vec4(f0, 1.0));
                 imageStore(NormalRoughness, pixel, vec4(encodeDlssNormalGuide(normal), roughness));
                 imageStore(FirstHitDepth, pixel, vec4(linearDepth));
-                // No reflection/refraction cache has supplied a continuation hit.
-                // First-surface depth is not a valid specular hit-distance guide.
-                imageStore(SpecularHitDepth, pixel, vec4(UNKNOWN_SPECULAR_HIT_DISTANCE));
 
                 float nDotL = max(dot(normal, lightDir), 0.0);
                 float day = smoothstep(-0.15, 0.25, lightDir.y);
@@ -454,7 +678,7 @@ final class CacheResolvePass {
                 vec3 ambient = albedo * skyAmbient * (0.10 + 0.40 * skylight) * (0.30 + 0.70 * ao);
                 vec3 localLight = albedo * blocklight * vec3(1.0, 0.78, 0.48) * 1.15;
                 ivec4 cacheKey = ivec4(
-                    ivec3(floor(absWorldPos * 0.5)),
+                    ivec3(floor(absWorldPos)),
                     diffuseRadianceNormalBucket(normal));
                 vec3 cachedIncident;
                 float cacheConfidence;
@@ -465,11 +689,153 @@ final class CacheResolvePass {
                 vec3 diffuseIndirect = cacheHit
                     ? mix(fallbackIndirect, cachedIndirect, cacheConfidence)
                     : fallbackIndirect;
+                vec3 cachedSpecular = vec3(0.0);
+                float specularHitDistance = UNKNOWN_SPECULAR_HIT_DISTANCE;
+                bool specularResultValid = false;
+                uint specularHistorySignature = 0u;
+                ivec4 transportKey = specularTransportKey(
+                    absWorldPos, normal, roughness, metallic, blockId, gAlbedoRaw.a);
+                bool thinTransparentSurface = gAlbedoRaw.a < 0.98
+                    && !isBlockId(blockId, 1007.0)
+                    && !isRefractiveBlock(blockId);
+                bool refractiveSurface = isRefractiveBlock(blockId) || thinTransparentSurface;
+                if (refractiveSurface) {
+                    vec3 incident = -viewDir;
+                    vec3 reflectionDirection = normalize(reflect(incident, normal));
+                    float ior = isBlockId(blockId, BLOCK_ID_WATER)
+                        ? 1.333
+                        : (isBlockId(blockId, BLOCK_ID_ICE)
+                            ? 1.31
+                            : (isBlockId(blockId, BLOCK_ID_CRYSTAL) ? 2.20 : 1.50));
+                    vec3 refractionDirection = refract(incident, normal, 1.0 / ior);
+                    if (dot(refractionDirection, refractionDirection) <= 1e-6) {
+                        refractionDirection = reflectionDirection;
+                    } else {
+                        refractionDirection = normalize(refractionDirection);
+                    }
+                    uint transportDetail = uint(specularTransportMedium(blockId))
+                        | (uint(specularTransportDirectionBucket(reflectionDirection)) << 8u)
+                        | (uint(specularTransportDirectionBucket(refractionDirection)) << 16u);
+                    specularHistorySignature = specularTransportCacheHash(
+                        transportKey, 1u, transportDetail);
+                    vec3 reflectedRadiance;
+                    vec3 refractedRadiance;
+                    float reflectionDistance;
+                    float refractionDistance;
+                    bool transportHit = readSpecularTransportCache(
+                        transportKey,
+                        1u,
+                        transportDetail,
+                        reflectedRadiance,
+                        refractedRadiance,
+                        reflectionDistance,
+                        refractionDistance);
+                    if (transportHit) {
+                        vec3 fresnel = fresnelSchlickResolve(max(dot(normal, viewDir), 0.0), f0);
+                        if (isBlockId(blockId, BLOCK_ID_WATER)) {
+                            fresnel = clamp(fresnel * 1.15, vec3(0.0), vec3(1.0));
+                            vec3 tint = waterTintResolve(albedo);
+                            vec3 absorption = waterAbsorptionResolve(refractionDistance);
+                            refractedRadiance = refractedRadiance * absorption
+                                + tint * (vec3(1.0) - absorption);
+                        } else if (isBlockId(blockId, BLOCK_ID_GLASS)) {
+                            refractedRadiance *= mix(vec3(1.0), max(albedo, vec3(0.2)), 0.28) * 0.88;
+                        } else if (isBlockId(blockId, BLOCK_ID_ICE)) {
+                            vec3 tint = iceTintResolve(albedo);
+                            vec3 absorption = iceAbsorptionResolve(refractionDistance);
+                            refractedRadiance = refractedRadiance * absorption * tint
+                                + tint * (vec3(1.0) - absorption) * 0.18;
+                        } else if (isBlockId(blockId, BLOCK_ID_CRYSTAL)) {
+                            refractedRadiance *= mix(vec3(1.0), max(albedo, vec3(0.12)), 0.55) * 0.28;
+                        } else {
+                            refractedRadiance *= mix(vec3(1.0), max(albedo, vec3(0.1)), 0.35)
+                                * clamp(gAlbedoRaw.a, 0.0, 1.0);
+                        }
+                        cachedSpecular = mix(refractedRadiance, reflectedRadiance, fresnel);
+                        specularHitDistance = min(reflectionDistance, refractionDistance);
+                        specularResultValid = true;
+                    } else {
+                        specularResultValid = readSpecularScreenHistory(
+                            previousPixel,
+                            normal,
+                            linearDepth,
+                            specularHistorySignature,
+                            cachedSpecular,
+                            specularHitDistance);
+                    }
+                } else {
+                    float surfaceFresnelLuma = dot(
+                        fresnelSchlickResolve(max(dot(normal, viewDir), 0.0), f0),
+                        vec3(0.2126, 0.7152, 0.0722));
+                    float reflectionRoughnessLimit = mix(0.62, 0.88, metallic);
+                    if (roughness < reflectionRoughnessLimit
+                            && (metallic > 0.5 || surfaceFresnelLuma > 0.025)) {
+                        vec3 reflectionDirection = normalize(reflect(-viewDir, normal));
+                        uint transportDetail = uint(specularTransportDirectionBucket(reflectionDirection));
+                        specularHistorySignature = specularTransportCacheHash(
+                            transportKey, 0u, transportDetail);
+                        vec3 reflectedRadiance;
+                        vec3 unusedRefraction;
+                        float reflectionDistance;
+                        float unusedRefractionDistance;
+                        bool transportHit = readSpecularTransportCache(
+                            transportKey,
+                            0u,
+                            transportDetail,
+                            reflectedRadiance,
+                            unusedRefraction,
+                            reflectionDistance,
+                            unusedRefractionDistance);
+                        if (transportHit) {
+                            vec3 fresnel = fresnelSchlickResolve(max(dot(normal, viewDir), 0.0), f0);
+                            float reflectionStrength = mix(0.65, 1.0, metallic)
+                                * (1.0 - roughness * roughness);
+                            float envBrightness = dot(reflectedRadiance, vec3(0.299, 0.587, 0.114));
+                            reflectionStrength *= 0.2 + 0.8 * smoothstep(0.0, 0.3, envBrightness);
+                            cachedSpecular = reflectedRadiance * fresnel * reflectionStrength;
+                            specularHitDistance = reflectionDistance;
+                            specularResultValid = true;
+                        } else {
+                            specularResultValid = readSpecularScreenHistory(
+                                previousPixel,
+                                normal,
+                                linearDepth,
+                                specularHistorySignature,
+                                cachedSpecular,
+                                specularHitDistance);
+                        }
+                    }
+                }
+                // A first-surface depth is not a continuation-ray hit distance.
+                // Preserve the explicit miss sentinel until a valid cache entry exists.
+                imageStore(SpecularHitDepth, pixel, vec4(specularHitDistance));
+                if (specularResultValid) {
+                    imageStore(currentSpecularHistory, pixel,
+                        vec4(cachedSpecular, specularHitDistance));
+                    imageStore(currentSpecularSurfaceHistory, pixel,
+                        vec4(encodeHistoryNormal(normal), linearDepth,
+                            float(specularHistorySignature & 0x000007ffu)));
+                } else {
+                    imageStore(currentSpecularHistory, pixel, vec4(0.0));
+                    imageStore(currentSpecularSurfaceHistory, pixel, vec4(0.0));
+                }
                 vec3 halfway = normalize(lightDir + viewDir);
                 float specPower = mix(96.0, 8.0, roughness);
                 vec3 specular = f0 * pow(max(dot(normal, halfway), 0.0), specPower) * nDotL * (1.0 - roughness * 0.65);
                 vec3 minLight = albedo * 0.004 * (0.2 + 0.8 * ao);
-                vec3 finalColor = linearColorGrade(direct + diffuseIndirect + specular + minLight);
+                // An empty cache is intentionally obvious and useful: preserve
+                // flat G-buffer albedo instead of presenting fallback lighting
+                // that can be mistaken for the vanilla renderer. Cache hits add
+                // only the transport that is actually resident.
+                vec3 finalColor;
+                if (!cacheHit) {
+                    finalColor = specularResultValid
+                        ? clamp(albedo + cachedSpecular, vec3(0.0), vec3(32.0))
+                        : clamp(albedo, vec3(0.0), vec3(1.0));
+                } else {
+                    finalColor = linearColorGrade(
+                        direct + diffuseIndirect + specular + cachedSpecular + minLight);
+                }
 
                 imageStore(blocklightDetailImage, pixel,
                     vec4(localLight + (cacheHit ? cachedIncident * diffuseResponse : vec3(0.0)),

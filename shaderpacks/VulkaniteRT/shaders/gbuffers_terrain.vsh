@@ -1,11 +1,13 @@
 #version 460
 
-// Vertex attributes from Minecraft
-layout(location = 0) in vec3 vaPosition;
-layout(location = 1) in vec2 vaUV0;
-layout(location = 2) in vec4 vaColor;
-layout(location = 3) in ivec2 vaUV2;
-layout(location = 4) in vec3 vaNormal;
+// Iris rewrites/binds these canonical names for Sodium's compact terrain
+// format. Explicit locations conflict with its bindings (normal is 10, light
+// UV is 4, tangent is 13 in Iris 1.7.5).
+in vec3 vaPosition;
+in vec2 vaUV0;
+in vec4 vaColor;
+in ivec2 vaUV2;
+in vec3 vaNormal;
 in vec4 mc_Entity;
 #ifdef IRIS_FEATURE_BLOCK_EMISSION_ATTRIBUTE
 in vec4 at_midBlock;
@@ -13,7 +15,7 @@ in vec4 at_midBlock;
 // Iris/OptiFine provides tangent as attribute (location 5 in newer versions)
 // If not available, we'll compute it in the shader
 #ifdef MC_NORMAL_MAP
-layout(location = 5) in vec4 vaTangent;
+in vec4 at_tangent;
 #endif
 
 uniform mat4 modelViewMatrix;
@@ -36,7 +38,10 @@ void main() {
     
     // Transform normal to world space
     // Note: Minecraft uses Z-up, but we need to handle the coordinate system properly
-    normal = normalize(vaNormal);
+    float normalLen2 = dot(vaNormal, vaNormal);
+    normal = normalLen2 > 0.000001
+        ? vaNormal * inversesqrt(normalLen2)
+        : vec3(0.0, 1.0, 0.0);
 
     // Lightmap UV: vaUV2 contains packed light values
     // Minecraft lightmap: each component is 0-15 (4 bits), scaled to 0-240 for UV
@@ -63,8 +68,14 @@ void main() {
     
 #ifdef MC_NORMAL_MAP
     // Use the tangent attribute if available (LabPBR/OptiFine)
-    tangent = normalize(vaTangent.xyz);
-    float tangentSign = vaTangent.w;
+    float tangentLen2 = dot(at_tangent.xyz, at_tangent.xyz);
+    if (tangentLen2 > 0.000001) {
+        tangent = at_tangent.xyz * inversesqrt(tangentLen2);
+    } else {
+        vec3 up = abs(normal.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        tangent = normalize(cross(up, normal));
+    }
+    float tangentSign = at_tangent.w < 0.0 ? -1.0 : 1.0;
     bitangent = normalize(cross(normal, tangent)) * tangentSign;
 #else
     // Compute tangent in the shader if not provided

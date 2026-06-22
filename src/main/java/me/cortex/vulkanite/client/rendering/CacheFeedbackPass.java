@@ -13,6 +13,7 @@ import me.cortex.vulkanite.lib.descriptors.VDescriptorPool;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorSet;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorSetLayout;
 import me.cortex.vulkanite.lib.memory.VBuffer;
+import me.cortex.vulkanite.lib.memory.VImage;
 import me.cortex.vulkanite.lib.other.VImageView;
 import me.cortex.vulkanite.lib.other.VSampler;
 import me.cortex.vulkanite.lib.pipeline.ComputePipelineBuilder;
@@ -21,6 +22,8 @@ import me.cortex.vulkanite.lib.shader.ShaderModule;
 import me.cortex.vulkanite.lib.shader.VShader;
 import me.cortex.vulkanite.lib.shader.reflection.ShaderReflection;
 import org.lwjgl.system.MemoryUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -36,12 +39,13 @@ import static org.lwjgl.vulkan.VK10.*;
  * finished, so request discovery stays asynchronous and avoids blocking readback.</p>
  */
 final class CacheFeedbackPass {
+    private static final Logger LOGGER = LoggerFactory.getLogger(CacheFeedbackPass.class);
     private static final int LOCAL_SIZE_X = 8;
     private static final int LOCAL_SIZE_Y = 8;
-    private static final int PUSH_CONSTANT_BYTES = 16;
+    private static final int PUSH_CONSTANT_BYTES = 24;
     private static final int MAX_FEEDBACK_RECORDS = 4096;
-    private static final int HEADER_BYTES = 16;
-    private static final int RECORD_BYTES = 56;
+    private static final int HEADER_BYTES = 64;
+    private static final int RECORD_BYTES = 72;
     private static final int BUFFER_BYTES = HEADER_BYTES + MAX_FEEDBACK_RECORDS * RECORD_BYTES;
     private static final int MIN_SAMPLE_STEP = 1;
     private static final int MAX_SAMPLE_STEP = 64;
@@ -53,9 +57,17 @@ final class CacheFeedbackPass {
     private final VRef<VDescriptorSetLayout> setLayout;
     private final ShaderReflection.Set setReflection;
     private final FeedbackSlot[] feedbackSlots = new FeedbackSlot[FEEDBACK_RING_SIZE];
-    private final int[] pushConstants = new int[4];
+    private final int[] pushConstants = new int[6];
     private FeedbackSlot encodedSlot;
     private long feedbackEpoch = 1L;
+    private long lastInvalidGbufferLogNanos;
+    private long cacheQueries;
+    private long cacheHits;
+    private long fallbackPixels;
+    private boolean screenHistoryValid;
+
+    record Metrics(long cacheQueries, long cacheHits, long fallbackPixels) {
+    }
 
     CacheFeedbackPass(VContext ctx, VRef<VSampler> sampler) {
         this.ctx = ctx;
@@ -126,6 +138,10 @@ final class CacheFeedbackPass {
             ByteBuffer data = MemoryUtil.memByteBuffer(ptr, BUFFER_BYTES).order(ByteOrder.nativeOrder());
             int count = Math.min(data.getInt(0), MAX_FEEDBACK_RECORDS);
             int feedbackFrame = data.getInt(4);
+            cacheQueries += Integer.toUnsignedLong(data.getInt(48));
+            cacheHits += Integer.toUnsignedLong(data.getInt(52));
+            fallbackPixels += Integer.toUnsignedLong(data.getInt(56));
+            logInvalidGbufferDiagnostics(data);
             int enqueued = 0;
             for (int i = 0; i < count; i++) {
                 int offset = HEADER_BYTES + i * RECORD_BYTES;
@@ -138,6 +154,27 @@ final class CacheFeedbackPass {
         } finally {
             slot.buffer.get().unmap();
         }
+    }
+
+    private void logInvalidGbufferDiagnostics(ByteBuffer data) {
+        int sampled = data.getInt(16);
+        int valid = data.getInt(44);
+        if (sampled <= 0 || valid > 0) {
+            return;
+        }
+        long now = System.nanoTime();
+        if (now - lastInvalidGbufferLogNanos < 2_000_000_000L) {
+            return;
+        }
+        lastInvalidGbufferLogNanos = now;
+        LOGGER.warn("[Vulkanite] G-buffer has no valid samples: sampled={}, finite={}, position={}, normal={}, material={}, albedoNonzero={}, extraNonzero={}",
+                sampled,
+                data.getInt(20),
+                data.getInt(24),
+                data.getInt(28),
+                data.getInt(32),
+                data.getInt(36),
+                data.getInt(40));
     }
 
     boolean execute(RtxPassGraph.Frame frame) {
@@ -173,12 +210,22 @@ final class CacheFeedbackPass {
             bindGbuffer(updater, frame, 4, 3);
             bindGbuffer(updater, frame, 5, 4);
             updater.buffer(6, slot.buffer);
+            if (frame.specularTransportCacheBuffer() != null) {
+                updater.buffer(7, frame.specularTransportCacheBuffer());
+            }
+            if (frame.diffuseRadianceCacheBuffer() != null) {
+                updater.buffer(10, frame.diffuseRadianceCacheBuffer());
+            }
+            updater.imageStore(8, frame.storageViews().previousSpecularHistory());
+            updater.imageStore(9, frame.storageViews().previousSpecularSurfaceHistory());
             updater.apply();
 
             pushConstants[0] = sampleStep;
             pushConstants[1] = frame.frameIndex();
             pushConstants[2] = frame.renderWidth();
             pushConstants[3] = frame.renderHeight();
+            pushConstants[4] = screenHistoryValid ? 1 : 0;
+            pushConstants[5] = 0;
 
             frame.cmd().bindCompute(pipeline);
             frame.cmd().bindDSet(List.of(set));
@@ -208,6 +255,14 @@ final class CacheFeedbackPass {
         return true;
     }
 
+    void markScreenHistoryResolved() {
+        screenHistoryValid = true;
+    }
+
+    Metrics snapshotMetrics() {
+        return new Metrics(cacheQueries, cacheHits, fallbackPixels);
+    }
+
     void markEncodedFeedbackSubmitted(long execution) {
         if (encodedSlot == null || encodedSlot.state != FeedbackState.ENCODED) {
             return;
@@ -233,12 +288,17 @@ final class CacheFeedbackPass {
             feedbackEpoch = 1L;
         }
         discardEncodedFeedback();
+        screenHistoryValid = false;
         for (FeedbackSlot slot : feedbackSlots) {
             if (slot.state == FeedbackState.READY) {
                 slot.state = FeedbackState.FREE;
                 slot.execution = 0L;
             }
         }
+    }
+
+    void invalidateScreenHistory() {
+        screenHistoryValid = false;
     }
 
     void destroy() {
@@ -269,6 +329,9 @@ final class CacheFeedbackPass {
         float error = data.getFloat(offset + 44);
         float luma = data.getFloat(offset + 48);
         float distanceSquared = data.getFloat(offset + 52);
+        float sampleX = data.getFloat(offset + 56);
+        float sampleY = data.getFloat(offset + 60);
+        float sampleZ = data.getFloat(offset + 64);
 
         CacheRequestKey key = switch (family) {
             case DIFFUSE_RADIANCE -> CacheRequestKey.diffuseRadianceEntry(
@@ -280,13 +343,32 @@ final class CacheFeedbackPass {
             case REFLECTION -> CacheRequestKey.reflectionEntry(
                     cellX, cellY, cellZ, normalBucket, roughnessBucket, materialBucket, viewOrMediumBucket);
             case REFRACTION -> CacheRequestKey.refractionEntry(
-                    cellX, cellY, cellZ, normalBucket, roughnessBucket, viewOrMediumBucket, materialBucket);
+                    cellX,
+                    cellY,
+                    cellZ,
+                    normalBucket,
+                    roughnessBucket,
+                    viewOrMediumBucket & 0xFF,
+                    materialBucket,
+                    (viewOrMediumBucket >>> 8) & 0xFF,
+                    (viewOrMediumBucket >>> 16) & 0xFF);
             case SECTION_PROBE_CELL -> null;
         };
         if (key == null) {
             return null;
         }
-        return new CacheRequest(key, source, feedbackFrame, priorityHint, visibility, error, luma, distanceSquared);
+        return new CacheRequest(
+                key,
+                source,
+                feedbackFrame,
+                priorityHint,
+                visibility,
+                error,
+                luma,
+                distanceSquared,
+                sampleX,
+                sampleY,
+                sampleZ);
     }
 
     private CacheRequestSource sourceFromOrdinal(int sourceOrdinal) {
@@ -334,6 +416,7 @@ final class CacheFeedbackPass {
     private void clearFeedbackHeader(VRef<VBuffer> buffer, int frameIndex) {
         long ptr = buffer.get().map();
         try {
+            MemoryUtil.memSet(ptr, 0, HEADER_BYTES);
             ByteBuffer data = MemoryUtil.memByteBuffer(ptr, HEADER_BYTES).order(ByteOrder.nativeOrder());
             data.putInt(0, 0);
             data.putInt(4, frameIndex);
@@ -360,7 +443,9 @@ final class CacheFeedbackPass {
                 Integer.toUnsignedLong(pushConstants[0])
                         | (Integer.toUnsignedLong(pushConstants[1]) << 32),
                 Integer.toUnsignedLong(pushConstants[2])
-                        | (Integer.toUnsignedLong(pushConstants[3]) << 32)
+                        | (Integer.toUnsignedLong(pushConstants[3]) << 32),
+                Integer.toUnsignedLong(pushConstants[4])
+                        | (Integer.toUnsignedLong(pushConstants[5]) << 32)
         };
     }
 
@@ -421,6 +506,10 @@ final class CacheFeedbackPass {
                 float error;
                 float luma;
                 float distanceSquared;
+                float sampleX;
+                float sampleY;
+                float sampleZ;
+                float samplePadding;
             };
 
             layout(std430, binding = 6) buffer CacheFeedback {
@@ -428,14 +517,52 @@ final class CacheFeedbackPass {
                 uint feedbackFrame;
                 uint feedbackCapacity;
                 uint feedbackDropped;
+                uint sampledCount;
+                uint finiteCount;
+                uint positionCount;
+                uint normalCount;
+                uint materialCount;
+                uint albedoNonzeroCount;
+                uint extraNonzeroCount;
+                uint validCount;
+                uint cacheQueryCount;
+                uint cacheHitCount;
+                uint fallbackPixelCount;
+                uint counterPadding;
                 FeedbackRecord records[];
             } feedback;
+
+            struct SpecularTransportCacheEntry {
+                ivec4 key;
+                uvec4 metadata;
+                uvec4 payload;
+            };
+
+            layout(std430, binding = 7) coherent buffer SpecularTransportCacheBuffer {
+                uvec4 specularTransportCacheHeader;
+                SpecularTransportCacheEntry specularTransportCacheEntries[];
+            };
+
+            layout(binding = 8, rgba16f) readonly uniform image2D previousSpecularHistory;
+            layout(binding = 9, rgba16f) readonly uniform image2D previousSpecularSurfaceHistory;
+
+            struct DiffuseRadianceCacheEntry {
+                ivec4 key;
+                uvec4 payload;
+            };
+
+            layout(std430, binding = 10) coherent buffer DiffuseRadianceCacheBuffer {
+                uvec4 diffuseRadianceCacheHeader;
+                DiffuseRadianceCacheEntry diffuseRadianceCacheEntries[];
+            };
 
             layout(push_constant) uniform PushConstants {
                 uint sampleStep;
                 uint frameIndex;
                 uint renderWidth;
                 uint renderHeight;
+                uint allowScreenHistory;
+                uint padding;
             } pc;
 
             const int FAMILY_DIFFUSE_RADIANCE = 1;
@@ -501,15 +628,129 @@ final class CacheFeedbackPass {
                 return direction.z >= 0.0 ? 4 : 5;
             }
 
-            int materialBucket(float metallic, float roughness, float blockId) {
+            vec2 signNotZero(vec2 value) {
+                return vec2(value.x >= 0.0 ? 1.0 : -1.0, value.y >= 0.0 ? 1.0 : -1.0);
+            }
+
+            int directionBucket(vec3 direction) {
+                direction = normalize(direction);
+                vec2 oct = direction.xy / max(abs(direction.x) + abs(direction.y) + abs(direction.z), 1e-6);
+                if (direction.z < 0.0) {
+                    oct = (vec2(1.0) - abs(oct.yx)) * signNotZero(oct);
+                }
+                ivec2 quantized = clamp(ivec2(round((oct * 0.5 + 0.5) * 7.0)), ivec2(0), ivec2(7));
+                return quantized.x | (quantized.y << 3);
+            }
+
+            int materialBucket(float metallic, float roughness, float blockId, float surfaceAlpha) {
                 int bucket = int(round(clamp(roughness, 0.0, 1.0) * 31.0));
                 if (metallic > 0.5) bucket |= 32;
                 if (blockId > 0.0) bucket |= 64;
+                if (surfaceAlpha < 0.98 && !isBlockId(blockId, 1007.0)) bucket |= 128;
                 return clamp(bucket, 0, 255);
             }
 
+            uint hashMix(uint value) {
+                value ^= value >> 16u;
+                value *= 0x7feb352du;
+                value ^= value >> 15u;
+                value *= 0x846ca68bu;
+                return value ^ (value >> 16u);
+            }
+
+            uint specularTransportHash(ivec4 key, uint family, uint detail) {
+                uint value = uint(key.x) * 0x9e3779b9u;
+                value ^= uint(key.y) * 0x85ebca6bu;
+                value ^= uint(key.z) * 0xc2b2ae35u;
+                value ^= uint(key.w) * 0x27d4eb2du;
+                value ^= family * 0x165667b1u;
+                value ^= detail * 0xd3a2646cu;
+                return hashMix(value);
+            }
+
+            uint diffuseRadianceHash(ivec4 key) {
+                uint value = uint(key.x) * 0x9e3779b9u;
+                value ^= uint(key.y) * 0x85ebca6bu;
+                value ^= uint(key.z) * 0xc2b2ae35u;
+                value ^= uint(key.w) * 0x27d4eb2du;
+                return hashMix(value);
+            }
+
+            bool hasDiffuseRadiance(ivec4 key) {
+                uint entryCount = diffuseRadianceCacheHeader.x;
+                uint probeCount = min(diffuseRadianceCacheHeader.z, 8u);
+                if (entryCount == 0u || probeCount == 0u) return false;
+                uint readyState = 0x80000000u | (diffuseRadianceCacheHeader.y & 0x3fffffffu);
+                uint slot = diffuseRadianceHash(key) % entryCount;
+                for (uint probe = 0u; probe < 8u; probe++) {
+                    if (probe >= probeCount) break;
+                    uint index = (slot + probe) % entryCount;
+                    DiffuseRadianceCacheEntry entry = diffuseRadianceCacheEntries[index];
+                    if (entry.payload.y == readyState && all(equal(entry.key, key))) {
+                        atomicMax(diffuseRadianceCacheEntries[index].payload.z, pc.frameIndex);
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            bool hasSpecularTransport(ivec4 key, uint family, uint detail) {
+                uint entryCount = specularTransportCacheHeader.x;
+                uint probeCount = min(specularTransportCacheHeader.z, 8u);
+                if (entryCount == 0u || probeCount == 0u) return false;
+                uint readyState = 0x80000000u | (specularTransportCacheHeader.y & 0x3fffffffu);
+                uint slot = specularTransportHash(key, family, detail) % entryCount;
+                for (uint probe = 0u; probe < 8u; probe++) {
+                    if (probe >= probeCount) break;
+                    uint index = (slot + probe) % entryCount;
+                    SpecularTransportCacheEntry entry = specularTransportCacheEntries[index];
+                    if (entry.metadata.w == readyState
+                            && entry.metadata.x == family
+                            && entry.metadata.y == detail
+                            && all(equal(entry.key, key))) {
+                        atomicMax(specularTransportCacheEntries[index].metadata.z, pc.frameIndex);
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            vec3 decodeHistoryNormal(vec2 encoded) {
+                vec2 oct = encoded * 2.0 - 1.0;
+                vec3 normal = vec3(oct, 1.0 - abs(oct.x) - abs(oct.y));
+                if (normal.z < 0.0) {
+                    normal.xy = (vec2(1.0) - abs(normal.yx)) * signNotZero(normal.xy);
+                }
+                return normalize(normal);
+            }
+
+            bool validSpecularScreenHistory(
+                ivec2 previousPixel,
+                vec3 normal,
+                float linearDepth,
+                uint keySignature
+            ) {
+                if (pc.allowScreenHistory == 0u
+                        || any(lessThan(previousPixel, ivec2(0)))
+                        || any(greaterThanEqual(previousPixel, imageSize(previousSpecularHistory)))) {
+                    return false;
+                }
+                vec4 history = imageLoad(previousSpecularHistory, previousPixel);
+                vec4 surface = imageLoad(previousSpecularSurfaceHistory, previousPixel);
+                if (!finiteVec4(history) || !finiteVec4(surface)
+                        || surface.z <= 0.0
+                        || history.a <= 0.0
+                        || history.a > 10000.0
+                        || uint(round(surface.w)) != (keySignature & 0x000007ffu)) {
+                    return false;
+                }
+                float depthTolerance = max(0.25, linearDepth * 0.025);
+                return abs(surface.z - linearDepth) <= depthTolerance
+                    && dot(decodeHistoryNormal(surface.xy), normal) >= 0.96;
+            }
+
             ivec3 cacheCell(vec3 absWorldPos) {
-                return ivec3(floor(absWorldPos * 0.5));
+                return ivec3(floor(absWorldPos));
             }
 
             void emitRequest(
@@ -524,7 +765,8 @@ final class CacheFeedbackPass {
                 float visibility,
                 float error,
                 float luma,
-                float distanceSquared
+                float distanceSquared,
+                vec3 samplePosition
             ) {
                 uint slot = atomicAdd(feedback.feedbackCount, 1u);
                 if (slot >= feedback.feedbackCapacity) {
@@ -546,6 +788,10 @@ final class CacheFeedbackPass {
                 feedback.records[slot].error = clamp(error, 0.0, 1.0);
                 feedback.records[slot].luma = max(luma, 0.0);
                 feedback.records[slot].distanceSquared = max(distanceSquared, 0.0);
+                feedback.records[slot].sampleX = samplePosition.x;
+                feedback.records[slot].sampleY = samplePosition.y;
+                feedback.records[slot].sampleZ = samplePosition.z;
+                feedback.records[slot].samplePadding = 0.0;
             }
 
             void main() {
@@ -560,16 +806,42 @@ final class CacheFeedbackPass {
                     return;
                 }
 
-                ivec2 gbufferMax = textureSize(gbufferWorldPos, 0) - 1;
-                pixel = clamp(pixel, ivec2(0), gbufferMax);
-                vec4 gPos = texelFetch(gbufferWorldPos, pixel, 0);
-                vec4 gNormalRaw = texelFetch(gbufferNormal, clamp(pixel, ivec2(0), textureSize(gbufferNormal, 0) - 1), 0);
-                vec4 gAlbedoRaw = texelFetch(gbufferAlbedo, clamp(pixel, ivec2(0), textureSize(gbufferAlbedo, 0) - 1), 0);
-                vec4 gMaterialRaw = texelFetch(gbufferMaterial, clamp(pixel, ivec2(0), textureSize(gbufferMaterial, 0) - 1), 0);
-                vec4 gExtraRaw = texelFetch(gbufferExtra, clamp(pixel, ivec2(0), textureSize(gbufferExtra, 0) - 1), 0);
-                if (!validHybridSample(gPos, gNormalRaw, gAlbedoRaw, gMaterialRaw, gExtraRaw)) {
+                // Feedback dispatch follows the RTX render resolution, but the
+                // Iris attachments remain output-sized. Preserve screen-space
+                // correspondence when those resolutions differ.
+                vec2 gbufferUv = (vec2(pixel) + vec2(0.5)) / vec2(renderSize);
+                ivec2 gPosPixel = clamp(ivec2(gbufferUv * vec2(textureSize(gbufferWorldPos, 0))),
+                    ivec2(0), textureSize(gbufferWorldPos, 0) - 1);
+                vec4 gPos = texelFetch(gbufferWorldPos, gPosPixel, 0);
+                vec4 gNormalRaw = texelFetch(gbufferNormal,
+                    clamp(ivec2(gbufferUv * vec2(textureSize(gbufferNormal, 0))), ivec2(0), textureSize(gbufferNormal, 0) - 1), 0);
+                vec4 gAlbedoRaw = texelFetch(gbufferAlbedo,
+                    clamp(ivec2(gbufferUv * vec2(textureSize(gbufferAlbedo, 0))), ivec2(0), textureSize(gbufferAlbedo, 0) - 1), 0);
+                vec4 gMaterialRaw = texelFetch(gbufferMaterial,
+                    clamp(ivec2(gbufferUv * vec2(textureSize(gbufferMaterial, 0))), ivec2(0), textureSize(gbufferMaterial, 0) - 1), 0);
+                vec4 gExtraRaw = texelFetch(gbufferExtra,
+                    clamp(ivec2(gbufferUv * vec2(textureSize(gbufferExtra, 0))), ivec2(0), textureSize(gbufferExtra, 0) - 1), 0);
+                atomicAdd(feedback.sampledCount, 1u);
+                bool finite = finiteVec4(gPos) && finiteVec4(gNormalRaw) && finiteVec4(gAlbedoRaw)
+                    && finiteVec4(gMaterialRaw) && finiteVec4(gExtraRaw);
+                float normalLen2 = dot(gNormalRaw.xyz, gNormalRaw.xyz);
+                bool hasPosition = finite && (gPos.w > 0.0 || dot(gPos.xyz, gPos.xyz) > 0.000001);
+                bool hasNormal = finite && normalLen2 > 0.25 && normalLen2 < 4.0;
+                bool hasMaterial = finite && gMaterialRaw.a >= 0.0 && gMaterialRaw.a <= 1.5;
+                if (finite) atomicAdd(feedback.finiteCount, 1u);
+                if (hasPosition) atomicAdd(feedback.positionCount, 1u);
+                if (hasNormal) atomicAdd(feedback.normalCount, 1u);
+                if (hasMaterial) atomicAdd(feedback.materialCount, 1u);
+                if (finite && any(greaterThan(abs(gAlbedoRaw), vec4(0.000001)))) {
+                    atomicAdd(feedback.albedoNonzeroCount, 1u);
+                }
+                if (finite && any(greaterThan(abs(gExtraRaw), vec4(0.000001)))) {
+                    atomicAdd(feedback.extraNonzeroCount, 1u);
+                }
+                if (!finite || !hasPosition || !hasNormal || !hasMaterial) {
                     return;
                 }
+                atomicAdd(feedback.validCount, 1u);
 
                 vec3 normal = normalize(gNormalRaw.xyz);
                 vec3 albedo = max(gAlbedoRaw.rgb, vec3(0.0));
@@ -587,65 +859,136 @@ final class CacheFeedbackPass {
 
                 vec3 origin = cam.viewInverse[3].xyz;
                 vec3 absWorldPos = gPos.xyz + origin;
+                vec4 previousClip = cam.prevViewProj * vec4(absWorldPos, 1.0);
+                ivec2 previousPixel = ivec2(-1);
+                if (previousClip.w > 1e-5 && !any(isnan(previousClip)) && !any(isinf(previousClip))) {
+                    vec2 previousNdc = previousClip.xy / previousClip.w;
+                    if (all(lessThanEqual(abs(previousNdc), vec2(1.0)))) {
+                        previousPixel = ivec2((previousNdc * 0.5 + 0.5) * vec2(renderSize));
+                    }
+                }
+                vec3 cameraForward = -normalize(cam.viewInverse[2].xyz);
+                float linearDepth = max(dot(gPos.xyz, cameraForward), 0.0);
                 ivec3 cell = cacheCell(absWorldPos);
-                int normalBucketValue = axisBucket(normal);
+                ivec3 transportCell = ivec3(floor(absWorldPos));
+                int diffuseNormalBucket = axisBucket(normal);
+                int transportNormalBucket = directionBucket(normal);
                 int roughnessBucket = int(round(roughness * 15.0));
-                int materialBucketValue = materialBucket(metallic, roughness, blockId);
+                int materialBucketValue = materialBucket(metallic, roughness, blockId, gAlbedoRaw.a);
+                ivec4 transportKey = ivec4(
+                    transportCell,
+                    transportNormalBucket | (roughnessBucket << 8) | (materialBucketValue << 16));
                 int visiblePriority = luma > 0.45 || blocklight > 0.65 ? 1 : 0;
-
-                emitRequest(
-                    FAMILY_DIFFUSE_RADIANCE,
-                    SOURCE_VISIBLE_GBUFFER,
-                    cell,
-                    normalBucketValue,
-                    DIFFUSE_INCIDENT_RADIANCE_BUCKET,
-                    roughnessBucket,
-                    0,
-                    visiblePriority,
-                    1.0,
-                    0.50 + 0.20 * blocklight,
-                    luma,
-                    distanceSquared);
+                ivec4 diffuseKey = ivec4(cell, diffuseNormalBucket);
+                bool diffuseCacheHit = hasDiffuseRadiance(diffuseKey);
+                atomicAdd(feedback.cacheQueryCount, 1u);
+                bool fallbackPixel = !diffuseCacheHit;
+                if (diffuseCacheHit) {
+                    atomicAdd(feedback.cacheHitCount, 1u);
+                } else {
+                    emitRequest(
+                        FAMILY_DIFFUSE_RADIANCE,
+                        SOURCE_VISIBLE_GBUFFER,
+                        cell,
+                        diffuseNormalBucket,
+                        DIFFUSE_INCIDENT_RADIANCE_BUCKET,
+                        roughnessBucket,
+                        0,
+                        visiblePriority,
+                        1.0,
+                        0.50 + 0.20 * blocklight,
+                        luma,
+                        distanceSquared,
+                        absWorldPos);
+                }
 
                 vec3 viewDir = normalize(origin - absWorldPos);
                 float viewNoV = clamp(dot(normal, viewDir), 0.0, 1.0);
                 float fresnel = pow(1.0 - viewNoV, 5.0);
                 float f0Luma = dot(f0, vec3(0.2126, 0.7152, 0.0722));
                 float surfaceFresnelLuma = mix(f0Luma, 1.0, fresnel);
-                bool reflectiveSurface = !isRefractiveBlock(blockId)
-                    && roughness < mix(0.82, 0.88, metallic)
+                bool thinTransparentSurface = gAlbedoRaw.a < 0.98
+                    && !isBlockId(blockId, 1007.0)
+                    && !isRefractiveBlock(blockId);
+                bool refractiveSurface = isRefractiveBlock(blockId) || thinTransparentSurface;
+                bool reflectiveSurface = !refractiveSurface
+                    && roughness < mix(0.62, 0.88, metallic)
                     && (metallic > 0.5 || surfaceFresnelLuma > 0.025);
                 if (reflectiveSurface) {
                     vec3 reflectionDir = reflect(-viewDir, normal);
-                    emitRequest(
-                        FAMILY_REFLECTION,
-                        SOURCE_REFLECTION_SURFACE,
-                        cell,
-                        normalBucketValue,
-                        materialBucketValue,
-                        roughnessBucket,
-                        axisBucket(reflectionDir),
-                        roughness < 0.35 || metallic > 0.5 ? 2 : 1,
-                        clamp(surfaceFresnelLuma * 8.0 + metallic * 0.35, 0.0, 1.0),
-                        clamp(0.25 + (1.0 - roughness) * 0.70, 0.0, 1.0),
-                        max(luma, f0Luma * 4.0),
-                        distanceSquared);
+                    int transportDirection = directionBucket(reflectionDir);
+                    uint transportSignature = specularTransportHash(
+                        transportKey, 0u, uint(transportDirection));
+                    bool historyHit = validSpecularScreenHistory(
+                        previousPixel, normal, linearDepth, transportSignature);
+                    bool transportHit = historyHit
+                        || hasSpecularTransport(transportKey, 0u, uint(transportDirection));
+                    atomicAdd(feedback.cacheQueryCount, 1u);
+                    if (transportHit) {
+                        atomicAdd(feedback.cacheHitCount, 1u);
+                    } else {
+                        fallbackPixel = true;
+                        emitRequest(
+                            FAMILY_REFLECTION,
+                            SOURCE_REFLECTION_SURFACE,
+                            transportCell,
+                            transportNormalBucket,
+                            materialBucketValue,
+                            roughnessBucket,
+                            transportDirection,
+                            roughness < 0.35 || metallic > 0.5 ? 2 : 1,
+                            clamp(surfaceFresnelLuma * 8.0 + metallic * 0.35, 0.0, 1.0),
+                            clamp(0.25 + (1.0 - roughness) * 0.70, 0.0, 1.0),
+                            max(luma, f0Luma * 4.0),
+                            distanceSquared,
+                            absWorldPos);
+                    }
                 }
 
-                if (isRefractiveBlock(blockId)) {
-                    emitRequest(
-                        FAMILY_REFRACTION,
-                        SOURCE_REFRACTION_SURFACE,
-                        cell,
-                        normalBucketValue,
-                        materialBucketValue,
-                        roughnessBucket,
-                        mediumBucket(blockId),
-                        2,
-                        1.0,
-                        0.85,
-                        max(luma, 0.35),
-                        distanceSquared);
+                if (refractiveSurface) {
+                    vec3 incident = -viewDir;
+                    vec3 reflectionDir = normalize(reflect(incident, normal));
+                    float ior = isBlockId(blockId, BLOCK_ID_WATER)
+                        ? 1.333
+                        : (isBlockId(blockId, BLOCK_ID_ICE)
+                            ? 1.31
+                            : (isBlockId(blockId, BLOCK_ID_CRYSTAL) ? 2.20 : 1.50));
+                    vec3 refractionDir = refract(incident, normal, 1.0 / ior);
+                    if (dot(refractionDir, refractionDir) <= 1e-6) {
+                        refractionDir = reflectionDir;
+                    }
+                    int transportDirections = mediumBucket(blockId)
+                        | (directionBucket(reflectionDir) << 8)
+                        | (directionBucket(normalize(refractionDir)) << 16);
+                    uint transportSignature = specularTransportHash(
+                        transportKey, 1u, uint(transportDirections));
+                    bool historyHit = validSpecularScreenHistory(
+                        previousPixel, normal, linearDepth, transportSignature);
+                    bool transportHit = historyHit
+                        || hasSpecularTransport(transportKey, 1u, uint(transportDirections));
+                    atomicAdd(feedback.cacheQueryCount, 1u);
+                    if (transportHit) {
+                        atomicAdd(feedback.cacheHitCount, 1u);
+                    } else {
+                        fallbackPixel = true;
+                        emitRequest(
+                            FAMILY_REFRACTION,
+                            SOURCE_REFRACTION_SURFACE,
+                            transportCell,
+                            transportNormalBucket,
+                            materialBucketValue,
+                            roughnessBucket,
+                            transportDirections,
+                            2,
+                            1.0,
+                            0.85,
+                            max(luma, 0.35),
+                            distanceSquared,
+                            absWorldPos);
+                    }
+                }
+                if (fallbackPixel) {
+                    atomicAdd(feedback.fallbackPixelCount, 1u);
                 }
             }
             """;

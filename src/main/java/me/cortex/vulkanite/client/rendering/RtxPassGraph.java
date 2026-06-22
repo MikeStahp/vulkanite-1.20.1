@@ -62,6 +62,8 @@ final class RtxPassGraph {
                     frame.enableReSTIR(),
                     frame.debugMode(),
                     frame.debugCellIndex(),
+                    frame.cacheExecutionMode(),
+                    frame.storageViews(),
                     frame.currentReservoir(),
                     frame.previousReservoir(),
                     frame.diffuseAlbedoMetallic(),
@@ -78,9 +80,11 @@ final class RtxPassGraph {
                     frame.sectionLightProbeFillRequestBuffer(),
                     frame.diffuseRadianceCacheBuffer(),
                     frame.diffuseRadianceFillRequestBuffer(),
+                    frame.specularTransportCacheBuffer(),
+                    frame.specularTransportFillRequestBuffer(),
                     frame.noisyOutput(),
-                    frame.renderWidth(),
-                    frame.renderHeight());
+                    frame.rayDispatchWidth(),
+                    frame.rayDispatchHeight());
         }
     }
 
@@ -112,8 +116,14 @@ final class RtxPassGraph {
             int enableReSTIR,
             int debugMode,
             int debugCellIndex,
+            int cacheExecutionMode,
+            RtxFrameImages.StorageViews storageViews,
             VRef<VImage> currentReservoir,
             VRef<VImage> previousReservoir,
+            VRef<VImage> currentSpecularHistory,
+            VRef<VImage> previousSpecularHistory,
+            VRef<VImage> currentSpecularSurfaceHistory,
+            VRef<VImage> previousSpecularSurfaceHistory,
             VRef<VImage> diffuseAlbedoMetallic,
             VRef<VImage> specularAlbedo,
             VRef<VImage> normalRoughness,
@@ -128,8 +138,12 @@ final class RtxPassGraph {
             VRef<VBuffer> sectionLightProbeFillRequestBuffer,
             VRef<VBuffer> diffuseRadianceCacheBuffer,
             VRef<VBuffer> diffuseRadianceFillRequestBuffer,
+            VRef<VBuffer> specularTransportCacheBuffer,
+            VRef<VBuffer> specularTransportFillRequestBuffer,
             VRef<VImage> noisyOutput,
             int renderWidth,
-            int renderHeight) {
+            int renderHeight,
+            int rayDispatchWidth,
+            int rayDispatchHeight) {
     }
 }

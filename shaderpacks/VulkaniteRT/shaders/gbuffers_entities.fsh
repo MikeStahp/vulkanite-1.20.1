@@ -10,6 +10,17 @@ in vec3 normal;
 in vec3 worldPos;
 in vec2 lightmapCoord;
 
+// Keep this program's render-target contract explicit as well. Iris collects
+// these directives from shader source when it creates the shared targets.
+const int RGBA16F = 34842; // GL_RGBA16F
+const int RGBA32F = 34836; // GL_RGBA32F
+const int colortex1Format = RGBA16F;
+const int colortex2Format = RGBA16F;
+const int colortex3Format = RGBA16F;
+const int colortex4Format = RGBA32F;
+const int colortex5Format = RGBA16F;
+
+/* RENDERTARGETS: 1,2,3,4,5 */
 layout(location = 0) out vec4 colortex1;
 layout(location = 1) out vec4 colortex2;
 layout(location = 2) out vec4 colortex3;

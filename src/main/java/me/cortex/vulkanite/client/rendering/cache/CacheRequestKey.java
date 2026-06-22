@@ -79,12 +79,14 @@ public record CacheRequestKey(
             int normalBucket,
             int roughnessBucket,
             int mediumBucket,
-            int materialBucket) {
+            int materialBucket,
+            int reflectionDirectionBucket,
+            int refractionDirectionBucket) {
         return new CacheRequestKey(
                 CacheRequestFamily.REFRACTION,
                 packGridCell(cellX, cellY, cellZ),
                 packVariant(normalBucket, roughnessBucket, materialBucket),
-                mediumBucket);
+                packVariant(mediumBucket, reflectionDirectionBucket, refractionDirectionBucket));
     }
 
     public static long packGridCell(int cellX, int cellY, int cellZ) {
@@ -103,7 +105,11 @@ public record CacheRequestKey(
         if (family == CacheRequestFamily.SECTION_PROBE_CELL) {
             return spatialKey;
         }
-        return ChunkSectionPos.from(gridCellX() >> 3, gridCellY() >> 3, gridCellZ() >> 3).asLong();
+        int sectionShift = 4;
+        return ChunkSectionPos.from(
+                gridCellX() >> sectionShift,
+                gridCellY() >> sectionShift,
+                gridCellZ() >> sectionShift).asLong();
     }
 
     public int gridCellX() {

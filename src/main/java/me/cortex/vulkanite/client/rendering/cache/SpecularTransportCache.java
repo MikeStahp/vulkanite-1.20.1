@@ -20,15 +20,19 @@ import static org.lwjgl.vulkan.VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 import static org.lwjgl.vulkan.VK10.VK_PIPELINE_STAGE_TRANSFER_BIT;
 
 /**
- * GPU-visible cache for coarse diffuse incident radiance entries.
+ * Bounded GPU cache for reflection and refraction continuation-ray results.
+ *
+ * <p>Entries use one-block world cells and store incident transport plus continuation hit distances. Surface
+ * Fresnel, tint, and absorption remain resolve-time operations so neighboring
+ * materials cannot silently share a final shaded color.</p>
  */
-public final class DiffuseRadianceCache {
-    public static final int MAX_ENTRIES = 16_384;
+public final class SpecularTransportCache {
+    public static final int MAX_ENTRIES = 32_768;
     public static final int MAX_FILL_REQUESTS = 256;
 
     private static final int HEADER_BYTES = 16;
-    private static final int ENTRY_BYTES = 32;
-    private static final int FILL_REQUEST_RECORD_BYTES = 32;
+    private static final int ENTRY_BYTES = 48;
+    private static final int FILL_REQUEST_RECORD_BYTES = 48;
     private static final int CACHE_BUFFER_BYTES = HEADER_BYTES + MAX_ENTRIES * ENTRY_BYTES;
     private static final int FILL_REQUEST_BUFFER_BYTES =
             HEADER_BYTES + MAX_FILL_REQUESTS * FILL_REQUEST_RECORD_BYTES;
@@ -41,11 +45,11 @@ public final class DiffuseRadianceCache {
     private ByteBuffer fillRequestScratch;
     private int uploadedGeneration;
 
-    public DiffuseRadianceCache() {
+    public SpecularTransportCache() {
         this(CacheInvalidationTracker.global());
     }
 
-    public DiffuseRadianceCache(CacheInvalidationTracker invalidationTracker) {
+    SpecularTransportCache(CacheInvalidationTracker invalidationTracker) {
         this.invalidationTracker = invalidationTracker;
     }
 
@@ -54,7 +58,7 @@ public final class DiffuseRadianceCache {
 
         int generation = currentGeneration();
         if (generation != uploadedGeneration) {
-            ByteBuffer data = cacheClearScratch(CACHE_BUFFER_BYTES);
+            ByteBuffer data = scratchCache(CACHE_BUFFER_BYTES);
             data.putInt(MAX_ENTRIES);
             data.putInt(generation);
             data.putInt(HASH_PROBE_LIMIT);
@@ -84,7 +88,7 @@ public final class DiffuseRadianceCache {
         ensureFillRequestCapacity(ctx);
 
         int generation = currentGeneration();
-        ByteBuffer data = fillRequestScratch(FILL_REQUEST_BUFFER_BYTES);
+        ByteBuffer data = scratchFillRequests(FILL_REQUEST_BUFFER_BYTES);
         data.putInt(0);
         data.putInt(generation);
         data.putInt(MAX_FILL_REQUESTS);
@@ -93,16 +97,23 @@ public final class DiffuseRadianceCache {
         int requestCount = 0;
         if (batch != null) {
             for (CacheRequest request : batch.requests()) {
+                CacheRequestFamily family = request.key().family();
                 if (requestCount >= MAX_FILL_REQUESTS
-                        || request.key().family() != CacheRequestFamily.DIFFUSE_RADIANCE
+                        || (family != CacheRequestFamily.REFLECTION
+                                && family != CacheRequestFamily.REFRACTION)
                         || !invalidationTracker.isCurrent(request.key(), request.versionStamp())) {
                     continue;
                 }
+
                 CacheRequestKey key = request.key();
                 data.putInt(key.gridCellX());
                 data.putInt(key.gridCellY());
                 data.putInt(key.gridCellZ());
-                data.putInt(key.variantKey() & 0xFF);
+                data.putInt(key.variantKey());
+                data.putInt(family == CacheRequestFamily.REFLECTION ? 0 : 1);
+                data.putInt(key.detailKey());
+                data.putInt(0);
+                data.putInt(0);
                 data.putFloat(request.sampleX());
                 data.putFloat(request.sampleY());
                 data.putFloat(request.sampleZ());
@@ -153,7 +164,7 @@ public final class DiffuseRadianceCache {
                 CACHE_BUFFER_BYTES,
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        cacheBuffer.get().setDebugUtilsObjectName("Diffuse radiance cache");
+        cacheBuffer.get().setDebugUtilsObjectName("Specular transport cache");
         uploadedGeneration = 0;
     }
 
@@ -165,7 +176,7 @@ public final class DiffuseRadianceCache {
                 FILL_REQUEST_BUFFER_BYTES,
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        fillRequestBuffer.get().setDebugUtilsObjectName("Diffuse radiance fill requests");
+        fillRequestBuffer.get().setDebugUtilsObjectName("Specular transport fill requests");
     }
 
     private int currentGeneration() {
@@ -175,7 +186,8 @@ public final class DiffuseRadianceCache {
         hash = mix(hash, invalidationTracker.skyGeneration());
         hash = mix(hash, invalidationTracker.materialGeneration());
         hash = mix(hash, invalidationTracker.cacheLayoutGeneration());
-        hash = mix(hash, invalidationTracker.familyGeneration(CacheRequestFamily.DIFFUSE_RADIANCE));
+        hash = mix(hash, invalidationTracker.familyGeneration(CacheRequestFamily.REFLECTION));
+        hash = mix(hash, invalidationTracker.familyGeneration(CacheRequestFamily.REFRACTION));
         hash = mix(hash, invalidationTracker.sceneGeometryGeneration());
         hash = mix(hash, invalidationTracker.sceneLightGeneration());
         int generation = (int) (hash ^ (hash >>> 32));
@@ -187,12 +199,12 @@ public final class DiffuseRadianceCache {
         return hash;
     }
 
-    private ByteBuffer cacheClearScratch(int requiredBytes) {
+    private ByteBuffer scratchCache(int requiredBytes) {
         cacheClearScratch = scratch(cacheClearScratch, requiredBytes);
         return cacheClearScratch;
     }
 
-    private ByteBuffer fillRequestScratch(int requiredBytes) {
+    private ByteBuffer scratchFillRequests(int requiredBytes) {
         fillRequestScratch = scratch(fillRequestScratch, requiredBytes);
         return fillRequestScratch;
     }

@@ -98,6 +98,8 @@ public final class RenderPassExecutor {
             int enableReSTIR, // New parameter for ReSTIR toggle (0/1)
             int debugMode, // New parameter for Debug Mode (0=NONE, 1=DLSS, 2=BUFFERS)
             int debugCellIndex, // For DLSS debug mode: which cell to display (0-5), -1 for grid view
+            int cacheExecutionMode,
+            RtxFrameImages.StorageViews storageViews,
             VRef<VImage> currentReservoirImage,
             VRef<VImage> prevReservoirImage,
             VRef<VImage> diffuseAlbedoMetallicImage,
@@ -114,9 +116,11 @@ public final class RenderPassExecutor {
             VRef<VBuffer> sectionLightProbeFillRequestBuffer,
             VRef<VBuffer> diffuseRadianceCacheBuffer,
             VRef<VBuffer> diffuseRadianceFillRequestBuffer,
+            VRef<VBuffer> specularTransportCacheBuffer,
+            VRef<VBuffer> specularTransportFillRequestBuffer,
             VRef<VImage> scaledOutputImage, // DLSS: Scaled output image for binding 12 (or null to use Iris target)
-            int renderWidth, // DLSS: Scaled render width (or full resolution if DLSS inactive)
-            int renderHeight) { // DLSS: Scaled render height (or full resolution if DLSS inactive)
+            int rayDispatchWidth,
+            int rayDispatchHeight) {
 
         // Early empty check to avoid unnecessary encoding work
         if (outImgs.isEmpty()) {
@@ -220,8 +224,8 @@ public final class RenderPassExecutor {
                             if (currentReservoirImage != null) {
                                 LOGGER.trace(
                                         "Binding 6: Binding ReSTIR reservoir image (VulkaniteRT/Dirt-RT-Optimized path)");
-                                var reservoirView = VImageView.create(ctx, currentReservoirImage);
-                                resourcesToClose.add(reservoirView);
+                                var reservoirView = resolveStorageView(
+                                        storageViews.currentReservoir(), currentReservoirImage, resourcesToClose);
                                 updater.imageStore(6, reservoirView);
                             } else {
                                 LOGGER.warn("Binding 6: Reservoir image is null!");
@@ -264,8 +268,8 @@ public final class RenderPassExecutor {
                     // This ensures ray tracing writes to a scaled buffer that DLSSD can then upscale
                     if (scaledOutputImage != null) {
                         // Use the scaled output image for DLSS
-                        var scaledView = VImageView.create(ctx, scaledOutputImage);
-                        resourcesToClose.add(scaledView);
+                        var scaledView = resolveStorageView(
+                                storageViews.radiance(), scaledOutputImage, resourcesToClose);
                         scaledViewListCache.clear();
                         scaledViewListCache.add(scaledView);
                         updater.imageStore(12, 0, scaledViewListCache); // Scaled output for DLSS
@@ -287,8 +291,8 @@ public final class RenderPassExecutor {
                 var binding13 = setReflection.getBindingAt(13);
                 if (binding13 != null) {
                     if (motionVectorImage != null) {
-                        var mvView = VImageView.create(ctx, motionVectorImage);
-                        resourcesToClose.add(mvView);
+                        var mvView = resolveStorageView(
+                                storageViews.motionVector(), motionVectorImage, resourcesToClose);
                         updater.imageStore(13, mvView);
                     } else if (outImgViewListCache.size() > 0) {
                         // Fallback: use first output image as dummy target if MV image is null
@@ -302,8 +306,8 @@ public final class RenderPassExecutor {
                 var binding14 = setReflection.getBindingAt(14);
                 if (binding14 != null) {
                     if (linearDepthImage != null) {
-                        var depthView = VImageView.create(ctx, linearDepthImage);
-                        resourcesToClose.add(depthView);
+                        var depthView = resolveStorageView(
+                                storageViews.linearDepth(), linearDepthImage, resourcesToClose);
                         updater.imageStore(14, depthView);
                     } else if (outImgViewListCache.size() > 0) {
                         // Fallback: use first output image as dummy target if depth image is null
@@ -317,8 +321,8 @@ public final class RenderPassExecutor {
                 var binding15 = setReflection.getBindingAt(15);
                 if (binding15 != null) {
                     if (prevReservoirImage != null) {
-                        var prevResView = VImageView.create(ctx, prevReservoirImage);
-                        resourcesToClose.add(prevResView);
+                        var prevResView = resolveStorageView(
+                                storageViews.previousReservoir(), prevReservoirImage, resourcesToClose);
                         updater.imageStore(15, prevResView);
                     } else if (outImgViewListCache.size() > 0) {
                         // Fallback: use first output image as dummy target if prev reservoir is null
@@ -327,17 +331,17 @@ public final class RenderPassExecutor {
                 }
 
                 bindOptionalStorageImage(updater, setReflection, resourcesToClose, outImgViewListCache,
-                        16, diffuseAlbedoMetallicImage, "DiffuseAlbedoMetallic");
+                        16, storageViews.diffuseAlbedoMetallic(), diffuseAlbedoMetallicImage, "DiffuseAlbedoMetallic");
                 bindOptionalStorageImage(updater, setReflection, resourcesToClose, outImgViewListCache,
-                        17, specularAlbedoImage, "SpecularAlbedo");
+                        17, storageViews.specularAlbedo(), specularAlbedoImage, "SpecularAlbedo");
                 bindOptionalStorageImage(updater, setReflection, resourcesToClose, outImgViewListCache,
-                        18, normalRoughnessImage, "NormalRoughness");
+                        18, storageViews.normalRoughness(), normalRoughnessImage, "NormalRoughness");
                 bindOptionalStorageImage(updater, setReflection, resourcesToClose, outImgViewListCache,
-                        19, specularHitDepthImage, "SpecularHitDepth");
+                        19, storageViews.specularHitDepth(), specularHitDepthImage, "SpecularHitDepth");
                 bindOptionalStorageImage(updater, setReflection, resourcesToClose, outImgViewListCache,
-                        20, firstHitDepthImage, "FirstHitDepth");
+                        20, storageViews.firstHitDepth(), firstHitDepthImage, "FirstHitDepth");
                 bindOptionalStorageImage(updater, setReflection, resourcesToClose, outImgViewListCache,
-                        21, blocklightDetailImage, "BlocklightDetail");
+                        21, storageViews.blocklightDetail(), blocklightDetailImage, "BlocklightDetail");
                 bindOptionalStorageBuffer(updater, setReflection, 22, sectionLightBuffer, "SectionLights");
                 bindOptionalStorageBuffer(updater, setReflection, 23, sectionLightProbeBuffer, "SectionLightProbes");
                 bindOptionalStorageBuffer(updater, setReflection, 24, sectionLightProbeFeedbackBuffer,
@@ -348,6 +352,10 @@ public final class RenderPassExecutor {
                         "DiffuseRadianceCache");
                 bindOptionalStorageBuffer(updater, setReflection, 27, diffuseRadianceFillRequestBuffer,
                         "DiffuseRadianceFillRequests");
+                bindOptionalStorageBuffer(updater, setReflection, 28, specularTransportCacheBuffer,
+                        "SpecularTransportCache");
+                bindOptionalStorageBuffer(updater, setReflection, 29, specularTransportFillRequestBuffer,
+                        "SpecularTransportFillRequests");
 
                 updater.apply();
 
@@ -449,23 +457,23 @@ public final class RenderPassExecutor {
                 (((long) Float.floatToRawIntBits(sunColorB) & 0xFFFFFFFFL) << 32);
             // Pack enableReSTIR (int) and debugMode (int)
             pushConstants[4] = ((long) enableReSTIR & 0xFFFFFFFFL) | (((long) debugMode & 0xFFFFFFFFL) << 32);
-            pushConstants[5] = (long) debugCellIndex & 0xFFFFFFFFL;
+            pushConstants[5] = (long) debugCellIndex & 0xFFFFFFFFL
+                    | (((long) cacheExecutionMode & 0xFFFFFFFFL) << 32);
 
-            // DLSS FIX: Use render dimensions (scaled if DLSS active) for ray tracing dispatch
-            // This ensures ray tracing renders at lower resolution when DLSS downscaling is active
             cmd.pushConstants(0, pushConstants, VK_SHADER_STAGE_ALL);
-            cmd.traceRays(renderWidth, renderHeight, 1);
+            cmd.traceRays(rayDispatchWidth, rayDispatchHeight, 1);
 
             // Diagnostic logging (throttled to every 300 frames)
             if (frameIndex % 300 == 0) {
                 VImage boundOutput = scaledOutputImage != null ? scaledOutputImage.get() : outImgs.get(0).get();
-                if (renderWidth != boundOutput.width || renderHeight != boundOutput.height) {
+                if (rayDispatchWidth != boundOutput.width || rayDispatchHeight != boundOutput.height) {
                     LOGGER.warn(
                             "[JITTER FRAME DIAG] DIMENSION MISMATCH: traceRays {}x{} vs output {}x{} - may cause visible boundary!",
-                            renderWidth, renderHeight, boundOutput.width, boundOutput.height);
+                            rayDispatchWidth, rayDispatchHeight, boundOutput.width, boundOutput.height);
                 } else if (LOGGER.isTraceEnabled()) {
-                    LOGGER.trace("[DLSS-RT] traceRays: {}x{} (output image: {}x{})",
-                            renderWidth, renderHeight, boundOutput.width, boundOutput.height);
+                    LOGGER.trace("[DLSS-RT] traceRays: {}x{} (output image: {}x{}, cacheExecutionMode={})",
+                            rayDispatchWidth, rayDispatchHeight,
+                            boundOutput.width, boundOutput.height, cacheExecutionMode);
                 }
             }
 
@@ -495,15 +503,14 @@ public final class RenderPassExecutor {
             List<VRef<?>> resourcesToClose,
             List<VRef<VImageView>> fallbackViews,
             int binding,
+            VRef<VImageView> stableView,
             VRef<VImage> image,
             String debugName) {
         if (setReflection.getBindingAt(binding) == null) {
             return;
         }
-        if (image != null) {
-            var view = VImageView.create(ctx, image);
-            resourcesToClose.add(view);
-            updater.imageStore(binding, view);
+        if (stableView != null || image != null) {
+            updater.imageStore(binding, resolveStorageView(stableView, image, resourcesToClose));
             return;
         }
         if (!fallbackViews.isEmpty()) {
@@ -511,6 +518,18 @@ public final class RenderPassExecutor {
         } else {
             LOGGER.warn("Binding {}: {} image is null and no fallback output exists", binding, debugName);
         }
+    }
+
+    private VRef<VImageView> resolveStorageView(
+            VRef<VImageView> stableView,
+            VRef<VImage> image,
+            List<VRef<?>> resourcesToClose) {
+        if (stableView != null) {
+            return stableView;
+        }
+        VRef<VImageView> view = VImageView.create(ctx, image);
+        resourcesToClose.add(view);
+        return view;
     }
 
     private void bindOptionalStorageBuffer(

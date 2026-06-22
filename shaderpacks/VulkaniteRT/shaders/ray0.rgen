@@ -78,7 +78,7 @@ layout(push_constant) uniform PushConstants {
 	int enableReSTIR;
 	int debugMode;
 	int debugCellIndex; // For DLSS debug mode: which cell to display (0-5), -1 for grid view
-	int separateStableBlocklight;
+	int cacheOnHit;
 } pc;
 
 // Shader options (defaults from shaders.properties)
@@ -339,9 +339,36 @@ layout(binding = 26, std430) coherent buffer DiffuseRadianceCacheBuffer {
     DiffuseRadianceCacheEntry diffuseRadianceCacheEntries[];
 };
 
+struct DiffuseRadianceFillRequest {
+    ivec4 key;
+    vec4 rayOrigin;
+};
+
 layout(binding = 27, std430) readonly buffer DiffuseRadianceFillRequestBuffer {
     uvec4 diffuseRadianceFillRequestHeader; // x=request count, y=generation, z=capacity
-    ivec4 diffuseRadianceFillRequests[];
+    DiffuseRadianceFillRequest diffuseRadianceFillRequests[];
+};
+
+struct SpecularTransportCacheEntry {
+    ivec4 key; // xyz=one-block world cell, w=packed normal/roughness/material buckets
+    uvec4 metadata; // x=family (0 reflection, 1 refraction), y=direction/medium detail, w=state
+    uvec4 payload; // xy=reflected/refracted RGB9E5, zw=their continuation hit distances
+};
+
+layout(binding = 28, std430) coherent buffer SpecularTransportCacheBuffer {
+    uvec4 specularTransportCacheHeader; // x=entry count, y=generation, z=hash probes
+    SpecularTransportCacheEntry specularTransportCacheEntries[];
+};
+
+struct SpecularTransportFillRequest {
+    ivec4 key;
+    ivec4 metadata;
+    vec4 rayOrigin;
+};
+
+layout(binding = 29, std430) readonly buffer SpecularTransportFillRequestBuffer {
+    uvec4 specularTransportFillRequestHeader; // x=request count, y=generation, z=capacity
+    SpecularTransportFillRequest specularTransportFillRequests[];
 };
 
 #if ENABLE_DLSS_RR
@@ -510,6 +537,7 @@ vec4 integrateVolumetrics(
     float phase = volumetricPhase(dot(rayDirection, sunDirection));
     vec3 ambientScatter = mix(vec3(0.025, 0.035, 0.055), sunRadiance * 0.06,
         smoothstep(-0.1, 0.4, sunDirection.y));
+    bool hasSunContribution = dot(sunRadiance, vec3(0.2126, 0.7152, 0.0722)) > 0.0001;
     vec3 scattering = vec3(0.0);
 
     for (int i = 0; i < VOLUMETRIC_SAMPLES; i++) {
@@ -518,7 +546,9 @@ vec4 integrateVolumetrics(
         float sunVisibility = 1.0;
 
 #if VOLUMETRIC_SHADOWS == 1
-        sunVisibility = alphaAwareVisibility(samplePosition, sunDirection, 10000.0);
+        if (hasSunContribution) {
+            sunVisibility = alphaAwareVisibility(samplePosition, sunDirection, 10000.0);
+        }
 #endif
 
         vec3 incident = ambientScatter + sunRadiance * sunVisibility * phase;
@@ -772,6 +802,13 @@ vec3 evaluateSectionLightRecord(
     vec3 viewDir,
     float specularIntensity
 ) {
+    float emission = sectionLightNormalizedEmission(light);
+    vec3 lightColor = vec3(light.colorEmission.rgb) * (1.0 / 255.0);
+    if (emission <= 0.0
+            || dot(lightColor, vec3(0.2126, 0.7152, 0.0722)) <= 0.0001) {
+        return vec3(0.0);
+    }
+
     float radius = max(float(light.posRadiusFlags.w & 0xFFFF), 1.0);
     vec3 lightPos = vec3(light.posRadiusFlags.xyz) + vec3(0.5);
     vec3 toLight = lightPos - worldPos;
@@ -785,8 +822,6 @@ vec3 evaluateSectionLightRecord(
     vec3 lightDir = toLight / distance;
     float attenuation = sectionLightDistanceAttenuation(distance, maxDistance);
 
-    vec3 lightColor = vec3(light.colorEmission.rgb) * (1.0 / 255.0);
-    float emission = sectionLightNormalizedEmission(light);
     vec3 radiance = lightColor * emission * attenuation * BLOCKLIGHT_EMISSION_SCALE;
 
     vec3 diffuseTerm;
@@ -845,6 +880,13 @@ void considerSectionLightSparseCandidate(
     inout float candidateDistance[SECTION_LIGHT_SPARSE_RT_CANDIDATE_LIMIT],
     inout vec3 candidateRadiance[SECTION_LIGHT_SPARSE_RT_CANDIDATE_LIMIT]
 ) {
+    vec3 lightColor = vec3(light.colorEmission.rgb) * (1.0 / 255.0);
+    float emission = sectionLightNormalizedEmission(light);
+    float lightLuma = dot(lightColor, vec3(0.2126, 0.7152, 0.0722)) * emission;
+    if (lightLuma <= 0.0001) {
+        return;
+    }
+
     float radius = max(float(light.posRadiusFlags.w & 0xFFFF), 1.0);
     vec3 lightPos = vec3(light.posRadiusFlags.xyz) + vec3(0.5);
     vec3 toLight = lightPos - worldPos;
@@ -860,13 +902,6 @@ void considerSectionLightSparseCandidate(
         ? max(dot(normal, lightDir), 0.0)
         : 1.0;
     if (normalWeight <= 0.0001) {
-        return;
-    }
-
-    vec3 lightColor = vec3(light.colorEmission.rgb) * (1.0 / 255.0);
-    float emission = sectionLightNormalizedEmission(light);
-    float lightLuma = dot(lightColor, vec3(0.2126, 0.7152, 0.0722)) * emission;
-    if (lightLuma <= 0.0001) {
         return;
     }
 
@@ -1342,6 +1377,9 @@ void sampleSectionLightProbeRtCell(
     face5 = vec3(0.0);
 #if SECTION_LIGHT_TABLE_ENABLE != 0
     int totalLightCount = int(sectionLightHeader.x);
+    if (totalLightCount <= 0 || SECTION_LIGHT_PROBE_INTENSITY <= 0.0) {
+        return;
+    }
     int count = min(totalLightCount, SECTION_LIGHT_SAMPLE_LIMIT);
     uint candidateSeed = sectionLightCandidateSeed(worldPos, vec3(0.0));
     int sampleBudget = clamp(
@@ -3141,7 +3179,8 @@ vec3 traceSimpleRadiance(
     hitDistance = payload.hitData.w;
     vec3 hitNormal = normalize(payload.material.normal);
     float nDotL = max(dot(hitNormal, sunDirection), 0.0);
-    float visibility = nDotL > 0.0
+    float sunLuma = dot(sunRadiance, vec3(0.2126, 0.7152, 0.0722));
+    float visibility = nDotL > 0.0 && sunLuma > 0.0001
         ? alphaAwareVisibility(payload.hitData.xyz + hitNormal * 0.02, sunDirection, 10000.0)
         : 0.0;
     vec3 surfaceColor = mix(
@@ -3182,6 +3221,13 @@ vec3 diffuseRadianceNormal(int bucket) {
     return vec3(0.0, 0.0, -1.0);
 }
 
+int diffuseRadianceNormalBucket(vec3 normal) {
+    vec3 axis = abs(normal);
+    if (axis.x >= axis.y && axis.x >= axis.z) return normal.x >= 0.0 ? 0 : 1;
+    if (axis.y >= axis.z) return normal.y >= 0.0 ? 2 : 3;
+    return normal.z >= 0.0 ? 4 : 5;
+}
+
 int claimDiffuseRadianceCacheEntry(ivec4 key) {
     uint entryCount = diffuseRadianceCacheHeader.x;
     uint probeCount = min(diffuseRadianceCacheHeader.z, 8u);
@@ -3192,14 +3238,25 @@ int claimDiffuseRadianceCacheEntry(ivec4 key) {
     uint readyState = 0x80000000u | (diffuseRadianceCacheHeader.y & 0x3fffffffu);
     uint fillState = 0x40000000u | (diffuseRadianceCacheHeader.y & 0x3fffffffu);
     uint slot = diffuseRadianceCacheHash(key) % entryCount;
+    int coldReadyIndex = -1;
+    uint coldReadyAge = 0u;
     for (uint probe = 0u; probe < 8u; probe++) {
         if (probe >= probeCount) break;
         uint index = (slot + probe) % entryCount;
         uint state = atomicAdd(diffuseRadianceCacheEntries[index].payload.y, 0u);
         if (state == readyState && all(equal(diffuseRadianceCacheEntries[index].key, key))) {
+            atomicMax(diffuseRadianceCacheEntries[index].payload.z, pc.frameIndex);
             return -1;
         }
-        if (state == readyState || state == fillState) {
+        if (state == readyState) {
+            uint age = pc.frameIndex - diffuseRadianceCacheEntries[index].payload.z;
+            if (age >= 120u && (coldReadyIndex < 0 || age > coldReadyAge)) {
+                coldReadyIndex = int(index);
+                coldReadyAge = age;
+            }
+            continue;
+        }
+        if (state == fillState) {
             continue;
         }
         if (atomicCompSwap(diffuseRadianceCacheEntries[index].payload.y, state, fillState) == state) {
@@ -3210,7 +3267,39 @@ int claimDiffuseRadianceCacheEntry(ivec4 key) {
             return int(index);
         }
     }
+
+    // Visible cache-on-hit publication refreshes payload.z. Replace only a
+    // genuinely cold candidate so hot entries remain stable.
+    if (coldReadyIndex >= 0
+            && atomicCompSwap(
+                diffuseRadianceCacheEntries[coldReadyIndex].payload.y,
+                readyState,
+                fillState) == readyState) {
+        diffuseRadianceCacheEntries[coldReadyIndex].key = key;
+        diffuseRadianceCacheEntries[coldReadyIndex].payload.x = 0u;
+        diffuseRadianceCacheEntries[coldReadyIndex].payload.z = 0u;
+        diffuseRadianceCacheEntries[coldReadyIndex].payload.w = 0u;
+        return coldReadyIndex;
+    }
     return -1;
+}
+
+void publishDiffuseRadianceCache(ivec4 key, vec3 radiance, float hitDistance) {
+    if (any(isnan(radiance)) || any(isinf(radiance))) {
+        return;
+    }
+    int entryIndex = claimDiffuseRadianceCacheEntry(key);
+    if (entryIndex < 0) {
+        return;
+    }
+    diffuseRadianceCacheEntries[entryIndex].payload.x =
+        packSectionLightProbeRgb9E5(max(radiance, vec3(0.0)));
+    diffuseRadianceCacheEntries[entryIndex].payload.z = pc.frameIndex;
+    diffuseRadianceCacheEntries[entryIndex].payload.w =
+        floatBitsToUint(max(hitDistance, 0.0));
+    memoryBarrierBuffer();
+    uint readyState = 0x80000000u | (diffuseRadianceCacheHeader.y & 0x3fffffffu);
+    atomicExchange(diffuseRadianceCacheEntries[entryIndex].payload.y, readyState);
 }
 
 void populateRequestedDiffuseRadianceCache(vec3 sunDirection, vec3 sunRadiance) {
@@ -3221,7 +3310,8 @@ void populateRequestedDiffuseRadianceCache(vec3 sunDirection, vec3 sunRadiance) 
         return;
     }
 
-    ivec4 key = diffuseRadianceFillRequests[requestIndex];
+    DiffuseRadianceFillRequest request = diffuseRadianceFillRequests[requestIndex];
+    ivec4 key = request.key;
     if (key.w < 0 || key.w > 5) {
         return;
     }
@@ -3231,25 +3321,297 @@ void populateRequestedDiffuseRadianceCache(vec3 sunDirection, vec3 sunRadiance) 
     }
 
     vec3 normal = diffuseRadianceNormal(key.w);
-    vec3 cellCenter = (vec3(key.xyz) + vec3(0.5)) * 2.0;
-    vec3 rayOrigin = cellCenter + normal * 0.94;
-    uint seed = diffuseRadianceCacheHash(key) ^ 0xa511e9b3u;
-    vec3 rayDirection = cosineWeightedHemisphere(normal, seed);
-    float hitDistance;
-    vec3 radiance = traceSimpleRadiance(
-        rayOrigin,
-        rayDirection,
-        sunDirection,
-        sunRadiance,
-        0.0,
-        hitDistance);
+    vec3 rayOrigin = request.rayOrigin.xyz + normal * 0.02;
+    vec3 radiance = vec3(0.0);
+    float hitDistance = 10000.0;
+    const uint raysPerFill = 8u;
+    for (uint sampleIndex = 0u; sampleIndex < raysPerFill; sampleIndex++) {
+        uint seed = diffuseRadianceCacheHash(key)
+            ^ diffuseRadianceHashMix((sampleIndex + 1u) * 0x9e3779b9u);
+        vec3 rayDirection = cosineWeightedHemisphere(normal, seed);
+        float sampleHitDistance;
+        radiance += traceSimpleRadiance(
+            rayOrigin,
+            rayDirection,
+            sunDirection,
+            sunRadiance,
+            0.0,
+            sampleHitDistance);
+        hitDistance = min(hitDistance, sampleHitDistance);
+    }
+    radiance /= float(raysPerFill);
 
     diffuseRadianceCacheEntries[entryIndex].payload.x = packSectionLightProbeRgb9E5(radiance);
-    diffuseRadianceCacheEntries[entryIndex].payload.z = 1u;
+    diffuseRadianceCacheEntries[entryIndex].payload.z = pc.frameIndex;
     diffuseRadianceCacheEntries[entryIndex].payload.w = floatBitsToUint(hitDistance);
     memoryBarrierBuffer();
     uint readyState = 0x80000000u | (diffuseRadianceCacheHeader.y & 0x3fffffffu);
     atomicExchange(diffuseRadianceCacheEntries[entryIndex].payload.y, readyState);
+}
+
+uint specularTransportCacheHash(ivec4 key, uint family, uint detail) {
+    uint value = uint(key.x) * 0x9e3779b9u;
+    value ^= uint(key.y) * 0x85ebca6bu;
+    value ^= uint(key.z) * 0xc2b2ae35u;
+    value ^= uint(key.w) * 0x27d4eb2du;
+    value ^= family * 0x165667b1u;
+    value ^= detail * 0xd3a2646cu;
+    return diffuseRadianceHashMix(value);
+}
+
+vec2 specularTransportSignNotZero(vec2 value) {
+    return vec2(value.x >= 0.0 ? 1.0 : -1.0, value.y >= 0.0 ? 1.0 : -1.0);
+}
+
+vec3 specularTransportDirection(int bucket) {
+    ivec2 quantized = ivec2(bucket & 7, (bucket >> 3) & 7);
+    vec2 oct = vec2(quantized) / 7.0 * 2.0 - 1.0;
+    vec3 direction = vec3(oct, 1.0 - abs(oct.x) - abs(oct.y));
+    if (direction.z < 0.0) {
+        direction.xy = (vec2(1.0) - abs(direction.yx))
+            * specularTransportSignNotZero(direction.xy);
+    }
+    return normalize(direction);
+}
+
+int specularTransportDirectionBucket(vec3 direction) {
+    direction = normalize(direction);
+    vec2 oct = direction.xy / max(abs(direction.x) + abs(direction.y) + abs(direction.z), 1e-6);
+    if (direction.z < 0.0) {
+        oct = (vec2(1.0) - abs(oct.yx)) * specularTransportSignNotZero(oct);
+    }
+    ivec2 quantized = clamp(ivec2(round((oct * 0.5 + 0.5) * 7.0)), ivec2(0), ivec2(7));
+    return quantized.x | (quantized.y << 3);
+}
+
+int specularTransportNormalBucket(vec3 normal) {
+    return specularTransportDirectionBucket(normal);
+}
+
+int specularTransportMaterialBucket(float metallic, float roughness, float blockId, float surfaceAlpha) {
+    int bucket = int(round(clamp(roughness, 0.0, 1.0) * 31.0));
+    if (metallic > 0.5) bucket |= 32;
+    if (blockId > 0.0) bucket |= 64;
+    if (surfaceAlpha < 0.98 && !isFoliageMaterial(blockId)) bucket |= 128;
+    return clamp(bucket, 0, 255);
+}
+
+ivec4 specularTransportKey(
+    vec3 worldPosition,
+    vec3 normal,
+    float roughness,
+    float metallic,
+    float blockId,
+    float surfaceAlpha
+) {
+    int variant = specularTransportNormalBucket(normal)
+        | (int(round(clamp(roughness, 0.0, 1.0) * 15.0)) << 8)
+        | (specularTransportMaterialBucket(metallic, roughness, blockId, surfaceAlpha) << 16);
+    return ivec4(ivec3(floor(worldPosition)), variant);
+}
+
+int specularTransportMedium(float blockId) {
+    if (isWaterMaterial(blockId)) return 1;
+    if (isGlassMaterial(blockId)) return 2;
+    if (isIceMaterial(blockId)) return 3;
+    if (isCrystalMaterial(blockId)) return 4;
+    return 0;
+}
+
+float specularTransportMediumBlockId(int medium) {
+    if (medium == 1) return 1000.0;
+    if (medium == 2) return 1001.0;
+    if (medium == 3) return 1012.0;
+    if (medium == 4) return 1103.0;
+    return 0.0;
+}
+
+int claimSpecularTransportCacheEntry(ivec4 key, uint family, uint detail) {
+    uint entryCount = specularTransportCacheHeader.x;
+    uint probeCount = min(specularTransportCacheHeader.z, 8u);
+    if (entryCount == 0u || probeCount == 0u) {
+        return -1;
+    }
+
+    uint readyState = 0x80000000u | (specularTransportCacheHeader.y & 0x3fffffffu);
+    uint fillState = 0x40000000u | (specularTransportCacheHeader.y & 0x3fffffffu);
+    uint slot = specularTransportCacheHash(key, family, detail) % entryCount;
+    int coldReadyIndex = -1;
+    uint coldReadyAge = 0u;
+    for (uint probe = 0u; probe < 8u; probe++) {
+        if (probe >= probeCount) break;
+        uint index = (slot + probe) % entryCount;
+        uint state = atomicAdd(specularTransportCacheEntries[index].metadata.w, 0u);
+        if (state == readyState
+                && all(equal(specularTransportCacheEntries[index].key, key))
+                && specularTransportCacheEntries[index].metadata.x == family
+                && specularTransportCacheEntries[index].metadata.y == detail) {
+            atomicMax(specularTransportCacheEntries[index].metadata.z, pc.frameIndex);
+            return -1;
+        }
+        if (state == readyState) {
+            uint age = pc.frameIndex - specularTransportCacheEntries[index].metadata.z;
+            if (age >= 120u && (coldReadyIndex < 0 || age > coldReadyAge)) {
+                coldReadyIndex = int(index);
+                coldReadyAge = age;
+            }
+            continue;
+        }
+        if (state == fillState) {
+            continue;
+        }
+        if (atomicCompSwap(specularTransportCacheEntries[index].metadata.w, state, fillState) == state) {
+            specularTransportCacheEntries[index].key = key;
+            specularTransportCacheEntries[index].metadata.xyz = uvec3(family, detail, pc.frameIndex);
+            specularTransportCacheEntries[index].payload = uvec4(0u);
+            return int(index);
+        }
+    }
+    if (coldReadyIndex >= 0
+            && atomicCompSwap(
+                specularTransportCacheEntries[coldReadyIndex].metadata.w,
+                readyState,
+                fillState) == readyState) {
+        specularTransportCacheEntries[coldReadyIndex].key = key;
+        specularTransportCacheEntries[coldReadyIndex].metadata.xyz =
+            uvec3(family, detail, pc.frameIndex);
+        specularTransportCacheEntries[coldReadyIndex].payload = uvec4(0u);
+        return coldReadyIndex;
+    }
+    return -1;
+}
+
+void publishSpecularTransportCache(
+    ivec4 key,
+    uint family,
+    uint detail,
+    vec3 reflectedRadiance,
+    vec3 refractedRadiance,
+    float reflectionDistance,
+    float refractionDistance
+) {
+    if (any(isnan(reflectedRadiance)) || any(isinf(reflectedRadiance))
+            || any(isnan(refractedRadiance)) || any(isinf(refractedRadiance))) {
+        return;
+    }
+    int entryIndex = claimSpecularTransportCacheEntry(key, family, detail);
+    if (entryIndex < 0) {
+        return;
+    }
+    specularTransportCacheEntries[entryIndex].payload = uvec4(
+        packSectionLightProbeRgb9E5(max(reflectedRadiance, vec3(0.0))),
+        packSectionLightProbeRgb9E5(max(refractedRadiance, vec3(0.0))),
+        floatBitsToUint(max(reflectionDistance, 0.0)),
+        floatBitsToUint(max(refractionDistance, 0.0)));
+    memoryBarrierBuffer();
+    uint readyState = 0x80000000u | (specularTransportCacheHeader.y & 0x3fffffffu);
+    atomicExchange(specularTransportCacheEntries[entryIndex].metadata.w, readyState);
+}
+
+bool readSpecularTransportCache(
+    ivec4 key,
+    uint family,
+    uint detail,
+    out vec3 reflectedRadiance,
+    out vec3 refractedRadiance,
+    out float reflectionDistance,
+    out float refractionDistance
+) {
+    reflectedRadiance = vec3(0.0);
+    refractedRadiance = vec3(0.0);
+    reflectionDistance = 10000.0;
+    refractionDistance = 10000.0;
+    uint entryCount = specularTransportCacheHeader.x;
+    uint probeCount = min(specularTransportCacheHeader.z, 8u);
+    if (entryCount == 0u || probeCount == 0u) {
+        return false;
+    }
+
+    uint readyState = 0x80000000u | (specularTransportCacheHeader.y & 0x3fffffffu);
+    uint slot = specularTransportCacheHash(key, family, detail) % entryCount;
+    for (uint probe = 0u; probe < 8u; probe++) {
+        if (probe >= probeCount) break;
+        uint index = (slot + probe) % entryCount;
+        SpecularTransportCacheEntry entry = specularTransportCacheEntries[index];
+        if (entry.metadata.w == readyState
+                && entry.metadata.x == family
+                && entry.metadata.y == detail
+                && all(equal(entry.key, key))) {
+            reflectedRadiance = unpackSectionLightProbeRgb9E5(entry.payload.x);
+            refractedRadiance = unpackSectionLightProbeRgb9E5(entry.payload.y);
+            reflectionDistance = uintBitsToFloat(entry.payload.z);
+            refractionDistance = uintBitsToFloat(entry.payload.w);
+            return true;
+        }
+    }
+    return false;
+}
+
+void populateRequestedSpecularTransportCache(vec3 sunDirection, vec3 sunRadiance) {
+    uint requestIndex = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
+    uint requestCount = min(specularTransportFillRequestHeader.x, specularTransportFillRequestHeader.z);
+    if (requestIndex >= requestCount
+            || specularTransportFillRequestHeader.y != specularTransportCacheHeader.y) {
+        return;
+    }
+
+    SpecularTransportFillRequest request = specularTransportFillRequests[requestIndex];
+    uint family = uint(request.metadata.x);
+    uint detail = uint(request.metadata.y);
+    if (family > 1u) {
+        return;
+    }
+    int entryIndex = claimSpecularTransportCacheEntry(request.key, family, detail);
+    if (entryIndex < 0) {
+        return;
+    }
+
+    int normalBucket = request.key.w & 0xff;
+    vec3 normal = specularTransportDirection(normalBucket);
+    vec3 surfaceOrigin = request.rayOrigin.xyz;
+    vec3 reflectedRadiance = vec3(0.0);
+    vec3 refractedRadiance = vec3(0.0);
+    float reflectionDistance = 10000.0;
+    float refractionDistance = 10000.0;
+
+    if (family == 0u) {
+        vec3 reflectionDirection = specularTransportDirection(int(detail & 0xffu));
+        reflectedRadiance = traceSimpleRadiance(
+            surfaceOrigin + normal * 0.02,
+            reflectionDirection,
+            sunDirection,
+            sunRadiance,
+            0.0,
+            reflectionDistance);
+    } else {
+        int medium = int(detail & 0xffu);
+        vec3 reflectionDirection = specularTransportDirection(int((detail >> 8u) & 0xffu));
+        vec3 refractionDirection = specularTransportDirection(int((detail >> 16u) & 0xffu));
+        float ignoredBlockId = specularTransportMediumBlockId(medium);
+        reflectedRadiance = traceSimpleRadiance(
+            surfaceOrigin + normal * 0.02,
+            reflectionDirection,
+            sunDirection,
+            sunRadiance,
+            ignoredBlockId,
+            reflectionDistance);
+        refractedRadiance = traceSimpleRadiance(
+            surfaceOrigin - normal * 0.02,
+            refractionDirection,
+            sunDirection,
+            sunRadiance,
+            ignoredBlockId,
+            refractionDistance);
+    }
+
+    specularTransportCacheEntries[entryIndex].payload = uvec4(
+        packSectionLightProbeRgb9E5(reflectedRadiance),
+        packSectionLightProbeRgb9E5(refractedRadiance),
+        floatBitsToUint(reflectionDistance),
+        floatBitsToUint(refractionDistance));
+    memoryBarrierBuffer();
+    uint readyState = 0x80000000u | (specularTransportCacheHeader.y & 0x3fffffffu);
+    atomicExchange(specularTransportCacheEntries[entryIndex].metadata.w, readyState);
 }
 
 // ============================================================================
@@ -3393,7 +3755,36 @@ void writeSkyDlssSidecars(ivec2 pixel) {
 // ============================================================================
 
 void main() {
-populateRequestedSectionLightProbeRtCacheCell();
+// A negative mode is a bounded request-only dispatch. It fills cache misses and
+// exits before any full-frame visibility or lighting work.
+if (pc.cacheOnHit < 0) {
+    populateRequestedSectionLightProbeRtCacheCell();
+    uint cacheRequestIndex = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
+    bool hasDiffuseRequest =
+        diffuseRadianceFillRequestHeader.y == diffuseRadianceCacheHeader.y
+        && cacheRequestIndex < min(
+            diffuseRadianceFillRequestHeader.x,
+            diffuseRadianceFillRequestHeader.z);
+    bool hasSpecularRequest =
+        specularTransportFillRequestHeader.y == specularTransportCacheHeader.y
+        && cacheRequestIndex < min(
+            specularTransportFillRequestHeader.x,
+            specularTransportFillRequestHeader.z);
+    if (!hasDiffuseRequest && !hasSpecularRequest) {
+        return;
+    }
+    vec3 cacheSunDirView = vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ);
+    if (dot(cacheSunDirView, cacheSunDirView) < 0.000001) {
+        cacheSunDirView = vec3(0.5, 1.0, 0.2);
+    }
+    vec3 cacheLightDir = normalize(mat3(cam.viewInverse) * normalize(cacheSunDirView));
+    vec3 cacheBaseSunColor = vec3(pc.sunColorR, pc.sunColorG, pc.sunColorB) * SUN_INTENSITY;
+    vec3 cacheSunColor = getSunColorFromElevation(cacheLightDir, cacheBaseSunColor);
+    populateRequestedDiffuseRadianceCache(cacheLightDir, cacheSunColor);
+    populateRequestedSpecularTransportCache(cacheLightDir, cacheSunColor);
+    return;
+}
+
 vec2 launchSize = vec2(gl_LaunchSizeEXT.xy);
 ivec2 screenCoord = ivec2(gl_LaunchIDEXT.xy);
 imageStore(blocklightDetailImage, screenCoord, vec4(0.0));
@@ -3498,6 +3889,9 @@ if (pc.debugMode == 1) {
   vec4 gExtraRaw = vec4(0.0); // Blocklight (R), Skylight (G), AO (B), encoded emission (A)
   
   #if HYBRID_RENDERING
+  // Retain the G-buffer resources in the full-reference permutation. Deferred
+  // cache-fill dispatches exit above and cache-hit frames use compute resolve.
+  if (pc.cacheOnHit < 0) {
   // Force sampling of all G-buffers to ensure bindings are active
   // This prevents the compiler from optimizing them out if HYBRID_RENDERING logic is conditional
   // Use original UV coordinates for G-buffer sampling (not remapped quadrant coordinates)
@@ -3510,11 +3904,20 @@ if (pc.debugMode == 1) {
   // colortex5 (gbufferExtra): Blocklight (R), Skylight (G), AO (B), encoded emission (A)
   // These textures encode one discrete first-hit surface per pixel. Filtering
   // across silhouettes mixes unrelated normals, materials, and positions.
-  vec4 gPos = texelFetch(gbufferWorldPos, clamp(originalPixelCoord, ivec2(0), textureSize(gbufferWorldPos, 0) - 1), 0);
-  vec4 gNormalRaw = texelFetch(gbufferNormal, clamp(originalPixelCoord, ivec2(0), textureSize(gbufferNormal, 0) - 1), 0);
-  vec4 gAlbedoRaw = texelFetch(gbufferAlbedo, clamp(originalPixelCoord, ivec2(0), textureSize(gbufferAlbedo, 0) - 1), 0);
-  vec4 gMaterialRaw = texelFetch(gbufferMaterial, clamp(originalPixelCoord, ivec2(0), textureSize(gbufferMaterial, 0) - 1), 0);
-  gExtraRaw = texelFetch(gbufferExtra, clamp(originalPixelCoord, ivec2(0), textureSize(gbufferExtra, 0) - 1), 0);
+  // Iris keeps its G-buffer at output resolution while RT/DLSS can dispatch at
+  // a lower render resolution. Use normalized screen coordinates so the two
+  // images remain aligned instead of stretching the upper-left G-buffer area.
+  ivec2 gPosPixel = clamp(ivec2(originalP * vec2(textureSize(gbufferWorldPos, 0))),
+      ivec2(0), textureSize(gbufferWorldPos, 0) - 1);
+  vec4 gPos = texelFetch(gbufferWorldPos, gPosPixel, 0);
+  vec4 gNormalRaw = texelFetch(gbufferNormal,
+      clamp(ivec2(originalP * vec2(textureSize(gbufferNormal, 0))), ivec2(0), textureSize(gbufferNormal, 0) - 1), 0);
+  vec4 gAlbedoRaw = texelFetch(gbufferAlbedo,
+      clamp(ivec2(originalP * vec2(textureSize(gbufferAlbedo, 0))), ivec2(0), textureSize(gbufferAlbedo, 0) - 1), 0);
+  vec4 gMaterialRaw = texelFetch(gbufferMaterial,
+      clamp(ivec2(originalP * vec2(textureSize(gbufferMaterial, 0))), ivec2(0), textureSize(gbufferMaterial, 0) - 1), 0);
+  gExtraRaw = texelFetch(gbufferExtra,
+      clamp(ivec2(originalP * vec2(textureSize(gbufferExtra, 0))), ivec2(0), textureSize(gbufferExtra, 0) - 1), 0);
 
     // Use the sampled values (even if trivially) to ensure they contribute to the output
     // In a real scenario, these would be used for shading.
@@ -3551,6 +3954,7 @@ if (pc.debugMode == 1) {
 
         hit = true;
     }
+  }
 #endif
 
   if (!hit) {
@@ -3580,7 +3984,6 @@ if (pc.debugMode == 1) {
   // Low sun = warm orange (sunset/sunrise), high sun = neutral white
   vec3 baseSunColor = vec3(pc.sunColorR, pc.sunColorG, pc.sunColorB) * SUN_INTENSITY;
   vec3 sunColor = getSunColorFromElevation(lightDir, baseSunColor);
-  populateRequestedDiffuseRadianceCache(lightDir, sunColor);
 
   vec4 color;
   vec2 motionVec = vec2(0.0);
@@ -3887,6 +4290,9 @@ if (pc.debugMode == 1) {
     vec3 indirectOrigin = rayOrigin;
     vec3 indirectNormal = normal;
     vec3 indirectThroughput = vec3(1.0);
+    vec3 firstBounceIncidentRadiance = vec3(0.0);
+    float firstBounceHitDistance = 10000.0;
+    bool firstBounceSampled = false;
     int indirectBounceCount = clamp(INDIRECT_BOUNCES, 1, 3);
 
     for (int bounce = 0; bounce < 3; bounce++) {
@@ -3917,6 +4323,10 @@ if (pc.debugMode == 1) {
             0);
 
         if (payload.hitData.w < 0.0) {
+            if (bounce == 0) {
+                firstBounceIncidentRadiance = max(payload.hitData.xyz, vec3(0.0));
+                firstBounceSampled = true;
+            }
             float skyBounceScale = bounce == 0 ? 0.5 : 0.22;
             indirectContrib += indirectThroughput
                 * max(payload.hitData.xyz, vec3(0.0))
@@ -3926,6 +4336,7 @@ if (pc.debugMode == 1) {
 
         vec3 hitNormal = normalize(payload.material.normal);
         vec3 hitAlbedo = max(payload.material.albedo, vec3(0.0));
+        float bounceHitDistance = payload.hitData.w;
         float hitAo = clamp(payload.material.ambientOcclusion, 0.0, 1.0);
         float hitNdotL = max(dot(hitNormal, lightDir), 0.0);
         float hitShadow = 0.0;
@@ -3943,6 +4354,11 @@ if (pc.debugMode == 1) {
         vec3 hitRadiance = payload.material.emission
             + hitAlbedo * sunColor * hitNdotL * hitShadow
             + hitAmbient;
+        if (bounce == 0) {
+            firstBounceIncidentRadiance = max(hitRadiance, vec3(0.0));
+            firstBounceHitDistance = bounceHitDistance;
+            firstBounceSampled = true;
+        }
         float bounceScale = bounce == 0 ? INDIRECT_SCALE : INDIRECT_SCALE * 0.55;
         indirectContrib += indirectThroughput * hitRadiance * bounceScale;
 
@@ -3953,6 +4369,15 @@ if (pc.debugMode == 1) {
 
         indirectOrigin = payload.hitData.xyz + hitNormal * 0.035;
         indirectNormal = hitNormal;
+    }
+    if (pc.cacheOnHit != 0 && firstBounceSampled) {
+        ivec4 diffuseKey = ivec4(
+            ivec3(floor(shadingWorldPos)),
+            diffuseRadianceNormalBucket(normal));
+        publishDiffuseRadianceCache(
+            diffuseKey,
+            firstBounceIncidentRadiance,
+            firstBounceHitDistance);
     }
     // --- Specular Environment Reflections with GGX Importance Sampling ---
 // Both metals and non-metals benefit from environment reflections.
@@ -3972,6 +4397,41 @@ float surfaceFresnelLuma = dot(
 if (!refractiveSurface
         && roughness < reflectionRoughnessLimit
         && (metallic > 0.5 || surfaceFresnelLuma > 0.025)) {
+    if (pc.cacheOnHit < 0) {
+        vec3 reflectionDirection = normalize(reflect(-viewDir, normal));
+        ivec4 transportKey = specularTransportKey(
+            shadingWorldPos, normal, roughness, metallic, blockId, surfaceAlpha);
+        uint transportDetail = uint(specularTransportDirectionBucket(reflectionDirection));
+        vec3 cachedReflection;
+        vec3 unusedRefraction;
+        float cachedReflectionDistance;
+        float unusedRefractionDistance;
+        bool transportHit = readSpecularTransportCache(
+            transportKey,
+            0u,
+            transportDetail,
+            cachedReflection,
+            unusedRefraction,
+            cachedReflectionDistance,
+            unusedRefractionDistance);
+        if (transportHit) {
+            vec3 fresnel = fresnelSchlick(max(dot(normal, viewDir), 0.0), F0);
+            float baseReflectionStrength = mix(DIELECTRIC_REFLECTION_SCALE, 1.0, metallic);
+            float roughnessAttenuation = 1.0 - roughness * roughness;
+            float envBrightness = dot(cachedReflection, vec3(0.299, 0.587, 0.114));
+            float envScale = 0.2 + 0.8 * smoothstep(0.0, 0.3, envBrightness);
+            specularEnvContrib = cachedReflection
+                * fresnel
+                * baseReflectionStrength
+                * roughnessAttenuation
+                * envScale
+                * METAL_REFLECTION_SCALE
+                * SPECULAR_INTENSITY;
+            specularHitDistanceGuide = cachedReflectionDistance;
+        } else {
+            specularHitDistanceGuide = 10000.0;
+        }
+    } else {
     // Initial path throughput - tracks accumulated reflection color
     vec3 throughput = vec3(1.0);
     vec3 reflectionAccum = vec3(0.0);
@@ -4028,10 +4488,11 @@ if (!refractiveSurface
         traceRayEXT(acc, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0,
                     currentOrigin + currentNormal * 0.01, 0.001, reflectDir,
                     REFLECTION_RAY_DISTANCE, 0);
+        float reflectionTransportDistance = payload.hitData.w < 0.0
+            ? 10000.0
+            : payload.hitData.w;
         if (bounce == 0) {
-            specularHitDistanceGuide = payload.hitData.w < 0.0
-                ? 10000.0
-                : payload.hitData.w;
+            specularHitDistanceGuide = reflectionTransportDistance;
         }
         
         vec3 envColor;
@@ -4066,6 +4527,20 @@ if (!refractiveSurface
             
             envColor = max(hitLitColor, vec3(0.0));
             envBrightness = dot(envColor, vec3(0.299, 0.587, 0.114));
+        }
+
+        if (pc.cacheOnHit != 0 && bounce == 0) {
+            ivec4 transportKey = specularTransportKey(
+                shadingWorldPos, normal, roughness, metallic, blockId, surfaceAlpha);
+            uint transportDetail = uint(specularTransportDirectionBucket(reflectDir));
+            publishSpecularTransportCache(
+                transportKey,
+                0u,
+                transportDetail,
+                envColor,
+                vec3(0.0),
+                reflectionTransportDistance,
+                10000.0);
         }
         
         // Calculate Fresnel for this bounce
@@ -4127,9 +4602,67 @@ if (!refractiveSurface
     }
     
     specularEnvContrib = reflectionAccum * SPECULAR_INTENSITY;
+    }
 }
 
 if (refractiveSurface) {
+    if (pc.cacheOnHit < 0) {
+        vec3 incident = -viewDir;
+        vec3 reflectionDirection = normalize(reflect(incident, normal));
+        float ior = waterSurface ? 1.333 : (iceSurface ? 1.31 : (crystalSurface ? 2.20 : 1.50));
+        vec3 refractionDirection = refract(incident, normal, 1.0 / ior);
+        if (dot(refractionDirection, refractionDirection) <= 1e-6) {
+            refractionDirection = reflectionDirection;
+        } else {
+            refractionDirection = normalize(refractionDirection);
+        }
+        uint transportDetail = uint(specularTransportMedium(blockId))
+            | (uint(specularTransportDirectionBucket(reflectionDirection)) << 8u)
+            | (uint(specularTransportDirectionBucket(refractionDirection)) << 16u);
+        ivec4 transportKey = specularTransportKey(
+            shadingWorldPos, normal, roughness, metallic, blockId, surfaceAlpha);
+        vec3 reflectedRadiance;
+        vec3 refractedRadiance;
+        float reflectionDistance;
+        float refractionDistance;
+        bool transportHit = readSpecularTransportCache(
+            transportKey,
+            1u,
+            transportDetail,
+            reflectedRadiance,
+            refractedRadiance,
+            reflectionDistance,
+            refractionDistance);
+        if (transportHit) {
+            vec3 fresnel = fresnelSchlick(max(dot(normal, viewDir), 0.0), F0);
+            if (waterSurface) {
+                fresnel = clamp(fresnel * WATER_REFLECTION_STRENGTH, vec3(0.0), vec3(1.0));
+                vec3 waterTint = waterTintColor(albedo);
+                vec3 absorption = waterAbsorption(refractionDistance);
+                refractedRadiance = refractedRadiance * absorption
+                    + waterTint * (1.0 - absorption);
+            } else if (glassSurface) {
+                refractedRadiance *= mix(vec3(1.0), max(albedo, vec3(0.2)), 0.28)
+                    * GLASS_TRANSMISSION;
+            } else if (iceSurface) {
+                vec3 iceTint = iceTintColor(albedo);
+                vec3 absorption = iceAbsorption(refractionDistance);
+                refractedRadiance = refractedRadiance * absorption * iceTint
+                    + iceTint * (1.0 - absorption) * 0.18;
+            } else if (crystalSurface) {
+                refractedRadiance *= mix(vec3(1.0), max(albedo, vec3(0.12)), 0.55)
+                    * CRYSTAL_TRANSMISSION;
+            } else {
+                refractedRadiance *= mix(vec3(1.0), max(albedo, vec3(0.1)), 0.35)
+                    * surfaceAlpha;
+            }
+            specularEnvContrib = mix(refractedRadiance, reflectedRadiance, fresnel)
+                * SPECULAR_INTENSITY;
+            specularHitDistanceGuide = min(reflectionDistance, refractionDistance);
+        } else {
+            specularHitDistanceGuide = 10000.0;
+        }
+    } else {
     vec3 incident = -viewDir;
     vec3 reflectionDirection = normalize(reflect(incident, normal));
     float reflectionDistance;
@@ -4143,15 +4676,34 @@ if (refractiveSurface) {
 
     float ior = waterSurface ? 1.333 : (iceSurface ? 1.31 : (crystalSurface ? 2.20 : 1.50));
     vec3 refractionDirection = refract(incident, normal, 1.0 / ior);
+    vec3 cachedRefractionDirection = dot(refractionDirection, refractionDirection) > 1e-6
+        ? normalize(refractionDirection)
+        : reflectionDirection;
     float refractionDistance = 10000.0;
     vec3 refractedRadiance = reflectedRadiance;
     if (dot(refractionDirection, refractionDirection) > 1e-6) {
         refractedRadiance = traceSimpleRadiance(
             shadingWorldPos - normal * 0.025,
-            normalize(refractionDirection),
+            cachedRefractionDirection,
             lightDir,
             sunColor,
             blockId,
+            refractionDistance);
+    }
+
+    if (pc.cacheOnHit != 0) {
+        uint transportDetail = uint(specularTransportMedium(blockId))
+            | (uint(specularTransportDirectionBucket(reflectionDirection)) << 8u)
+            | (uint(specularTransportDirectionBucket(cachedRefractionDirection)) << 16u);
+        ivec4 transportKey = specularTransportKey(
+            shadingWorldPos, normal, roughness, metallic, blockId, surfaceAlpha);
+        publishSpecularTransportCache(
+            transportKey,
+            1u,
+            transportDetail,
+            reflectedRadiance,
+            refractedRadiance,
+            reflectionDistance,
             refractionDistance);
     }
 
@@ -4181,6 +4733,7 @@ if (refractiveSurface) {
     specularEnvContrib = mix(refractedRadiance, reflectedRadiance, fresnel)
         * SPECULAR_INTENSITY;
     specularHitDistanceGuide = min(reflectionDistance, refractionDistance);
+    }
 }
 
     // --- Ambient (sky-based hemisphere lighting) ---

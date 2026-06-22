@@ -14,21 +14,26 @@ public final class CacheRequestQueue {
     public enum EnqueueResult {
         ADDED,
         MERGED,
+        THROTTLED,
         REJECTED;
 
         public boolean accepted() {
-            return this != REJECTED;
+            return this == ADDED || this == MERGED;
         }
     }
+
+    private static final long RETRY_SUPPRESSION_NANOS = 1_000_000_000L;
 
     private final int maxBacklog;
     private final int maxBacklogPerFamily;
     private final int[] familyBacklogs = new int[CacheRequestFamily.values().length];
     private final LinkedHashMap<CacheRequestKey, CacheRequest> backlog = new LinkedHashMap<>();
+    private final LinkedHashMap<CacheRequestKey, RetrySuppression> retrySuppressions = new LinkedHashMap<>();
     private long enqueued;
     private long merged;
     private long drained;
     private long dropped;
+    private long throttled;
     private int lastBatchSize;
 
     public CacheRequestQueue(int maxBacklog) {
@@ -45,6 +50,17 @@ public final class CacheRequestQueue {
             return EnqueueResult.MERGED;
         }
 
+        RetrySuppression suppression = retrySuppressions.get(request.key());
+        if (suppression != null) {
+            long now = System.nanoTime();
+            if (suppression.versionStamp().equals(request.versionStamp())
+                    && now < suppression.retryAfterNanos()) {
+                throttled++;
+                return EnqueueResult.THROTTLED;
+            }
+            retrySuppressions.remove(request.key());
+        }
+
         boolean familyFull = familyBacklog(request.key().family()) >= maxBacklogPerFamily;
         if (familyFull && request.key().family() == CacheRequestFamily.SECTION_PROBE_CELL) {
             dropped++;
@@ -59,6 +75,11 @@ public final class CacheRequestQueue {
         familyBacklogs[request.key().family().ordinal()]++;
         enqueued++;
         return EnqueueResult.ADDED;
+    }
+
+    public synchronized EnqueueResult requeue(CacheRequest request) {
+        retrySuppressions.remove(request.key());
+        return enqueue(request);
     }
 
     public synchronized CacheRequestBatch drainBatch(int maxRequests, int frameIndex) {
@@ -84,11 +105,13 @@ public final class CacheRequestQueue {
 
         int batchSize = Math.min(maxRequests, sorted.size());
         ArrayList<CacheRequest> batch = new ArrayList<>(batchSize);
+        long retryAfterNanos = System.nanoTime() + RETRY_SUPPRESSION_NANOS;
         for (int i = 0; i < batchSize; i++) {
             CacheRequest request = sorted.get(i);
             backlog.remove(request.key());
             familyBacklogs[request.key().family().ordinal()]--;
             batch.add(request);
+            rememberRetrySuppression(request, retryAfterNanos);
         }
 
         drained += batchSize;
@@ -113,11 +136,23 @@ public final class CacheRequestQueue {
     }
 
     public synchronized CacheRequestStats snapshot() {
-        return new CacheRequestStats(backlog.size(), lastBatchSize, enqueued, merged, drained, dropped);
+        return new CacheRequestStats(
+                backlog.size(),
+                familyBacklog(CacheRequestFamily.SECTION_PROBE_CELL),
+                familyBacklog(CacheRequestFamily.DIFFUSE_RADIANCE),
+                familyBacklog(CacheRequestFamily.REFLECTION),
+                familyBacklog(CacheRequestFamily.REFRACTION),
+                lastBatchSize,
+                enqueued,
+                merged,
+                drained,
+                dropped,
+                throttled);
     }
 
     public synchronized void clear() {
         backlog.clear();
+        retrySuppressions.clear();
         java.util.Arrays.fill(familyBacklogs, 0);
         lastBatchSize = 0;
     }
@@ -152,5 +187,27 @@ public final class CacheRequestQueue {
 
     private int familyBacklog(CacheRequestFamily family) {
         return familyBacklogs[family.ordinal()];
+    }
+
+    private void rememberRetrySuppression(CacheRequest request, long retryAfterNanos) {
+        if (request.key().family() == CacheRequestFamily.SECTION_PROBE_CELL) {
+            return;
+        }
+        if (!retrySuppressions.containsKey(request.key())
+                && retrySuppressions.size() >= maxBacklog) {
+            var iterator = retrySuppressions.entrySet().iterator();
+            if (iterator.hasNext()) {
+                iterator.next();
+                iterator.remove();
+            }
+        }
+        retrySuppressions.put(
+                request.key(),
+                new RetrySuppression(request.versionStamp(), retryAfterNanos));
+    }
+
+    private record RetrySuppression(
+            CacheEntryVersionStamp versionStamp,
+            long retryAfterNanos) {
     }
 }

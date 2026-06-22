@@ -27,6 +27,16 @@ final class RtxFrameImages {
 
     @SuppressWarnings("unchecked")
     private final VRef<VImage>[] reservoirs = new VRef[2];
+    @SuppressWarnings("unchecked")
+    private final VRef<VImageView>[] reservoirViews = new VRef[2];
+    @SuppressWarnings("unchecked")
+    private final VRef<VImage>[] specularHistory = new VRef[2];
+    @SuppressWarnings("unchecked")
+    private final VRef<VImageView>[] specularHistoryViews = new VRef[2];
+    @SuppressWarnings("unchecked")
+    private final VRef<VImage>[] specularSurfaceHistory = new VRef[2];
+    @SuppressWarnings("unchecked")
+    private final VRef<VImageView>[] specularSurfaceHistoryViews = new VRef[2];
 
     private VRef<VImage> radiance;
     private VRef<VImageView> radianceView;
@@ -43,7 +53,9 @@ final class RtxFrameImages {
     private VRef<VImage> specularHitDepth;
     private VRef<VImageView> specularHitDepthView;
     private VRef<VImage> firstHitDepth;
+    private VRef<VImageView> firstHitDepthView;
     private VRef<VImage> blocklightDetail;
+    private VRef<VImageView> blocklightDetailView;
 
     private VRef<VImage> processed;
     private VRef<VImageView> processedView;
@@ -82,6 +94,13 @@ final class RtxFrameImages {
         for (int i = 0; i < reservoirs.length; i++) {
             reservoirs[i] = createStorageImage(ctx, renderWidth, renderHeight,
                     VK_FORMAT_R32G32B32A32_SFLOAT, "RTX Reservoir " + i);
+            reservoirViews[i] = VImageView.create(ctx, reservoirs[i]);
+            specularHistory[i] = createStorageImage(ctx, renderWidth, renderHeight,
+                    VK_FORMAT_R16G16B16A16_SFLOAT, "Specular transport history " + i);
+            specularHistoryViews[i] = VImageView.create(ctx, specularHistory[i]);
+            specularSurfaceHistory[i] = createStorageImage(ctx, renderWidth, renderHeight,
+                    VK_FORMAT_R16G16B16A16_SFLOAT, "Specular surface history " + i);
+            specularSurfaceHistoryViews[i] = VImageView.create(ctx, specularSurfaceHistory[i]);
         }
 
         radiance = createStorageImage(ctx, renderWidth, renderHeight,
@@ -119,6 +138,8 @@ final class RtxFrameImages {
         motionVectorView = VImageView.create(ctx, motionVector);
         linearDepthView = VImageView.create(ctx, linearDepth);
         specularHitDepthView = VImageView.create(ctx, specularHitDepth);
+        firstHitDepthView = VImageView.create(ctx, firstHitDepth);
+        blocklightDetailView = VImageView.create(ctx, blocklightDetail);
         processedView = VImageView.create(ctx, processed);
     }
 
@@ -150,6 +171,10 @@ final class RtxFrameImages {
         return List.of(
                 reservoirs[0],
                 reservoirs[1],
+                specularHistory[0],
+                specularHistory[1],
+                specularSurfaceHistory[0],
+                specularSurfaceHistory[1],
                 radiance,
                 diffuseAlbedoMetallic,
                 specularAlbedo,
@@ -187,6 +212,22 @@ final class RtxFrameImages {
 
     VRef<VImage> previousReservoir(int frameIndex) {
         return reservoirs[(frameIndex + 1) & 1];
+    }
+
+    VRef<VImage> currentSpecularHistory(int frameIndex) {
+        return specularHistory[frameIndex & 1];
+    }
+
+    VRef<VImage> previousSpecularHistory(int frameIndex) {
+        return specularHistory[(frameIndex + 1) & 1];
+    }
+
+    VRef<VImage> currentSpecularSurfaceHistory(int frameIndex) {
+        return specularSurfaceHistory[frameIndex & 1];
+    }
+
+    VRef<VImage> previousSpecularSurfaceHistory(int frameIndex) {
+        return specularSurfaceHistory[(frameIndex + 1) & 1];
     }
 
     VRef<VImage> radiance() {
@@ -253,6 +294,45 @@ final class RtxFrameImages {
         return blocklightDetail;
     }
 
+    StorageViews storageViews(int frameIndex) {
+        int current = frameIndex & 1;
+        int previous = (frameIndex + 1) & 1;
+        return new StorageViews(
+                reservoirViews[current],
+                reservoirViews[previous],
+                specularHistoryViews[previous],
+                specularSurfaceHistoryViews[previous],
+                specularHistoryViews[current],
+                specularSurfaceHistoryViews[current],
+                radianceView,
+                motionVectorView,
+                linearDepthView,
+                diffuseAlbedoMetallicView,
+                specularAlbedoView,
+                normalRoughnessView,
+                specularHitDepthView,
+                firstHitDepthView,
+                blocklightDetailView);
+    }
+
+    record StorageViews(
+            VRef<VImageView> currentReservoir,
+            VRef<VImageView> previousReservoir,
+            VRef<VImageView> previousSpecularHistory,
+            VRef<VImageView> previousSpecularSurfaceHistory,
+            VRef<VImageView> currentSpecularHistory,
+            VRef<VImageView> currentSpecularSurfaceHistory,
+            VRef<VImageView> radiance,
+            VRef<VImageView> motionVector,
+            VRef<VImageView> linearDepth,
+            VRef<VImageView> diffuseAlbedoMetallic,
+            VRef<VImageView> specularAlbedo,
+            VRef<VImageView> normalRoughness,
+            VRef<VImageView> specularHitDepth,
+            VRef<VImageView> firstHitDepth,
+            VRef<VImageView> blocklightDetail) {
+    }
+
     VRef<VImage> processed() {
         return processed;
     }
@@ -278,6 +358,9 @@ final class RtxFrameImages {
     }
 
     void destroy() {
+        closeAllViews(reservoirViews);
+        closeAllViews(specularHistoryViews);
+        closeAllViews(specularSurfaceHistoryViews);
         radianceView = closeView(radianceView);
         diffuseAlbedoMetallicView = closeView(diffuseAlbedoMetallicView);
         specularAlbedoView = closeView(specularAlbedoView);
@@ -285,9 +368,13 @@ final class RtxFrameImages {
         motionVectorView = closeView(motionVectorView);
         linearDepthView = closeView(linearDepthView);
         specularHitDepthView = closeView(specularHitDepthView);
+        firstHitDepthView = closeView(firstHitDepthView);
+        blocklightDetailView = closeView(blocklightDetailView);
         processedView = closeView(processedView);
 
         closeAll(reservoirs);
+        closeAll(specularHistory);
+        closeAll(specularSurfaceHistory);
         radiance = close(radiance);
         diffuseAlbedoMetallic = close(diffuseAlbedoMetallic);
         specularAlbedo = close(specularAlbedo);
@@ -316,6 +403,12 @@ final class RtxFrameImages {
             image.close();
         }
         return null;
+    }
+
+    private static void closeAllViews(VRef<VImageView>[] views) {
+        for (int i = 0; i < views.length; i++) {
+            views[i] = closeView(views[i]);
+        }
     }
 
     private static VRef<VImageView> closeView(VRef<VImageView> view) {
