@@ -1,0 +1,3 @@
+## 2024-06-03 - Stream allocations in hot rendering loops
+**Learning:** Hot rendering loops in Java using Streams (`.stream().map()`, `.stream().mapToInt()`, `.stream().mapToLong().max()`) cause continuous per-frame object allocation (boxing, closures, stream pipelines), leading to significant GC pressure and frame stuttering. Additionally, stream-based max calculations for monotonic queues can incorrectly decrease values if used improperly.
+**Action:** Replace all `Stream` operations in hot paths with pre-allocated explicit arrays and basic `for` loops (preferably indexed `for` loops for `ArrayList`s) to avoid unboxing overhead and iterator allocations.
