@@ -1,0 +1,3 @@
+## 2024-06-11 - Stream allocations in hot loops
+**Learning:** Using Java Streams (like `.stream().mapToInt().toArray()`, `.stream().map().toList()`) in per-frame rendering hot paths (e.g. `VulkanPipeline.renderPostShadows`, `VCmdBuff.bindDSet`, `MixinIrisRenderingPipeline.getCustomTextures`) creates significant GC pressure by allocating multiple iterator and closure objects every frame. This triggers frequent minor garbage collections which cause measurable frame time spikes (micro-stutters) in the rendering pipeline.
+**Action:** Always refactor Java Streams to traditional indexed `for` loops with explicitly sized target collections (`new int[size]`, `new ArrayList<>(size)`) in any method that executes per-frame. Add comments explaining why the optimization was applied.
