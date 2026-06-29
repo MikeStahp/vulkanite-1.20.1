@@ -225,7 +225,15 @@ public class CommandManager {
 
         public void waitForExecutions(int execQueue, List<Long> executions) {
             synchronized (waitingFor) {
-                long execMax = executions.stream().mapToLong(Long::longValue).max().orElse(waitingFor.getOrDefault(execQueue, 0));
+                // Use explicit loop to avoid stream allocation, primitive boxing/unboxing overhead,
+                // and to correctly ensure monotonic increasing value.
+                long execMax = waitingFor.getOrDefault(execQueue, 0);
+                for (int i = 0; i < executions.size(); i++) {
+                    long val = executions.get(i);
+                    if (val > execMax) {
+                        execMax = val;
+                    }
+                }
                 waitingFor.put(execQueue, execMax);
             }
         }
