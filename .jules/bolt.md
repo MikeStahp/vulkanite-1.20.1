@@ -1,0 +1,3 @@
+## 2024-03-24 - Stream allocations in hot paths
+**Learning:** Found that `stream()` is heavily used in hot path methods like `VulkanPipeline.renderPostShadows`, `VCmdBuff.bindDSet`, and `MixinIrisRenderingPipeline.getCustomTextures`. Streams cause high GC pressure due to per-frame iterator, closure, and intermediate object allocations.
+**Action:** Replace `stream()` chains with explicit traditional loops, especially when allocating arrays or lists. Using explicit sizing for target lists (e.g. `new ArrayList<>(size)`) or arrays (e.g. `new int[size]`) will prevent reallocation and eliminate GC overhead.
