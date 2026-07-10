@@ -100,6 +100,16 @@ public class AccelerationBlasBuilder {
         jobEnqueuer.enqueue(batch);
     }
 
+    public synchronized void markInstalled(List<BLASBuildResult> results) {
+        if (!destroyed) {
+            jobEnqueuer.markInstalled(results);
+        }
+    }
+
+    public synchronized void removeSection(me.jellysquid.mods.sodium.client.render.chunk.RenderSection section) {
+        jobEnqueuer.removeSection(section);
+    }
+
     public synchronized void destroy() {
         if (destroyed) {
             return;
@@ -110,6 +120,7 @@ public class AccelerationBlasBuilder {
         java.util.concurrent.locks.LockSupport.unpark(workerThread);
         boolean workerStopped = joinWorker();
         closeQueuedJobs();
+        jobEnqueuer.clear();
 
         if (!workerStopped) {
             return;

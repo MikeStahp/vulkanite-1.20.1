@@ -47,6 +47,32 @@ class VoxelBrickGeometryTest {
     }
 
     @Test
+    void emitsAabbOnlyBuildInputWithoutPayloadHeader() {
+        long[] mask = new long[64];
+        set(mask, 0, 0, 0);
+        set(mask, 9, 2, 12);
+
+        VoxelBrickGeometry geometry = VoxelBrickGeometry.fromOpacityMask(mask, 8);
+        ByteBuffer aabbs = geometry.packAabbs().order(ByteOrder.nativeOrder());
+
+        assertEquals(2, geometry.brickCount());
+        assertEquals(2 * VoxelBrickGeometry.AABB_BYTES, geometry.aabbBytes());
+        assertEquals(geometry.aabbBytes(), aabbs.remaining());
+        assertEquals(0.0f, aabbs.getFloat(0));
+        assertEquals(0.0f, aabbs.getFloat(4));
+        assertEquals(0.0f, aabbs.getFloat(8));
+        assertEquals(8.0f, aabbs.getFloat(12));
+        assertEquals(8.0f, aabbs.getFloat(16));
+        assertEquals(8.0f, aabbs.getFloat(20));
+        assertEquals(8.0f, aabbs.getFloat(VoxelBrickGeometry.AABB_BYTES));
+        assertEquals(0.0f, aabbs.getFloat(VoxelBrickGeometry.AABB_BYTES + 4));
+        assertEquals(8.0f, aabbs.getFloat(VoxelBrickGeometry.AABB_BYTES + 8));
+        assertEquals(16.0f, aabbs.getFloat(VoxelBrickGeometry.AABB_BYTES + 12));
+        assertEquals(8.0f, aabbs.getFloat(VoxelBrickGeometry.AABB_BYTES + 16));
+        assertEquals(16.0f, aabbs.getFloat(VoxelBrickGeometry.AABB_BYTES + 20));
+    }
+
+    @Test
     void rejectsUnsupportedBrickSizes() {
         assertThrows(IllegalArgumentException.class,
                 () -> VoxelBrickGeometry.fromOpacityMask(new long[64], 6));

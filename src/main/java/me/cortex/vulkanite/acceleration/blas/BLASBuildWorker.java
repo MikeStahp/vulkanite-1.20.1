@@ -272,6 +272,7 @@ public class BLASBuildWorker implements Runnable {
     public static void closeJobs(List<BLASBuildJob> jobs) {
         for (BLASBuildJob job : jobs) {
             job.data().geometryBuffer().close();
+            job.proceduralInput().ifPresent(ProceduralBLASInput::close);
         }
     }
 

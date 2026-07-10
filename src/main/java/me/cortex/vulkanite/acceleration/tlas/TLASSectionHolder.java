@@ -1,5 +1,6 @@
 package me.cortex.vulkanite.acceleration.tlas;
 
+import me.cortex.vulkanite.acceleration.blas.ProceduralBLAS;
 import me.cortex.vulkanite.lib.base.VObject;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorSet;
@@ -18,15 +19,18 @@ public final class TLASSectionHolder extends VObject {
     public final int geometryIndex;
     public final int numGeometries;
     private final VRef<VAccelerationStructure> structure;
+    private final VRef<ProceduralBLAS> proceduralBlas;
     private VRef<VDescriptorSet> geometryDescriptorSet;
 
     private TLASSectionHolder(int id, int geometryIndex, int numGeometries,
-            VRef<VAccelerationStructure> structure, VRef<VDescriptorSet> geometryDescriptorSet,
+            VRef<VAccelerationStructure> structure, VRef<ProceduralBLAS> proceduralBlas,
+            VRef<VDescriptorSet> geometryDescriptorSet,
             TLASSectionManager manager) {
         this.id = id;
         this.geometryIndex = geometryIndex;
         this.numGeometries = numGeometries;
         this.structure = structure;
+        this.proceduralBlas = proceduralBlas;
         this.geometryDescriptorSet = geometryDescriptorSet;
         this.manager = manager;
     }
@@ -35,10 +39,15 @@ public final class TLASSectionHolder extends VObject {
      * Creates a new holder with a reference.
      */
     public static VRef<TLASSectionHolder> create(int id, int geometryIndex, int numGeometries,
-            VRef<VAccelerationStructure> structure, VRef<VDescriptorSet> geometryDescriptorSet,
+            VRef<VAccelerationStructure> structure, VRef<ProceduralBLAS> proceduralBlas,
+            VRef<VDescriptorSet> geometryDescriptorSet,
             TLASSectionManager manager) {
         return new VRef<>(new TLASSectionHolder(id, geometryIndex, numGeometries, structure,
-                geometryDescriptorSet, manager));
+                proceduralBlas, geometryDescriptorSet, manager));
+    }
+
+    public VRef<ProceduralBLAS> proceduralBlas() {
+        return proceduralBlas == null ? null : proceduralBlas.addRef();
     }
 
     public void attachGeometryDescriptorSet(VRef<VDescriptorSet> descriptorSet) {
@@ -51,6 +60,9 @@ public final class TLASSectionHolder extends VObject {
     @Override
     protected void free() {
         structure.close();
+        if (proceduralBlas != null) {
+            proceduralBlas.close();
+        }
         manager.arenaFree(geometryIndex, numGeometries, geometryDescriptorSet);
         if (geometryDescriptorSet != null) {
             geometryDescriptorSet.close();

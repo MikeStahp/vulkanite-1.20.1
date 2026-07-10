@@ -2,11 +2,13 @@ package me.cortex.vulkanite.lib.base;
 
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VkPhysicalDevice;
+import org.lwjgl.vulkan.VkPhysicalDeviceAccelerationStructureFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingPipelineFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceSubgroupProperties;
+import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
 import org.lwjgl.vulkan.VkQueueFamilyProperties;
 import org.slf4j.Logger;
 
@@ -28,6 +30,8 @@ public record DeviceCapabilities(
         int queueFamilyIndex,
         int queueCount,
         boolean multiQueueOverlap,
+        boolean accelerationStructure,
+        boolean bufferDeviceAddress,
         boolean rayTracingPipeline,
         boolean rayQuery,
         boolean traceRaysIndirect,
@@ -67,11 +71,18 @@ public record DeviceCapabilities(
             VkPhysicalDeviceFeatures features = VkPhysicalDeviceFeatures.calloc(stack);
             vkGetPhysicalDeviceFeatures(physicalDevice, features);
 
+            VkPhysicalDeviceVulkan12Features vulkan12Features =
+                    VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default();
             VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingFeatures =
                     VkPhysicalDeviceRayTracingPipelineFeaturesKHR.calloc(stack).sType$Default();
+            VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures =
+                    VkPhysicalDeviceAccelerationStructureFeaturesKHR.calloc(stack)
+                            .sType$Default()
+                            .pNext(rayTracingFeatures.address());
+            rayTracingFeatures.pNext(vulkan12Features.address());
             VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack)
                     .sType$Default()
-                    .pNext(rayTracingFeatures.address());
+                    .pNext(accelerationStructureFeatures.address());
             vkGetPhysicalDeviceFeatures2(physicalDevice, features2);
 
             VkPhysicalDeviceSubgroupProperties subgroupProperties =
@@ -89,7 +100,10 @@ public record DeviceCapabilities(
                     ? families.get(queueFamilyIndex).queueCount()
                     : 0;
 
-            boolean rayTracingPipeline = extensions.contains(KHR_ACCELERATION_STRUCTURE)
+            boolean accelerationStructure = extensions.contains(KHR_ACCELERATION_STRUCTURE)
+                    && accelerationStructureFeatures.accelerationStructure();
+            boolean bufferDeviceAddress = vulkan12Features.bufferDeviceAddress();
+            boolean rayTracingPipeline = accelerationStructure
                     && extensions.contains(KHR_RAY_TRACING_PIPELINE)
                     && rayTracingFeatures.rayTracingPipeline();
             boolean rayQuery = extensions.contains(KHR_RAY_QUERY);
@@ -111,7 +125,7 @@ public record DeviceCapabilities(
             boolean multiQueueOverlap = queueCount >= 2;
 
             AccelerationTier tier = supportedAccelerationTier(
-                    rayTracingPipeline,
+                    accelerationStructure && bufferDeviceAddress && rayTracingPipeline,
                     traceRaysIndirect,
                     sparseResidency,
                     subgroupOperations,
@@ -121,6 +135,8 @@ public record DeviceCapabilities(
                     queueFamilyIndex,
                     queueCount,
                     multiQueueOverlap,
+                    accelerationStructure,
+                    bufferDeviceAddress,
                     rayTracingPipeline,
                     rayQuery,
                     traceRaysIndirect,
@@ -136,24 +152,28 @@ public record DeviceCapabilities(
     }
 
     private static AccelerationTier supportedAccelerationTier(
-            boolean rayTracingPipeline,
+            boolean proceduralAabbBlas,
             boolean traceRaysIndirect,
             boolean sparseResidency,
             boolean subgroupOperations,
             boolean multiQueueOverlap) {
-        if (rayTracingPipeline
+        if (proceduralAabbBlas
                 && traceRaysIndirect
                 && sparseResidency
                 && subgroupOperations
                 && multiQueueOverlap) {
             return AccelerationTier.GPU_DRIVEN_HYBRID;
         }
-        if (rayTracingPipeline) {
+        if (proceduralAabbBlas) {
             // Procedural AABBs are part of the required KHR RT pipeline; no
             // vendor-only feature is needed for the BVH-over-bricks backend.
             return AccelerationTier.HYBRID_VOXEL_RT;
         }
         return AccelerationTier.TRIANGLE_RT;
+    }
+
+    public boolean proceduralAabbBlas() {
+        return accelerationStructure && bufferDeviceAddress && rayTracingPipeline;
     }
 
     private static boolean containsAny(Set<String> extensions, String first, String second) {
@@ -163,8 +183,9 @@ public record DeviceCapabilities(
     public void logReport(Logger logger) {
         logger.info("[Vulkanite] GPU acceleration: device='{}', tier={}, queueFamily={}, queues={}, multiQueue={}",
                 deviceName, supportedAccelerationTier, queueFamilyIndex, queueCount, multiQueueOverlap);
-        logger.info("[Vulkanite] GPU acceleration support: rtPipeline={}, rayQuery={}, indirectTrace={}, sparseResidency={}, subgroups={}",
-                rayTracingPipeline, rayQuery, traceRaysIndirect, sparseResidency, subgroupOperations);
+        logger.info("[Vulkanite] GPU acceleration support: accelerationStructure={}, bufferDeviceAddress={}, rtPipeline={}, proceduralAABBs={}, rayQuery={}, indirectTrace={}, sparseResidency={}, subgroups={}",
+                accelerationStructure, bufferDeviceAddress, rayTracingPipeline, proceduralAabbBlas(),
+                rayQuery, traceRaysIndirect, sparseResidency, subgroupOperations);
         logger.info("[Vulkanite] Optional GPU support: meshShader={}, VRS={}, invocationReorder={}, cooperativeMatrix={}, deviceGeneratedCommands={}",
                 meshShader, fragmentShadingRate, invocationReorder, cooperativeMatrix, deviceGeneratedCommands);
     }

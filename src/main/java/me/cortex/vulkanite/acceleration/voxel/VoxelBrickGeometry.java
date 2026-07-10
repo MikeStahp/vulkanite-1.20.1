@@ -135,6 +135,18 @@ public final class VoxelBrickGeometry {
         return recordOffsetBytes() + brickCount() * recordStrideBytes();
     }
 
+    public int aabbBytes() {
+        return brickCount() * AABB_BYTES;
+    }
+
+    /** Creates only the tightly packed {@code VkAabbPositionsKHR} array. */
+    public ByteBuffer packAabbs() {
+        ByteBuffer data = ByteBuffer.allocateDirect(aabbBytes()).order(ByteOrder.nativeOrder());
+        writeAabbs(data);
+        data.flip();
+        return data;
+    }
+
     /**
      * Creates a native-order blob containing a header, tightly packed Vulkan
      * AABBs, and fixed-stride shader records.
@@ -151,14 +163,7 @@ public final class VoxelBrickGeometry {
         data.putInt(recordStrideBytes());
 
         data.position(aabbOffsetBytes());
-        for (Brick brick : bricks) {
-            data.putFloat(brick.localX());
-            data.putFloat(brick.localY());
-            data.putFloat(brick.localZ());
-            data.putFloat(brick.localX() + brickSize);
-            data.putFloat(brick.localY() + brickSize);
-            data.putFloat(brick.localZ() + brickSize);
-        }
+        writeAabbs(data);
 
         data.position(recordOffsetBytes());
         for (Brick brick : bricks) {
@@ -172,6 +177,17 @@ public final class VoxelBrickGeometry {
         }
         data.flip();
         return data;
+    }
+
+    private void writeAabbs(ByteBuffer data) {
+        for (Brick brick : bricks) {
+            data.putFloat(brick.localX());
+            data.putFloat(brick.localY());
+            data.putFloat(brick.localZ());
+            data.putFloat(brick.localX() + brickSize);
+            data.putFloat(brick.localY() + brickSize);
+            data.putFloat(brick.localZ() + brickSize);
+        }
     }
 
     public boolean isOccupied(int brickIndex, int localX, int localY, int localZ) {

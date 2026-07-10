@@ -18,6 +18,7 @@ import java.nio.LongBuffer;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
@@ -106,8 +107,19 @@ public class BLASBatchProcessor {
         var buildInfos = VkAccelerationStructureBuildGeometryInfoKHR.calloc(jobs.size(), stack);
         PointerBuffer buildRanges = stack.mallocPointer(jobs.size());
         LongBuffer pAccelerationStructures = stack.mallocLong(jobs.size());
+        int proceduralBuildCount = (int) jobs.stream().filter(job -> job.proceduralInput().isPresent()).count();
+        var proceduralBuildInfos = proceduralBuildCount == 0
+                ? null
+                : VkAccelerationStructureBuildGeometryInfoKHR.calloc(proceduralBuildCount, stack);
+        PointerBuffer proceduralBuildRanges = proceduralBuildCount == 0
+                ? null
+                : stack.mallocPointer(proceduralBuildCount);
         
         var accelerationStructures = new ArrayList<VRef<VAccelerationStructure>>(jobs.size());
+        var proceduralBuilds = new ArrayList<ProceduralBLASBuild>(jobs.size());
+        for (int i = 0; i < jobs.size(); i++) {
+            proceduralBuilds.add(null);
+        }
         
         // Create command buffer for geometry processing and build
         var uploadBuildCmdRef = singleUsePoolWorker.createCommandBuffer();
@@ -124,6 +136,10 @@ public class BLASBatchProcessor {
             LOGGER.trace("[BLAS Batch #{}] Processing job {} with {} geometries",
                 batchNumber, i, job.geometries().size());
             geometryProcessor.processJob(job, i, buildInfos, buildRanges, pAccelerationStructures, accelerationStructures);
+            if (job.proceduralInput().isPresent()) {
+                proceduralBuilds.set(i, geometryProcessor.processProceduralJob(
+                        job, i, proceduralBuildInfos, proceduralBuildRanges));
+            }
         }
         geometryProcessor.flushBuildInputBarriers(stack);
         
@@ -134,6 +150,10 @@ public class BLASBatchProcessor {
         buildInfos.rewind();
         buildRanges.rewind();
         pAccelerationStructures.rewind();
+        if (proceduralBuildInfos != null) {
+            proceduralBuildInfos.rewind();
+            proceduralBuildRanges.rewind();
+        }
         
         // Build acceleration structures
         LOGGER.debug("[BLAS Batch #{}] Building {} acceleration structures", batchNumber, jobs.size());
@@ -141,6 +161,10 @@ public class BLASBatchProcessor {
         uploadBuildCmd.resetQueryPool(timestampQueryPool, BUILD_TIMESTAMP_START, 2);
         uploadBuildCmd.writeTimestamp(timestampQueryPool, BUILD_TIMESTAMP_START, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
         vkCmdBuildAccelerationStructuresKHR(uploadBuildCmd.buffer(), buildInfos, buildRanges);
+        if (proceduralBuildInfos != null) {
+            vkCmdBuildAccelerationStructuresKHR(
+                    uploadBuildCmd.buffer(), proceduralBuildInfos, proceduralBuildRanges);
+        }
         
         // Add memory barrier for AS build synchronization
         encodeASBuildMemoryBarrier(uploadBuildCmd, stack);
@@ -172,6 +196,7 @@ public class BLASBatchProcessor {
                     formatMillis(buildTime), formatMillis(buildGpuNanos));
         } catch (Exception e) {
             LOGGER.error("[BLAS Batch #{}] Failed while waiting for build submission", batchNumber, e);
+            discardProceduralBuilds(proceduralBuilds);
             throw new RuntimeException(e);
         }
         
@@ -194,10 +219,11 @@ public class BLASBatchProcessor {
             }
 
             // Compact and publish results (compactor handles closing source AS)
-            compactor.compactAndPublish(jobs, accelerationStructures, compactedSizes,
+            compactor.compactAndPublish(jobs, accelerationStructures, proceduralBuilds, compactedSizes,
                 singleUsePoolWorker, stack, priorExecutions, batchNumber);
         } else {
-            publishBuiltResults(jobs, accelerationStructures, buildExecution, priorExecutions, batchNumber);
+            publishBuiltResults(jobs, accelerationStructures, proceduralBuilds,
+                    buildExecution, priorExecutions, batchNumber);
         }
 
         long totalBatchNanos = System.nanoTime() - batchStartTime;
@@ -237,6 +263,7 @@ public class BLASBatchProcessor {
     private void publishBuiltResults(
             List<BLASBuildJob> jobs,
             List<VRef<VAccelerationStructure>> accelerationStructures,
+            List<ProceduralBLASBuild> proceduralBuilds,
             long buildExecution,
             Deque<Long> priorExecutions,
             int batchNumber) {
@@ -247,7 +274,8 @@ public class BLASBatchProcessor {
 
         List<BLASBuildResult> results = new ArrayList<>(jobs.size());
         for (int i = 0; i < jobs.size(); i++) {
-            results.add(new BLASBuildResult(accelerationStructures.get(i), jobs.get(i).data()));
+            results.add(createBuildResult(
+                    accelerationStructures.get(i), jobs.get(i), proceduralBuilds.get(i)));
         }
 
         resultConsumer.accept(new BLASBatchResult(results, buildExecution));
@@ -260,6 +288,31 @@ public class BLASBatchProcessor {
             long prior = priorExecutions.poll();
             LOGGER.debug("[BLAS Batch #{}] Waiting for prior execution {}", batchNumber, prior);
             context.cmd.hostWaitForExecution(asyncQueue, prior);
+        }
+    }
+
+    static BLASBuildResult createBuildResult(
+            VRef<VAccelerationStructure> triangleStructure,
+            BLASBuildJob job,
+            ProceduralBLASBuild proceduralBuild) {
+        Optional<VRef<ProceduralBLAS>> procedural = Optional.empty();
+        if (job.proceduralDisposition() == ProceduralBLASDisposition.REPLACE) {
+            if (proceduralBuild == null) {
+                throw new IllegalStateException("Missing procedural build for REPLACE result");
+            }
+            procedural = Optional.of(proceduralBuild.complete());
+        } else if (proceduralBuild != null) {
+            throw new IllegalStateException("Unexpected procedural build for " + job.proceduralDisposition());
+        }
+        return new BLASBuildResult(
+                triangleStructure, job.data(), procedural, job.proceduralDisposition());
+    }
+
+    static void discardProceduralBuilds(List<ProceduralBLASBuild> builds) {
+        for (ProceduralBLASBuild build : builds) {
+            if (build != null) {
+                build.discard();
+            }
         }
     }
 

@@ -93,6 +93,7 @@ public class AccelerationManager {
         }
 
         if (!results.isEmpty()) {
+            blasBuilder.markInstalled(results);
             tlasManager.updateSections(results);
         }
 
@@ -115,6 +116,7 @@ public class AccelerationManager {
     public void sectionRemove(RenderSection section) {
         retiredSections.add(section);
         latestBuildTimes.remove(section);
+        blasBuilder.removeSection(section);
         tlasManager.removeSection(section);
     }
 
@@ -189,8 +191,7 @@ public class AccelerationManager {
     }
 
     private static void closeResult(BLASBuildResult result) {
-        result.structure().close();
-        result.data().geometryBuffer().close();
+        result.close();
     }
 
     private void logBlasInstall(

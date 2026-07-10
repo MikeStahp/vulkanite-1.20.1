@@ -33,6 +33,7 @@ public class BLASGeometryProcessor {
         private final AccelerationStructurePool accelerationStructurePool;
         private final boolean compactBlas;
         private final List<BuildInputBarrier> buildInputBarriers = new ArrayList<>();
+        private final List<BuildInputBarrier> proceduralInputBarriers = new ArrayList<>();
         private final long[] decodePushConstants = new long[3];
 
         public BLASGeometryProcessor(VContext context,
@@ -102,6 +103,79 @@ public class BLASGeometryProcessor {
 
                 pAccelerationStructures.put(structure.get().structure);
                 accelerationStructures.add(structure);
+        }
+
+        public ProceduralBLASBuild processProceduralJob(
+                        BLASBuildJob job,
+                        int jobIndex,
+                        VkAccelerationStructureBuildGeometryInfoKHR.Buffer buildInfos,
+                        PointerBuffer buildRanges) {
+                ProceduralBLASInput input = job.proceduralInput().orElseThrow();
+                int primitiveCount = input.geometry().brickCount();
+                if (primitiveCount <= 0) {
+                        throw new IllegalStateException("Procedural BLAS job has no AABBs");
+                }
+
+                var stack = buildCtx.stack;
+                long inputAddress = input.aabbBuffer().get().deviceAddress();
+                if (inputAddress == 0L || (inputAddress & 0x7L) != 0L) {
+                        throw new IllegalStateException("Procedural AABB input address must be non-zero and 8-byte aligned: 0x"
+                                        + Long.toHexString(inputAddress));
+                }
+
+                var range = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack);
+                range.get(0).primitiveCount(primitiveCount);
+                buildRanges.put(range);
+
+                var geometryInfo = VkAccelerationStructureGeometryKHR.calloc(1, stack);
+                geometryInfo.get(0)
+                                .sType$Default()
+                                .geometryType(VK_GEOMETRY_TYPE_AABBS_KHR)
+                                .flags(VK_GEOMETRY_OPAQUE_BIT_KHR)
+                                .geometry(VkAccelerationStructureGeometryDataKHR.calloc(stack)
+                                                .aabbs(VkAccelerationStructureGeometryAabbsDataKHR.calloc(stack)
+                                                                .sType$Default()
+                                                                .data(VkDeviceOrHostAddressConstKHR.calloc(stack)
+                                                                                .deviceAddress(inputAddress))
+                                                                .stride(me.cortex.vulkanite.acceleration.voxel.VoxelBrickGeometry.AABB_BYTES)));
+
+                var buildInfo = buildInfos.get()
+                                .sType$Default()
+                                .type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+                                .flags(BLASBuildPolicy.staticTerrainBuildFlags(false))
+                                .pGeometries(geometryInfo)
+                                .geometryCount(1);
+
+                VkAccelerationStructureBuildSizesInfoKHR buildSizes =
+                                VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
+                vkGetAccelerationStructureBuildSizesKHR(
+                                context.device,
+                                VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                buildInfo,
+                                stack.ints(primitiveCount),
+                                buildSizes);
+
+                VRef<VAccelerationStructure> structure = accelerationStructurePool.createAcceleration(
+                                buildSizes.accelerationStructureSize(),
+                                VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+                context.setDebugUtilsObjectName(
+                                structure.get().structure,
+                                VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR,
+                                input.debugName() + " Procedural BLAS");
+
+                var scratch = buildCtx.scratchAllocator.allocate(buildSizes.buildScratchSize());
+                uploadBuildCmd.addBufferRef(scratch.buffer());
+                buildInfo
+                                .scratchData(VkDeviceOrHostAddressKHR.calloc(stack)
+                                                .deviceAddress(scratch.deviceAddress()))
+                                .dstAccelerationStructure(structure.get().structure);
+
+                proceduralInputBarriers.add(new BuildInputBarrier(
+                                input.aabbBuffer().addRef(), 0L, input.aabbBuffer().get().size()));
+                LOGGER.debug("[Procedural BLAS] Encoded {}: job={}, AABBs={}, AS bytes={}, scratch bytes={}",
+                                input.debugName(), jobIndex, primitiveCount,
+                                buildSizes.accelerationStructureSize(), buildSizes.buildScratchSize());
+                return new ProceduralBLASBuild(structure, input, buildSizes.accelerationStructureSize());
         }
 
         private void processGeometry(BLASBuildJob job, int geoIdx,
@@ -202,16 +276,48 @@ public class BLASGeometryProcessor {
         }
 
         public void flushBuildInputBarriers(MemoryStack stack) {
-                if (buildInputBarriers.isEmpty()) {
+                if (!buildInputBarriers.isEmpty()) {
+                        var barriers = VkBufferMemoryBarrier.calloc(buildInputBarriers.size(), stack);
+                        for (int i = 0; i < buildInputBarriers.size(); i++) {
+                                BuildInputBarrier pending = buildInputBarriers.get(i);
+                                barriers.get(i)
+                                                .sType$Default()
+                                                .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
+                                                .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR)
+                                                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                                                .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                                                .buffer(pending.buffer().get().buffer())
+                                                .offset(pending.offset())
+                                                .size(pending.size());
+                                uploadBuildCmd.addBufferRef(pending.buffer());
+                                pending.buffer().close();
+                        }
+
+                        vkCmdPipelineBarrier(
+                                        uploadBuildCmd.buffer(),
+                                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                                        0,
+                                        null,
+                                        barriers,
+                                        null);
+                        buildInputBarriers.clear();
+                }
+
+                flushProceduralInputBarriers(stack);
+        }
+
+        private void flushProceduralInputBarriers(MemoryStack stack) {
+                if (proceduralInputBarriers.isEmpty()) {
                         return;
                 }
 
-                var barriers = VkBufferMemoryBarrier.calloc(buildInputBarriers.size(), stack);
-                for (int i = 0; i < buildInputBarriers.size(); i++) {
-                        BuildInputBarrier pending = buildInputBarriers.get(i);
+                var barriers = VkBufferMemoryBarrier.calloc(proceduralInputBarriers.size(), stack);
+                for (int i = 0; i < proceduralInputBarriers.size(); i++) {
+                        BuildInputBarrier pending = proceduralInputBarriers.get(i);
                         barriers.get(i)
                                         .sType$Default()
-                                        .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
+                                        .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
                                         .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR)
                                         .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
                                         .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
@@ -224,13 +330,13 @@ public class BLASGeometryProcessor {
 
                 vkCmdPipelineBarrier(
                                 uploadBuildCmd.buffer(),
-                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
                                 VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                                 0,
                                 null,
                                 barriers,
                                 null);
-                buildInputBarriers.clear();
+                proceduralInputBarriers.clear();
         }
 
         private record BuildInputBarrier(VRef<me.cortex.vulkanite.lib.memory.VBuffer> buffer, long offset, long size) {

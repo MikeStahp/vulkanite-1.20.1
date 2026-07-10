@@ -276,47 +276,57 @@ Add transfer usage flags if staging or copies require them.
 
 ## Tasks
 
-* [ ] Extend the async BLAS job model with optional procedural voxel-brick input.
-* [ ] Extend the async BLAS result model with an optional procedural BLAS.
-* [ ] Upload tightly packed `VkAabbPositionsKHR` records.
-* [ ] Upload fixed-stride brick payloads.
-* [ ] Query procedural BLAS build sizes.
-* [ ] Allocate procedural BLAS storage.
-* [ ] Allocate or reuse scratch storage.
-* [ ] Build one procedural AABB BLAS per non-empty section.
-* [ ] Skip procedural BLAS creation for empty sections.
-* [ ] Assign readable debug names to buffers and acceleration structures.
-* [ ] Track procedural BLAS lifetime with section lifetime.
-* [ ] Destroy procedural BLAS resources on chunk unload.
-* [ ] Destroy procedural BLAS resources on world change.
-* [ ] Destroy procedural BLAS resources during shutdown.
-* [ ] Rebuild the procedural BLAS after relevant opaque occupancy changes.
-* [ ] Avoid rebuilding procedural BLAS for changes that do not affect procedural occupancy.
-* [ ] Add capability checks for required ray-tracing features.
-* [ ] Keep the backend disabled when required procedural RT support is unavailable.
-* [ ] Report procedural BLAS creation statistics in debug mode.
-* [ ] Report AABB count per section.
-* [ ] Report procedural BLAS memory usage.
+* [x] Extend the async BLAS job model with optional procedural voxel-brick input.
+* [x] Extend the async BLAS result model with an optional procedural BLAS.
+* [x] Upload tightly packed `VkAabbPositionsKHR` records.
+* [x] Upload fixed-stride brick payloads.
+* [x] Query procedural BLAS build sizes.
+* [x] Allocate procedural BLAS storage.
+* [x] Allocate or reuse scratch storage.
+* [x] Build one procedural AABB BLAS per non-empty section.
+* [x] Skip procedural BLAS creation for empty sections.
+* [x] Assign readable debug names to buffers and acceleration structures.
+* [x] Track procedural BLAS lifetime with section lifetime.
+* [x] Destroy procedural BLAS resources on chunk unload.
+* [x] Destroy procedural BLAS resources on world change.
+* [x] Destroy procedural BLAS resources during shutdown.
+* [x] Rebuild the procedural BLAS after relevant opaque occupancy changes.
+* [x] Avoid rebuilding procedural BLAS for changes that do not affect procedural occupancy.
+* [x] Add capability checks for required ray-tracing features.
+* [x] Keep the backend disabled when required procedural RT support is unavailable.
+* [x] Report procedural BLAS creation statistics in debug mode.
+* [x] Report AABB count per section.
+* [x] Report procedural BLAS memory usage.
 * [ ] Verify Vulkan object lifetime ordering.
+  * BLOCKED: Source ownership paths now close procedural inputs, results, section-held procedural BLAS resources, queued updates, removals, world-change/shutdown state, and retained-occupancy records. Runtime ordering still needs validation-layer and lifecycle stress coverage, which is blocked by the existing `vkCreateInstance` validation-layer crash documented in Phase 0.
 
 ## Validation
 
 * [ ] Vulkan validation reports no acceleration-structure build errors.
-* [ ] Empty sections create no procedural BLAS.
-* [ ] Full sections create the expected number of AABB primitives.
+  * BLOCKED: Validation-layer runtime coverage is blocked by the Phase 0 native `vkCreateInstance` crash with `VK_LAYER_KHRONOS_validation`.
+* [x] Empty sections create no procedural BLAS.
+* [x] Full sections create the expected number of AABB primitives.
 * [ ] Chunk unload releases procedural resources.
+  * BLOCKED: Requires runtime lifecycle stress with validation or object leak reporting.
 * [ ] Repeated rebuilds do not leak memory.
+  * BLOCKED: Requires runtime lifecycle stress with validation or object leak reporting.
 * [ ] World changes do not retain stale procedural BLAS references.
+  * BLOCKED: Requires runtime lifecycle stress with validation or object leak reporting.
 * [ ] Shutdown reports no live Vulkan objects from this path.
+  * BLOCKED: Requires runtime lifecycle stress with validation or object leak reporting.
 
 ## Phase gate
 
 Do not continue until:
 
 * [ ] Procedural BLAS objects build successfully.
+  * BLOCKED: The build path compiles and unit tests pass, but actual device-side procedural BLAS execution has not been validated because validation-layer runtime coverage is blocked.
 * [ ] Vulkan validation reports no procedural-build errors.
+  * BLOCKED: Same Phase 0 validation-layer `vkCreateInstance` crash.
 * [ ] Resource lifetime stress tests pass.
+  * BLOCKED: Requires runtime lifecycle stress coverage.
 * [ ] Memory usage remains stable over repeated rebuild cycles.
+  * BLOCKED: Requires runtime lifecycle stress coverage.
 
 ---
 

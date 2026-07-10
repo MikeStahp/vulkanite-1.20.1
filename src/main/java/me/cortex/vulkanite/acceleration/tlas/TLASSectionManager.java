@@ -1,6 +1,8 @@
 package me.cortex.vulkanite.acceleration.tlas;
 
 import me.cortex.vulkanite.acceleration.blas.BLASBuildResult;
+import me.cortex.vulkanite.acceleration.blas.ProceduralBLAS;
+import me.cortex.vulkanite.acceleration.blas.ProceduralBLASDisposition;
 import me.cortex.vulkanite.lib.base.VContext;
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.cmd.VCmdBuff;
@@ -114,16 +116,15 @@ public class TLASSectionManager extends TLASInstanceBuffer {
                 var section = data.section();
                 if (removals.contains(section)) {
                     // Already removed, close the buffers and continue
-                    result.structure().close();
-                    data.geometryBuffer().close();
+                    result.close();
                 } else {
                     // We process the updates sequentially
                     // Older updates are overwritten
                     var key = section.getPosition();
                     if (updates.containsKey(key)) {
                         var prev = updates.get(key);
-                        prev.structure().close();
-                        prev.data().geometryBuffer().close();
+                        result = mergeRetainedProceduralResult(result, prev);
+                        prev.close();
                     }
                     updates.put(key, result);
                 }
@@ -159,6 +160,7 @@ public class TLASSectionManager extends TLASInstanceBuffer {
                 var posKey = section.getPosition();
 
                 var prevHolder = activeSections.remove(posKey);
+                VRef<ProceduralBLAS> proceduralBlas = resolveProceduralBlas(result, prevHolder);
                 if (prevHolder != null) {
                     free(prevHolder.get().id);
                     prevHolder.close();
@@ -189,7 +191,7 @@ public class TLASSectionManager extends TLASInstanceBuffer {
 
                 // Ownership of result.structure() is transferred to the holder
                 var holder = TLASSectionHolder.create(id, geometryIndex, numGeometriesInInstance,
-                        result.structure(), geometryBufferDescSet.addRef(), this);
+                        result.structure(), proceduralBlas, geometryBufferDescSet.addRef(), this);
                 activeSections.put(section.getPosition(), holder);
             }
 
@@ -268,7 +270,8 @@ public class TLASSectionManager extends TLASInstanceBuffer {
 
         addEphemeralInstance(asi);
 
-        var holder = TLASSectionHolder.create(-1, geometryIndex, numGeometries, structure.addRef(), null, this);
+        var holder = TLASSectionHolder.create(-1, geometryIndex, numGeometries,
+                structure.addRef(), null, null, this);
         descriptorUpdateJobs.add(new DescriptorUpdateJob(geometryIndex, geometryBuffer.addRef(), bufferOffsets,
                 holder.addRef()));
         return holder;
@@ -282,8 +285,7 @@ public class TLASSectionManager extends TLASInstanceBuffer {
 
         BLASBuildResult update;
         while ((update = sectionUpdates.poll()) != null) {
-            update.structure().close();
-            update.data().geometryBuffer().close();
+            update.close();
         }
         sectionRemovals.clear();
 
@@ -307,5 +309,37 @@ public class TLASSectionManager extends TLASInstanceBuffer {
 
     private static String formatMillis(long nanos) {
         return String.format(Locale.ROOT, "%.3f", nanos / 1_000_000.0);
+    }
+
+    private static BLASBuildResult mergeRetainedProceduralResult(
+            BLASBuildResult result,
+            BLASBuildResult previous) {
+        if (result.proceduralDisposition() != ProceduralBLASDisposition.RETAIN) {
+            return result;
+        }
+
+        return switch (previous.proceduralDisposition()) {
+            case REPLACE -> new BLASBuildResult(
+                    result.structure(),
+                    result.data(),
+                    Optional.of(previous.proceduralBlas().orElseThrow().addRef()),
+                    ProceduralBLASDisposition.REPLACE);
+            case CLEAR -> new BLASBuildResult(
+                    result.structure(),
+                    result.data(),
+                    Optional.empty(),
+                    ProceduralBLASDisposition.CLEAR);
+            case RETAIN -> result;
+        };
+    }
+
+    private static VRef<ProceduralBLAS> resolveProceduralBlas(
+            BLASBuildResult result,
+            VRef<TLASSectionHolder> previousHolder) {
+        return switch (result.proceduralDisposition()) {
+            case REPLACE -> result.proceduralBlas().orElseThrow();
+            case CLEAR -> null;
+            case RETAIN -> previousHolder == null ? null : previousHolder.get().proceduralBlas();
+        };
     }
 }

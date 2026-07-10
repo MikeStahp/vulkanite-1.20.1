@@ -70,6 +70,7 @@ public class BLASCompactor {
     public void compactAndPublish(
             List<BLASBuildJob> jobs,
             List<VRef<VAccelerationStructure>> accelerationStructures,
+            List<ProceduralBLASBuild> proceduralBuilds,
             long[] compactedSizes,
             VCommandPool singleUsePoolWorker,
             MemoryStack stack,
@@ -128,7 +129,8 @@ public class BLASCompactor {
             
             // Create result
             var job = jobs.get(idx);
-            results.add(new BLASBuildResult(compact_as, job.data()));
+            results.add(BLASBatchProcessor.createBuildResult(
+                    compact_as, job, proceduralBuilds.get(idx)));
         }
         cmdRef.get().writeTimestamp(timestampQueryPool, COMPACT_TIMESTAMP_END,
                 VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
