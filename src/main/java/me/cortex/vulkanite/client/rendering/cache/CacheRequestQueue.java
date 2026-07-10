@@ -142,6 +142,7 @@ public final class CacheRequestQueue {
                 familyBacklog(CacheRequestFamily.DIFFUSE_RADIANCE),
                 familyBacklog(CacheRequestFamily.REFLECTION),
                 familyBacklog(CacheRequestFamily.REFRACTION),
+                familyBacklog(CacheRequestFamily.SURFACE_DIRECT_LIGHT),
                 lastBatchSize,
                 enqueued,
                 merged,
@@ -190,7 +191,8 @@ public final class CacheRequestQueue {
     }
 
     private void rememberRetrySuppression(CacheRequest request, long retryAfterNanos) {
-        if (request.key().family() == CacheRequestFamily.SECTION_PROBE_CELL) {
+        if (request.key().family() == CacheRequestFamily.SECTION_PROBE_CELL
+                || request.key().family() == CacheRequestFamily.SURFACE_DIRECT_LIGHT) {
             return;
         }
         if (!retrySuppressions.containsKey(request.key())

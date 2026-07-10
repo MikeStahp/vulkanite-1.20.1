@@ -57,6 +57,20 @@ const vec3 HCM_METALS[] = vec3[](
     vec3(0.96200, 0.94947, 0.92212)  // 237: Silver
 );
 
+int flatAxisBucket(vec3 direction) {
+    vec3 axis = abs(direction);
+    if (axis.x >= axis.y && axis.x >= axis.z) return direction.x >= 0.0 ? 0 : 1;
+    if (axis.y >= axis.z) return direction.y >= 0.0 ? 2 : 3;
+    return direction.z >= 0.0 ? 4 : 5;
+}
+
+float encodeSurfaceFaceBucket(vec3 geometricNormal) {
+    // Negative values distinguish a real terrain face marker from the previous
+    // roughness payload and from entity G-buffer samples. The cache resolver
+    // decodes -1..-6 to +X, -X, +Y, -Y, +Z, -Z.
+    return -float(flatAxisBucket(geometricNormal) + 1);
+}
+
 void main() {
     // Sample base albedo texture
     vec4 textureAlbedo = texture(gtexture, texCoord);
@@ -168,9 +182,11 @@ void main() {
     // Metallic flag is encoded: if any F0 component > 0.5, it's a metal
     colortex2 = vec4(F0, roughness);
     
-    // colortex3: Signed world-space unit normal (RGB), roughness packed (A).
-    // NGX Ray Reconstruction consumes float normals directly.
-    colortex3 = vec4(finalNormal, roughness);
+    // colortex3: signed world-space shaded normal (RGB), terrain flat-face
+    // marker (A). Roughness is already stored in colortex2.a and copied to the
+    // final DLSS/RR guide by resolve/raygen. The face marker keeps persistent
+    // blocklight cache keys independent from normal maps and animated normals.
+    colortex3 = vec4(finalNormal, encodeSurfaceFaceBucket(normal));
     
     // colortex4: World Position (RGB), Metallic flag in A (1.0 for metal, 0.0 for dielectric)
     // Storing metallic flag here so RT shader knows material type

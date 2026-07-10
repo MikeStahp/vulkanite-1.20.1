@@ -19,7 +19,7 @@ public record CacheRequestBatch(
     }
 
     /**
-     * The bounded raygen consumes section, diffuse, and specular request
+     * The bounded raygen consumes section, diffuse, specular, and surface-light request
      * buffers in parallel at the same launch index. Reflection and refraction
      * share the specular buffer, so the required launch width is the largest
      * populated buffer rather than the sum of every request family.
@@ -28,13 +28,15 @@ public record CacheRequestBatch(
         int section = 0;
         int diffuse = 0;
         int specular = 0;
+        int surfaceDirect = 0;
         for (CacheRequest request : requests) {
             switch (request.key().family()) {
                 case SECTION_PROBE_CELL -> section++;
                 case DIFFUSE_RADIANCE -> diffuse++;
                 case REFLECTION, REFRACTION -> specular++;
+                case SURFACE_DIRECT_LIGHT -> surfaceDirect++;
             }
         }
-        return Math.max(section, Math.max(diffuse, specular));
+        return Math.max(Math.max(section, diffuse), Math.max(specular, surfaceDirect));
     }
 }

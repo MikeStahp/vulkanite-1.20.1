@@ -14,6 +14,8 @@ import java.util.Properties;
  */
 public class VulkaniteConfig {
     private static final String CONFIG_FILE_NAME = "vulkanite.properties";
+    public static final String VULKAN_VALIDATION_SYSTEM_PROPERTY = "vulkanite.validation";
+    public static final String VULKAN_VALIDATION_ENVIRONMENT_VARIABLE = "VULKANITE_VALIDATION";
     private static final boolean DEFAULT_RTX_ENTITY_CAPTURE_ENABLED = true;
     private static final boolean DEFAULT_RTX_PARTICLE_CAPTURE_ENABLED = false;
     private static final int DEFAULT_RTX_ENTITY_CAPTURE_INTERVAL = 6;
@@ -93,6 +95,10 @@ public class VulkaniteConfig {
     // compute path. This prevents a shaderpack setting or old persisted config
     // from re-enabling a known-hanging interop path by accident.
     public boolean deferredComputeExperimental = false;
+
+    // Opt-in because validation has a material CPU cost and requires the Vulkan SDK
+    // validation layer to be installed on the host.
+    public boolean vulkanValidationEnabled = false;
     
     // Manual override for deferred rendering detection
     // If true, forces deferred rendering even if shaderpack isn't detected
@@ -137,6 +143,7 @@ public class VulkaniteConfig {
             
             deferredComputeEnabled = Boolean.parseBoolean(props.getProperty("deferredComputeEnabled", "false"));
             deferredComputeExperimental = Boolean.parseBoolean(props.getProperty("deferredComputeExperimental", "false"));
+            vulkanValidationEnabled = Boolean.parseBoolean(props.getProperty("vulkanValidationEnabled", "false"));
             String overrideValue = props.getProperty("deferredRenderingOverride");
             if (overrideValue != null && !overrideValue.isEmpty()) {
                 deferredRenderingOverride = Boolean.parseBoolean(overrideValue);
@@ -186,6 +193,7 @@ public class VulkaniteConfig {
         props.setProperty("restirReservoirHeight", String.valueOf(restirReservoirHeight));
         props.setProperty("deferredComputeEnabled", String.valueOf(deferredComputeEnabled));
         props.setProperty("deferredComputeExperimental", String.valueOf(deferredComputeExperimental));
+        props.setProperty("vulkanValidationEnabled", String.valueOf(vulkanValidationEnabled));
         if (deferredRenderingOverride != null) {
             props.setProperty("deferredRenderingOverride", String.valueOf(deferredRenderingOverride));
         }
@@ -244,6 +252,38 @@ public class VulkaniteConfig {
      */
     public RtxCacheMode getRtxCacheMode() {
         return RtxCacheMode.parse(System.getProperty("vulkanite.rtxCacheMode", rtxCacheMode.configValue()));
+    }
+
+    /**
+     * Returns whether Vulkan validation was explicitly requested. A JVM property is
+     * convenient for launcher profiles, while the environment variable works for
+     * Gradle/client smoke runs without rewriting the persisted config.
+     */
+    public boolean isVulkanValidationEnabled() {
+        return resolveVulkanValidationEnabled(vulkanValidationEnabled,
+                System.getProperty(VULKAN_VALIDATION_SYSTEM_PROPERTY),
+                System.getenv(VULKAN_VALIDATION_ENVIRONMENT_VARIABLE));
+    }
+
+    static boolean resolveVulkanValidationEnabled(boolean configuredValue, String systemPropertyValue,
+            String environmentValue) {
+        if (systemPropertyValue != null) {
+            return parseBooleanOverride(systemPropertyValue, VULKAN_VALIDATION_SYSTEM_PROPERTY);
+        }
+        if (environmentValue != null) {
+            return parseBooleanOverride(environmentValue, VULKAN_VALIDATION_ENVIRONMENT_VARIABLE);
+        }
+        return configuredValue;
+    }
+
+    private static boolean parseBooleanOverride(String value, String source) {
+        if ("true".equalsIgnoreCase(value)) {
+            return true;
+        }
+        if ("false".equalsIgnoreCase(value)) {
+            return false;
+        }
+        throw new IllegalArgumentException(source + " must be either true or false, but was: " + value);
     }
     
     /**

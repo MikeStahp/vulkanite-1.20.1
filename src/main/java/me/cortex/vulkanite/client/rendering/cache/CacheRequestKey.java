@@ -89,6 +89,22 @@ public record CacheRequestKey(
                 packVariant(mediumBucket, reflectionDirectionBucket, refractionDirectionBucket));
     }
 
+    /**
+     * Direct-light cache key for a one-block surface cell and dominant normal
+     * face. Lighting/material response is applied during resolve.
+     */
+    public static CacheRequestKey surfaceDirectLightEntry(
+            int blockCellX,
+            int blockCellY,
+            int blockCellZ,
+            int surfaceVariant) {
+        return new CacheRequestKey(
+                CacheRequestFamily.SURFACE_DIRECT_LIGHT,
+                packGridCell(blockCellX, blockCellY, blockCellZ),
+                Math.max(0, Math.min(0xFFF, surfaceVariant)),
+                0);
+    }
+
     public static long packGridCell(int cellX, int cellY, int cellZ) {
         return (packSigned(cellX, GRID_XZ_MASK) << (GRID_Y_BITS + GRID_XZ_BITS))
                 | (packSigned(cellY, GRID_Y_MASK) << GRID_XZ_BITS)

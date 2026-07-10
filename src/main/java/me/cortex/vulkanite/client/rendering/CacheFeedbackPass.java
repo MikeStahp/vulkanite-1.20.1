@@ -42,7 +42,7 @@ final class CacheFeedbackPass {
     private static final Logger LOGGER = LoggerFactory.getLogger(CacheFeedbackPass.class);
     private static final int LOCAL_SIZE_X = 8;
     private static final int LOCAL_SIZE_Y = 8;
-    private static final int PUSH_CONSTANT_BYTES = 24;
+    private static final int PUSH_CONSTANT_BYTES = 40;
     private static final int MAX_FEEDBACK_RECORDS = 4096;
     private static final int HEADER_BYTES = 64;
     private static final int RECORD_BYTES = 72;
@@ -57,7 +57,7 @@ final class CacheFeedbackPass {
     private final VRef<VDescriptorSetLayout> setLayout;
     private final ShaderReflection.Set setReflection;
     private final FeedbackSlot[] feedbackSlots = new FeedbackSlot[FEEDBACK_RING_SIZE];
-    private final int[] pushConstants = new int[6];
+    private final int[] pushConstants = new int[10];
     private FeedbackSlot encodedSlot;
     private long feedbackEpoch = 1L;
     private long lastInvalidGbufferLogNanos;
@@ -216,6 +216,12 @@ final class CacheFeedbackPass {
             if (frame.diffuseRadianceCacheBuffer() != null) {
                 updater.buffer(10, frame.diffuseRadianceCacheBuffer());
             }
+            if (frame.surfaceDirectLightCacheBuffer() != null) {
+                updater.buffer(11, frame.surfaceDirectLightCacheBuffer());
+            }
+            if (frame.sectionLightBuffer() != null) {
+                updater.buffer(12, frame.sectionLightBuffer());
+            }
             updater.imageStore(8, frame.storageViews().previousSpecularHistory());
             updater.imageStore(9, frame.storageViews().previousSpecularSurfaceHistory());
             updater.apply();
@@ -226,6 +232,10 @@ final class CacheFeedbackPass {
             pushConstants[3] = frame.renderHeight();
             pushConstants[4] = screenHistoryValid ? 1 : 0;
             pushConstants[5] = 0;
+            pushConstants[6] = Float.floatToRawIntBits(frame.sunDirectionX());
+            pushConstants[7] = Float.floatToRawIntBits(frame.sunDirectionY());
+            pushConstants[8] = Float.floatToRawIntBits(frame.sunDirectionZ());
+            pushConstants[9] = 0;
 
             frame.cmd().bindCompute(pipeline);
             frame.cmd().bindDSet(List.of(set));
@@ -352,6 +362,8 @@ final class CacheFeedbackPass {
                     materialBucket,
                     (viewOrMediumBucket >>> 8) & 0xFF,
                     (viewOrMediumBucket >>> 16) & 0xFF);
+            case SURFACE_DIRECT_LIGHT -> CacheRequestKey.surfaceDirectLightEntry(
+                    cellX, cellY, cellZ, normalBucket);
             case SECTION_PROBE_CELL -> null;
         };
         if (key == null) {
@@ -445,7 +457,11 @@ final class CacheFeedbackPass {
                 Integer.toUnsignedLong(pushConstants[2])
                         | (Integer.toUnsignedLong(pushConstants[3]) << 32),
                 Integer.toUnsignedLong(pushConstants[4])
-                        | (Integer.toUnsignedLong(pushConstants[5]) << 32)
+                        | (Integer.toUnsignedLong(pushConstants[5]) << 32),
+                Integer.toUnsignedLong(pushConstants[6])
+                        | (Integer.toUnsignedLong(pushConstants[7]) << 32),
+                Integer.toUnsignedLong(pushConstants[8])
+                        | (Integer.toUnsignedLong(pushConstants[9]) << 32)
         };
     }
 
@@ -556,6 +572,29 @@ final class CacheFeedbackPass {
                 DiffuseRadianceCacheEntry diffuseRadianceCacheEntries[];
             };
 
+            struct SurfaceDirectLightCacheEntry {
+                ivec4 key;
+                uvec4 metadata;
+                uvec4 lightRecords[72];
+                uvec4 directionalVisibility;
+                uvec4 dependencyVersion;
+            };
+
+            layout(std430, binding = 11) coherent buffer SurfaceDirectLightCacheBuffer {
+                uvec4 surfaceDirectLightCacheHeader;
+                SurfaceDirectLightCacheEntry surfaceDirectLightCacheEntries[];
+            };
+
+            struct GpuSectionLight {
+                ivec4 posRadiusFlags;
+                uvec4 colorEmission;
+            };
+
+            layout(std430, binding = 12) readonly buffer SectionLightTableBuffer {
+                uvec4 sectionLightHeader;
+                GpuSectionLight sectionLightRecords[];
+            };
+
             layout(push_constant) uniform PushConstants {
                 uint sampleStep;
                 uint frameIndex;
@@ -563,15 +602,22 @@ final class CacheFeedbackPass {
                 uint renderHeight;
                 uint allowScreenHistory;
                 uint padding;
+                float sunDirX;
+                float sunDirY;
+                float sunDirZ;
+                uint sunPadding;
             } pc;
 
             const int FAMILY_DIFFUSE_RADIANCE = 1;
             const int FAMILY_REFLECTION = 2;
             const int FAMILY_REFRACTION = 3;
+            const int FAMILY_SURFACE_DIRECT_LIGHT = 4;
             const int SOURCE_VISIBLE_GBUFFER = 1;
             const int SOURCE_REFLECTION_SURFACE = 3;
             const int SOURCE_REFRACTION_SURFACE = 4;
             const int DIFFUSE_INCIDENT_RADIANCE_BUCKET = 0;
+            const bool ENABLE_CAMERA_SURFACE_LIGHT_REQUESTS = false;
+            const bool ENABLE_CAMERA_DIFFUSE_REQUESTS = false;
 
             const float BLOCK_ID_WATER = 1000.0;
             const float BLOCK_ID_GLASS = 1001.0;
@@ -628,6 +674,23 @@ final class CacheFeedbackPass {
                 return direction.z >= 0.0 ? 4 : 5;
             }
 
+            vec3 axisBucketNormal(int bucket) {
+                if (bucket == 0) return vec3(1.0, 0.0, 0.0);
+                if (bucket == 1) return vec3(-1.0, 0.0, 0.0);
+                if (bucket == 2) return vec3(0.0, 1.0, 0.0);
+                if (bucket == 3) return vec3(0.0, -1.0, 0.0);
+                if (bucket == 4) return vec3(0.0, 0.0, 1.0);
+                return vec3(0.0, 0.0, -1.0);
+            }
+
+            bool hasEncodedSurfaceFace(float encodedFace) {
+                return encodedFace <= -0.5 && encodedFace >= -6.5;
+            }
+
+            int decodeSurfaceFaceBucket(float encodedFace) {
+                return clamp(int(round(-encodedFace)) - 1, 0, 5);
+            }
+
             vec2 signNotZero(vec2 value) {
                 return vec2(value.x >= 0.0 ? 1.0 : -1.0, value.y >= 0.0 ? 1.0 : -1.0);
             }
@@ -676,6 +739,62 @@ final class CacheFeedbackPass {
                 return hashMix(value);
             }
 
+            uint surfaceDirectLightHash(ivec4 key) {
+                uint value = uint(key.x) * 0x9e3779b9u;
+                value ^= uint(key.y) * 0x85ebca6bu;
+                value ^= uint(key.z) * 0xc2b2ae35u;
+                value ^= uint(key.w) * 0x27d4eb2du;
+                return hashMix(value ^ 0x6d2b79f5u);
+            }
+
+            uint sectionDirectoryHash(ivec3 sectionCoord) {
+                uint value = uint(sectionCoord.x) * 0x8da6b343u
+                    ^ uint(sectionCoord.y) * 0xd8163841u
+                    ^ uint(sectionCoord.z) * 0xcb1ab31fu;
+                value ^= value >> 16u;
+                value *= 0x7feb352du;
+                return value ^ (value >> 15u);
+            }
+
+            bool surfaceDependencyVersion(vec3 worldPos, out uvec2 version) {
+                version = uvec2(0u);
+                int recordCount = int(sectionLightHeader.w);
+                if (recordCount <= 0) return false;
+                ivec3 sectionOrigin = ivec3(floor(worldPos / 16.0)) * 16;
+                ivec3 sectionCoord = sectionOrigin / 16;
+                uint mask = uint(recordCount - 1);
+                uint hash = sectionDirectoryHash(sectionCoord);
+                int directoryBase = int(sectionLightHeader.x);
+                for (int probe = 0; probe < 64; probe++) {
+                    if (probe >= recordCount) break;
+                    int index = int((hash + uint(probe)) & mask);
+                    GpuSectionLight record = sectionLightRecords[directoryBase + index];
+                    if (record.colorEmission.w == 0u) return false;
+                    if (all(equal(record.posRadiusFlags.xyz, sectionOrigin))) {
+                        version = record.colorEmission.yz;
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            vec3 cacheSunDirection() {
+                vec3 sunDirWorld = vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ);
+                if (dot(sunDirWorld, sunDirWorld) < 0.000001) {
+                    sunDirWorld = vec3(0.5, 1.0, 0.2);
+                }
+                sunDirWorld = normalize(sunDirWorld);
+                return sunDirWorld;
+            }
+
+            uint cacheSunSignature(vec3 direction) {
+                ivec3 quantized = ivec3(round(normalize(direction) * 32.0));
+                uint value = uint(quantized.x) * 0x9e3779b9u;
+                value ^= uint(quantized.y) * 0x85ebca6bu;
+                value ^= uint(quantized.z) * 0xc2b2ae35u;
+                return hashMix(value ^ 0x51ed270bu);
+            }
+
             bool hasDiffuseRadiance(ivec4 key) {
                 uint entryCount = diffuseRadianceCacheHeader.x;
                 uint probeCount = min(diffuseRadianceCacheHeader.z, 8u);
@@ -715,6 +834,37 @@ final class CacheFeedbackPass {
                 return false;
             }
 
+            bool hasSurfaceDirectLight(
+                ivec4 key,
+                bool requireLocal,
+                bool requireDirectional,
+                uint sunSignature,
+                uvec2 dependencyVersion
+            ) {
+                uint entryCount = surfaceDirectLightCacheHeader.x;
+                uint probeCount = min(surfaceDirectLightCacheHeader.z, 8u);
+                if (entryCount == 0u || probeCount == 0u) return false;
+                uint readyState = 0x80000000u | (surfaceDirectLightCacheHeader.y & 0x1fffffffu);
+                uint slot = surfaceDirectLightHash(key) % entryCount;
+                for (uint probe = 0u; probe < 8u; probe++) {
+                    if (probe >= probeCount) break;
+                    uint index = (slot + probe) % entryCount;
+                    SurfaceDirectLightCacheEntry entry = surfaceDirectLightCacheEntries[index];
+                    bool localReady = !requireLocal || entry.metadata.y == readyState;
+                    bool directionalReady = !requireDirectional
+                        || (entry.directionalVisibility.y == readyState
+                            && entry.directionalVisibility.z == sunSignature);
+                    bool dependencyReady = all(equal(
+                        entry.dependencyVersion.xy, dependencyVersion));
+                    if (localReady && directionalReady && dependencyReady
+                            && all(equal(entry.key, key))) {
+                        atomicMax(surfaceDirectLightCacheEntries[index].metadata.z, pc.frameIndex);
+                        return true;
+                    }
+                }
+                return false;
+            }
+
             vec3 decodeHistoryNormal(vec2 encoded) {
                 vec2 oct = encoded * 2.0 - 1.0;
                 vec3 normal = vec3(oct, 1.0 - abs(oct.x) - abs(oct.y));
@@ -747,10 +897,6 @@ final class CacheFeedbackPass {
                 float depthTolerance = max(0.25, linearDepth * 0.025);
                 return abs(surface.z - linearDepth) <= depthTolerance
                     && dot(decodeHistoryNormal(surface.xy), normal) >= 0.96;
-            }
-
-            ivec3 cacheCell(vec3 absWorldPos) {
-                return ivec3(floor(absWorldPos));
             }
 
             void emitRequest(
@@ -869,9 +1015,9 @@ final class CacheFeedbackPass {
                 }
                 vec3 cameraForward = -normalize(cam.viewInverse[2].xyz);
                 float linearDepth = max(dot(gPos.xyz, cameraForward), 0.0);
-                ivec3 cell = cacheCell(absWorldPos);
                 ivec3 transportCell = ivec3(floor(absWorldPos));
                 int diffuseNormalBucket = axisBucket(normal);
+                vec3 diffuseFaceNormal = axisBucketNormal(diffuseNormalBucket);
                 int transportNormalBucket = directionBucket(normal);
                 int roughnessBucket = int(round(roughness * 15.0));
                 int materialBucketValue = materialBucket(metallic, roughness, blockId, gAlbedoRaw.a);
@@ -879,29 +1025,54 @@ final class CacheFeedbackPass {
                     transportCell,
                     transportNormalBucket | (roughnessBucket << 8) | (materialBucketValue << 16));
                 int visiblePriority = luma > 0.45 || blocklight > 0.65 ? 1 : 0;
-                ivec4 diffuseKey = ivec4(cell, diffuseNormalBucket);
-                bool diffuseCacheHit = hasDiffuseRadiance(diffuseKey);
-                atomicAdd(feedback.cacheQueryCount, 1u);
-                bool fallbackPixel = !diffuseCacheHit;
-                if (diffuseCacheHit) {
-                    atomicAdd(feedback.cacheHitCount, 1u);
-                } else {
-                    emitRequest(
-                        FAMILY_DIFFUSE_RADIANCE,
-                        SOURCE_VISIBLE_GBUFFER,
-                        cell,
-                        diffuseNormalBucket,
-                        DIFFUSE_INCIDENT_RADIANCE_BUCKET,
-                        roughnessBucket,
-                        0,
-                        visiblePriority,
-                        1.0,
-                        0.50 + 0.20 * blocklight,
-                        luma,
-                        distanceSquared,
-                        absWorldPos);
+                bool hasSurfaceFace = hasEncodedSurfaceFace(gNormalRaw.a);
+                int surfaceDirectVariant = hasSurfaceFace
+                    ? decodeSurfaceFaceBucket(gNormalRaw.a)
+                    : diffuseNormalBucket;
+                vec3 surfaceFaceNormal = axisBucketNormal(surfaceDirectVariant);
+                // Identify the owning solid block, not whichever side of the
+                // mathematical face floating-point interpolation lands on.
+                ivec3 surfaceDirectCell = ivec3(floor(
+                    absWorldPos - surfaceFaceNormal * 0.01));
+                ivec4 surfaceDirectKey = ivec4(surfaceDirectCell, surfaceDirectVariant);
+                bool localVisibilityRequired = hasSurfaceFace && blocklight > 0.015;
+                bool directionalVisibilityRequired = hasSurfaceFace && skylight > 0.015;
+                bool surfaceDirectRequired = ENABLE_CAMERA_SURFACE_LIGHT_REQUESTS
+                    && (localVisibilityRequired || directionalVisibilityRequired);
+                bool surfaceDirectHit = !surfaceDirectRequired;
+                if (surfaceDirectRequired) {
+                    uint sunSignature = cacheSunSignature(cacheSunDirection());
+                    uvec2 dependencyVersion;
+                    bool dependencyKnown = surfaceDependencyVersion(
+                        vec3(surfaceDirectCell) + vec3(0.5), dependencyVersion);
+                    surfaceDirectHit = dependencyKnown
+                        && hasSurfaceDirectLight(
+                            surfaceDirectKey,
+                            localVisibilityRequired,
+                            directionalVisibilityRequired,
+                            sunSignature,
+                            dependencyVersion);
+                    atomicAdd(feedback.cacheQueryCount, 1u);
+                    if (surfaceDirectHit) {
+                        atomicAdd(feedback.cacheHitCount, 1u);
+                    } else {
+                        emitRequest(
+                            FAMILY_SURFACE_DIRECT_LIGHT,
+                            SOURCE_VISIBLE_GBUFFER,
+                            surfaceDirectCell,
+                            surfaceDirectVariant,
+                            0,
+                            0,
+                            0,
+                            max(blocklight, skylight) > 0.35 ? 2 : visiblePriority,
+                            1.0,
+                            0.65 + 0.25 * max(blocklight, skylight),
+                            max(luma, max(blocklight, skylight)),
+                            distanceSquared,
+                            absWorldPos);
+                    }
                 }
-
+                bool fallbackPixel = !surfaceDirectHit;
                 vec3 viewDir = normalize(origin - absWorldPos);
                 float viewNoV = clamp(dot(normal, viewDir), 0.0, 1.0);
                 float fresnel = pow(1.0 - viewNoV, 5.0);
@@ -912,8 +1083,8 @@ final class CacheFeedbackPass {
                     && !isRefractiveBlock(blockId);
                 bool refractiveSurface = isRefractiveBlock(blockId) || thinTransparentSurface;
                 bool reflectiveSurface = !refractiveSurface
-                    && roughness < mix(0.62, 0.88, metallic)
-                    && (metallic > 0.5 || surfaceFresnelLuma > 0.025);
+                    && (metallic > 0.5 || surfaceFresnelLuma > 0.025)
+                    && roughness < mix(0.62, 0.88, metallic);
                 if (reflectiveSurface) {
                     vec3 reflectionDir = reflect(-viewDir, normal);
                     int transportDirection = directionBucket(reflectionDir);
@@ -983,6 +1154,37 @@ final class CacheFeedbackPass {
                             1.0,
                             0.85,
                             max(luma, 0.35),
+                            distanceSquared,
+                            absWorldPos);
+                    }
+                }
+
+                // Diffuse entries are keyed by world-space surface cell and
+                // dominant normal, so discovery may be view-driven without the
+                // cached lighting becoming view-dependent. Without these
+                // requests CACHE_ON_HIT never acquires indirect RTX radiance.
+                if (ENABLE_CAMERA_DIFFUSE_REQUESTS) {
+                    ivec3 diffuseCell = ivec3(floor(
+                        absWorldPos - diffuseFaceNormal * 0.01));
+                    ivec4 diffuseKey = ivec4(diffuseCell, diffuseNormalBucket);
+                    bool diffuseHit = hasDiffuseRadiance(diffuseKey);
+                    atomicAdd(feedback.cacheQueryCount, 1u);
+                    if (diffuseHit) {
+                        atomicAdd(feedback.cacheHitCount, 1u);
+                    } else {
+                        fallbackPixel = true;
+                        emitRequest(
+                            FAMILY_DIFFUSE_RADIANCE,
+                            SOURCE_VISIBLE_GBUFFER,
+                            diffuseCell,
+                            diffuseNormalBucket,
+                            DIFFUSE_INCIDENT_RADIANCE_BUCKET,
+                            0,
+                            0,
+                            max(blocklight, skylight) > 0.35 ? 2 : visiblePriority,
+                            1.0,
+                            0.75,
+                            max(luma, 0.08 + skylight * 0.12),
                             distanceSquared,
                             absWorldPos);
                     }

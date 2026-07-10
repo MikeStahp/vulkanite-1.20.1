@@ -49,11 +49,11 @@ void main(void) {
     vec3 rayDir = gl_WorldRayDirectionEXT;
     
     // Get sun direction and color for sky calculation
-    vec3 sunDirView = vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ);
-    if (dot(sunDirView, sunDirView) < 0.000001) {
-        sunDirView = vec3(0.5, 1.0, 0.2); // Default sun direction
+    vec3 sunDirWorld = vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ);
+    if (dot(sunDirWorld, sunDirWorld) < 0.000001) {
+        sunDirWorld = vec3(0.5, 1.0, 0.2); // Default sun direction
     }
-    vec3 lightDir = normalize(mat3(cam.viewInverse) * normalize(sunDirView));
+    vec3 lightDir = normalize(sunDirWorld);
     
     vec3 sunColor = vec3(pc.sunColorR, pc.sunColorG, pc.sunColorB) * SUN_INTENSITY;
     

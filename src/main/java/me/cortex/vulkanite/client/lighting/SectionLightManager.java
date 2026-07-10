@@ -229,9 +229,9 @@ public final class SectionLightManager {
         if (processedSections == 0) {
             return;
         }
-        if (changedTables > 0) {
-            markGpuDirty();
-        }
+        // Geometry-only rebuilds update the surface dependency versions stored
+        // in the GPU section directory even when the emitter list is unchanged.
+        markGpuDirty();
         int prebakedProbePages = processDirtyProbePages(MAX_PROBE_REGENERATIONS_PER_UPDATE);
 
         long now = System.nanoTime();
@@ -254,6 +254,7 @@ public final class SectionLightManager {
         ChunkSectionPos sectionPos = section.getPosition();
         cacheInvalidationTracker.recordSectionRemoval(sectionPos);
         activeSectionPositions.remove(sectionPos);
+        markGpuDirty();
         removeQueuedProbePage(sectionPos);
         removeQueuedProbeRtRequests(sectionPos);
         probeBuildVersions.remove(sectionPos);
@@ -268,7 +269,6 @@ public final class SectionLightManager {
         }
         if (removed != null) {
             activeLightCount -= removed.size();
-            markGpuDirty();
             DirtyProbeMarks marks = markProbePageAndNeighborsDirty(sectionPos, false);
             int prebakedProbePages = processDirtyProbePages(MAX_PROBE_REGENERATIONS_PER_UPDATE);
             LOGGER.debug("[Vulkanite] Removed section light table for {}; queued {} neighbor probe pages, prebaked {} probe pages",
@@ -284,7 +284,7 @@ public final class SectionLightManager {
     public synchronized VRef<VBuffer> ensureGpuBuffer(VContext ctx, VCmdBuff cmd) {
         int lightCount = Math.min(activeLightCount, MAX_GPU_LIGHTS);
         List<SectionLightTable> sortedTables = sortedTables();
-        int lightGridRecordCount = lightGridRecordCount(sortedTables.size(), lightCount);
+        int lightGridRecordCount = lightGridRecordCount(activeSectionPositions.size(), lightCount);
         int uploadBytes = HEADER_BYTES + (lightCount + lightGridRecordCount) * RECORD_BYTES;
         ensureCapacity(ctx, uploadBytes);
 
@@ -295,7 +295,7 @@ public final class SectionLightManager {
         long uploadStartNanos = System.nanoTime();
         ByteBuffer data = tableUploadScratch(uploadBytes);
         data.putInt(lightCount);
-        data.putInt(activeTables.size());
+        data.putInt(activeSectionPositions.size());
         data.putInt(gpuVersion);
         data.putInt(lightGridRecordCount);
 
@@ -331,15 +331,25 @@ public final class SectionLightManager {
                 break;
             }
         }
+        int uploadedLightSectionCount = uploadedSections.size();
+        Set<ChunkSectionPos> directorySections = new HashSet<>();
+        for (UploadedLightSection uploaded : uploadedSections) {
+            directorySections.add(uploaded.sectionPos());
+        }
+        for (ChunkSectionPos activeSection : activeSectionPositions) {
+            if (directorySections.add(activeSection)) {
+                uploadedSections.add(new UploadedLightSection(activeSection, 0, 0));
+            }
+        }
         writeLightGridDirectory(data, lightCount, lightGridRecordCount, uploadedSections);
         data.flip();
 
         cmd.encodeDataUpload(ctx.memory, MemoryUtil.memAddress(data), gpuBuffer, 0, uploadBytes);
         cmd.encodeBufferBarrier(gpuBuffer, 0, uploadBytes,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         gpuDirty = false;
-        logSectionLightUpload(lightCount, uploadedSections.size(), lightGridRecordCount,
+        logSectionLightUpload(lightCount, uploadedLightSectionCount, lightGridRecordCount,
                 uploadBytes, System.nanoTime() - uploadStartNanos);
         if (activeLightCount > MAX_GPU_LIGHTS) {
             LOGGER.warn("[Vulkanite] Section light GPU upload truncated: {} active lights, {} uploaded",
@@ -388,7 +398,8 @@ public final class SectionLightManager {
         if (uploadedBytes > 0L) {
             cmd.encodeBufferBarrier(probeGpuBuffer, 0, PROBE_BUFFER_BYTES,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+                            | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
             long uploadNanos = System.nanoTime() - uploadStartNanos;
             logProbeUpload(dirtyAtStart, queuedAtStart, queuedAfterRegeneration,
                     regeneratedProbePages, neighborMarksAtStart, uploadedBytes,
@@ -459,13 +470,15 @@ public final class SectionLightManager {
         if (uploadedBytes > 0L) {
             cmd.encodeBufferBarrier(probeFeedbackGpuBuffer, 0, PROBE_FEEDBACK_BUFFER_BYTES,
                     VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+                            | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         } else {
             cmd.encodeBufferBarrier(probeFeedbackGpuBuffer, 0, PROBE_FEEDBACK_BUFFER_BYTES,
                     VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+                            | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     VK_ACCESS_SHADER_WRITE_BIT,
                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         }
@@ -1388,7 +1401,7 @@ public final class SectionLightManager {
         return -1;
     }
 
-    private static void writeLightGridDirectoryRecord(
+    private void writeLightGridDirectoryRecord(
             ByteBuffer data,
             int lightCount,
             int directoryIndex,
@@ -1400,8 +1413,8 @@ public final class SectionLightManager {
         data.putInt(offset + 8, sectionPos.getMinZ());
         data.putInt(offset + 12, section.firstLight());
         data.putInt(offset + 16, section.lightCount());
-        data.putInt(offset + 20, 0);
-        data.putInt(offset + 24, 0);
+        data.putInt(offset + 20, cacheInvalidationTracker.surfaceGeometryVersion(sectionPos));
+        data.putInt(offset + 24, cacheInvalidationTracker.surfaceLightVersion(sectionPos));
         data.putInt(offset + 28, 1);
     }
 
@@ -1458,7 +1471,7 @@ public final class SectionLightManager {
     }
 
     private static int lightGridRecordCount(int activeSectionCount, int lightCount) {
-        if (activeSectionCount <= 0 || lightCount <= 0) {
+        if (activeSectionCount <= 0) {
             return 0;
         }
         int desired = roundUpPowerOfTwo(Math.max(MIN_GPU_LIGHT_GRID_RECORDS, activeSectionCount * 2));

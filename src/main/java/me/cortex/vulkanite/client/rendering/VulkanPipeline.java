@@ -12,6 +12,7 @@ import me.cortex.vulkanite.client.rendering.cache.CacheRequestQueue;
 import me.cortex.vulkanite.client.rendering.cache.CacheRequestStats;
 import me.cortex.vulkanite.client.rendering.cache.DiffuseRadianceCache;
 import me.cortex.vulkanite.client.rendering.cache.SpecularTransportCache;
+import me.cortex.vulkanite.client.rendering.cache.SurfaceDirectLightCache;
 import me.cortex.vulkanite.compat.IVGImage;
 import me.cortex.vulkanite.compat.RaytracingShaderSet;
 import me.cortex.vulkanite.lib.base.VContext;
@@ -37,8 +38,8 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.render.Camera;
 import net.minecraft.client.texture.AbstractTexture;
 import net.minecraft.client.texture.SpriteAtlasTexture;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkSectionPos;
-import net.minecraft.util.math.Vec3d;
 import org.lwjgl.system.MemoryUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -104,6 +105,7 @@ public class VulkanPipeline {
     private final CacheFeedbackPass cacheFeedbackPass;
     private final DiffuseRadianceCache diffuseRadianceCache = new DiffuseRadianceCache();
     private final SpecularTransportCache specularTransportCache = new SpecularTransportCache();
+    private final SurfaceDirectLightCache surfaceDirectLightCache = new SurfaceDirectLightCache();
     private final CacheRequestQueue cacheRequestQueue = new CacheRequestQueue(MAX_CACHE_REQUEST_BACKLOG);
     private final RtxFrameImages frameImages = new RtxFrameImages();
     private final DLSSDProcessor dlssdProcessor;
@@ -541,7 +543,10 @@ public class VulkanPipeline {
         transitionImages(cmd, sampledImages, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         transitionImages(cmd, gbufferImages, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
-        var sunPos = celestialUniforms.invokeGetSunPosition();
+        // Iris sunPosition is camera/view dependent. Ask its celestial model
+        // for the raw world-space sun vector; shaders flip only the shadow ray
+        // at night, matching Photonics without corrupting day/night ambience.
+        var sunPos = celestialUniforms.invokeGetCelestialPositionInWorldSpace(100.0f);
         int debugMode = mapDebugMode(dlssConfig.getDebugType());
         VRef<VBuffer> sectionLightBuffer = null;
         VRef<VBuffer> sectionLightProbeBuffer = null;
@@ -551,23 +556,31 @@ public class VulkanPipeline {
         VRef<VBuffer> diffuseRadianceFillRequestBuffer = null;
         VRef<VBuffer> specularTransportCacheBuffer = null;
         VRef<VBuffer> specularTransportFillRequestBuffer = null;
+        VRef<VBuffer> surfaceDirectLightCacheBuffer = null;
+        VRef<VBuffer> surfaceDirectLightFillRequestBuffer = null;
         try {
             if (frameDecision.usesRayTracing() || frameDecision.usesCacheResolve()) {
                 diffuseRadianceCacheBuffer = diffuseRadianceCache.ensureCacheGpuBuffer(ctx, cmd);
                 specularTransportCacheBuffer = specularTransportCache.ensureCacheGpuBuffer(ctx, cmd);
-            }
-            if (frameDecision.usesRayTracing()) {
+                surfaceDirectLightCacheBuffer = surfaceDirectLightCache.ensureCacheGpuBuffer(ctx, cmd);
                 var sectionLightManager = Vulkanite.INSTANCE.getSectionLightManager();
                 sectionLightBuffer = sectionLightManager.ensureGpuBuffer(ctx, cmd);
+                // The compute resolve consumes the same persistent, world-space
+                // six-face voxel cache that request-only RTX dispatches fill.
                 sectionLightProbeBuffer = sectionLightManager.ensureProbeGpuBuffer(ctx, cmd);
                 sectionLightProbeFeedbackBuffer =
                         sectionLightManager.ensureProbeFeedbackGpuBuffer(ctx, cmd);
+            }
+            if (frameDecision.usesRayTracing()) {
+                var sectionLightManager = Vulkanite.INSTANCE.getSectionLightManager();
                 sectionLightProbeFillRequestBuffer =
                         sectionLightManager.ensureProbeFillRequestGpuBuffer(ctx, cmd, cacheRequestBatch);
                 diffuseRadianceFillRequestBuffer =
-                        diffuseRadianceCache.ensureFillRequestGpuBuffer(ctx, cmd, cacheRequestBatch);
+                        diffuseRadianceCache.ensureFillRequestGpuBuffer(ctx, cmd, cacheRequestBatch, frameIndex);
                 specularTransportFillRequestBuffer =
-                        specularTransportCache.ensureFillRequestGpuBuffer(ctx, cmd, cacheRequestBatch);
+                        specularTransportCache.ensureFillRequestGpuBuffer(ctx, cmd, cacheRequestBatch, frameIndex);
+                surfaceDirectLightFillRequestBuffer =
+                        surfaceDirectLightCache.ensureFillRequestGpuBuffer(ctx, cmd, cacheRequestBatch, frameIndex);
             }
 
             RtxPassGraph.Frame frame = new RtxPassGraph.Frame(
@@ -622,6 +635,8 @@ public class VulkanPipeline {
                     diffuseRadianceFillRequestBuffer,
                     specularTransportCacheBuffer,
                     specularTransportFillRequestBuffer,
+                    surfaceDirectLightCacheBuffer,
+                    surfaceDirectLightFillRequestBuffer,
                     frameImages.radiance(),
                     renderWidth,
                     renderHeight,
@@ -647,6 +662,12 @@ public class VulkanPipeline {
                 cacheFeedbackPass.markScreenHistoryResolved();
             }
         } finally {
+            if (surfaceDirectLightFillRequestBuffer != null) {
+                surfaceDirectLightFillRequestBuffer.close();
+            }
+            if (surfaceDirectLightCacheBuffer != null) {
+                surfaceDirectLightCacheBuffer.close();
+            }
             if (specularTransportFillRequestBuffer != null) {
                 specularTransportFillRequestBuffer.close();
             }
@@ -693,9 +714,14 @@ public class VulkanPipeline {
         cacheRequestQueue.discardIf(request ->
                 !invalidationTracker.isCurrent(request.key(), request.versionStamp()));
         int feedbackRequests = cacheFeedbackPass.ingestPendingFeedback(cacheRequestQueue);
+        // Diffuse/local RTX lighting is a world-space 2-block voxel volume.
+        // Populate it from section dirtiness, not from whichever surfaces the
+        // camera happens to expose this frame.
+        ChunkSectionPos cameraSection = ChunkSectionPos.from(
+                BlockPos.ofFloored(camera.getPos()));
         int sectionRequests = Vulkanite.INSTANCE.getSectionLightManager().drainPendingCacheRequests(
                 cacheRequestQueue,
-                cameraSection(camera),
+                cameraSection,
                 frameIndex,
                 MAX_CACHE_REQUESTS_PER_FRAME);
 
@@ -705,9 +731,9 @@ public class VulkanPipeline {
                     MAX_CACHE_REQUESTS_PER_FRAME,
                     frameIndex,
                     request -> request.key().family() == CacheRequestFamily.SECTION_PROBE_CELL
-                            || request.key().family() == CacheRequestFamily.DIFFUSE_RADIANCE
                             || request.key().family() == CacheRequestFamily.REFLECTION
-                            || request.key().family() == CacheRequestFamily.REFRACTION);
+                            || request.key().family() == CacheRequestFamily.REFRACTION
+                            );
         } else {
             CacheRequestStats stats = cacheRequestQueue.snapshot();
             batch = new CacheRequestBatch(List.of(), stats.backlog(), stats);
@@ -735,22 +761,11 @@ public class VulkanPipeline {
         if (now - lastFrameOrchestrationLogNanos < FRAME_PATH_LOG_INTERVAL_NANOS) {
             return;
         }
-        LOGGER.info("[Vulkanite] Cache requests: mode={}, batch={}, section={}, feedback={}, backlog={} (probe={}, diffuse={}, reflection={}, refraction={}), enqueued={}, merged={}, drained={}, dropped={}, throttled={}",
+        LOGGER.info("[Vulkanite] Cache requests: mode={}, batch={}, section={}, feedback={}, backlog={} (probe={}, diffuse={}, reflection={}, refraction={}, surfaceDirect={}), enqueued={}, merged={}, drained={}, dropped={}, throttled={}",
                 mode.configValue(), batch.size(), sectionRequests, feedbackRequests, stats.backlog(),
                 stats.sectionProbeBacklog(), stats.diffuseRadianceBacklog(),
-                stats.reflectionBacklog(), stats.refractionBacklog(),
+                stats.reflectionBacklog(), stats.refractionBacklog(), stats.surfaceDirectLightBacklog(),
                 stats.enqueued(), stats.merged(), stats.drained(), stats.dropped(), stats.throttled());
-    }
-
-    private static ChunkSectionPos cameraSection(Camera camera) {
-        if (camera == null) {
-            return null;
-        }
-        Vec3d pos = camera.getPos();
-        return ChunkSectionPos.from(
-                (int) Math.floor(pos.x) >> 4,
-                (int) Math.floor(pos.y) >> 4,
-                (int) Math.floor(pos.z) >> 4);
     }
 
     private void recordFrameDecision(RtxFrameDecision decision) {
@@ -933,6 +948,7 @@ public class VulkanPipeline {
             cacheFeedbackPass.clearPendingFeedback();
             diffuseRadianceCache.reset();
             specularTransportCache.reset();
+            surfaceDirectLightCache.reset();
             Vulkanite.INSTANCE.getSectionLightManager().clear();
             resetTemporalHistory();
         }
@@ -1030,6 +1046,7 @@ public class VulkanPipeline {
             cacheFeedbackPass.clearPendingFeedback();
             diffuseRadianceCache.reset();
             specularTransportCache.reset();
+            surfaceDirectLightCache.reset();
             resetTemporalHistory();
         }
         shaderpackInitialized = true;
@@ -1049,6 +1066,7 @@ public class VulkanPipeline {
         dlssdProcessor.cleanup();
         diffuseRadianceCache.destroy();
         specularTransportCache.destroy();
+        surfaceDirectLightCache.destroy();
         cacheFeedbackPass.destroy();
         cacheResolvePass.destroy();
         renderPassExecutor.destroy();

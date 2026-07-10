@@ -371,6 +371,33 @@ layout(binding = 29, std430) readonly buffer SpecularTransportFillRequestBuffer 
     SpecularTransportFillRequest specularTransportFillRequests[];
 };
 
+struct SurfaceDirectLightCacheEntry {
+    ivec4 key; // xyz=block cell, w=dominant geometric face
+    uvec4 metadata; // x=covered lights, y=state, z=last use, w=coverage cursor
+    // Three uints per light: stable relative position/emission/radius, RGB,
+    // then a 4x4 grid of 2-bit face-sample visibilities. No reorderable table indices.
+    uvec4 lightRecords[72];
+    // x=four R8 sun visibility samples, y=state, z=direction signature, w=last use
+    uvec4 directionalVisibility;
+    // x/y=radius-2 geometry/light group versions for the owning section
+    uvec4 dependencyVersion;
+};
+
+layout(binding = 30, std430) coherent buffer SurfaceDirectLightCacheBuffer {
+    uvec4 surfaceDirectLightCacheHeader; // x=entry count, y=generation, z=hash probes
+    SurfaceDirectLightCacheEntry surfaceDirectLightCacheEntries[];
+};
+
+struct SurfaceDirectLightFillRequest {
+    ivec4 key;
+    vec4 surfacePosition;
+};
+
+layout(binding = 31, std430) readonly buffer SurfaceDirectLightFillRequestBuffer {
+    uvec4 surfaceDirectLightFillRequestHeader; // x=request count, y=generation, z=capacity
+    SurfaceDirectLightFillRequest surfaceDirectLightFillRequests[];
+};
+
 #if ENABLE_DLSS_RR
 // DLSS Motion Vectors (RG16F) - pixel-space motion for temporal reprojection
 layout(binding = 13, rg16f) uniform image2D motionVectors;
@@ -777,9 +804,33 @@ bool findSectionLightGridRange(ivec3 sectionOrigin, out int firstLight, out int 
 #endif
 }
 
+bool findSurfaceDependencyVersion(vec3 worldPos, out uvec2 version) {
+    version = uvec2(0u);
+    int gridRecordCount = int(sectionLightHeader.w);
+    if (gridRecordCount <= 0) return false;
+    ivec3 sectionOrigin = ivec3(floor(worldPos / 16.0)) * 16;
+    ivec3 sectionCoord = sectionOrigin / 16;
+    uint directoryMask = uint(gridRecordCount - 1);
+    uint hash = sectionLightGridHash(sectionCoord);
+    int directoryBase = int(sectionLightHeader.x);
+    int probeLimit = min(SECTION_LIGHT_GRID_HASH_PROBES, gridRecordCount);
+    for (int probe = 0; probe < probeLimit; probe++) {
+        int directoryIndex = int((hash + uint(probe)) & directoryMask);
+        GpuSectionLight record = sectionLightRecords[directoryBase + directoryIndex];
+        if (record.colorEmission.w == 0u) return false;
+        if (all(equal(record.posRadiusFlags.xyz, sectionOrigin))) {
+            version = record.colorEmission.yz;
+            return true;
+        }
+    }
+    return false;
+}
+
 float sectionLightBlocklightMaxDistance(float radius) {
-    float cascadeScale = clamp(float(SECTION_LIGHT_PROBE_CASCADE_DISTANCE_SCALE), 1.0, 4.0);
-    return max(radius + 1.0, radius * cascadeScale);
+    // IRLights point emitters have a finite physical radius. Do not expand the
+    // light range with probe-cascade tuning: that makes unrelated emitters
+    // overlap and gives surfaces an apparently incorrect light direction.
+    return max(radius, 1.0);
 }
 
 float sectionLightNormalizedEmission(GpuSectionLight light) {
@@ -787,8 +838,12 @@ float sectionLightNormalizedEmission(GpuSectionLight light) {
 }
 
 float sectionLightDistanceAttenuation(float distance, float maxDistance) {
-    float attenuation = smoothstep(maxDistance, 0.0, distance);
-    return attenuation * attenuation;
+    // IRLights/Frostbite radial window: (1 - (distance / radius)^4)^2.
+    float normalizedDistance = clamp(distance / max(maxDistance, 0.001), 0.0, 1.0);
+    float distance2 = normalizedDistance * normalizedDistance;
+    float distance4 = distance2 * distance2;
+    float falloff = max(1.0 - distance4, 0.0);
+    return falloff * falloff;
 }
 
 vec3 evaluateSectionLightRecord(
@@ -3143,6 +3198,7 @@ vec3 traceSimpleRadiance(
     vec3 sunDirection,
     vec3 sunRadiance,
     float ignoredBlockId,
+    bool diffuseIncidentContract,
     out float hitDistance
 ) {
     payload.hitData = vec4(0.0, 0.0, 0.0, -1.0);
@@ -3168,7 +3224,7 @@ vec3 traceSimpleRadiance(
         rayOrigin,
         0.001,
         rayDirection,
-        REFLECTION_RAY_DISTANCE,
+        diffuseIncidentContract ? 100.0 : REFLECTION_RAY_DISTANCE,
         0);
 
     if (payload.hitData.w < 0.0) {
@@ -3183,15 +3239,27 @@ vec3 traceSimpleRadiance(
     float visibility = nDotL > 0.0 && sunLuma > 0.0001
         ? alphaAwareVisibility(payload.hitData.xyz + hitNormal * 0.02, sunDirection, 10000.0)
         : 0.0;
-    vec3 surfaceColor = mix(
-        payload.material.albedo,
-        payload.material.F0,
-        clamp(payload.material.metallic, 0.0, 1.0));
+    vec3 hitAlbedo = max(payload.material.albedo, vec3(0.0));
     float hitAo = clamp(payload.material.ambientOcclusion, 0.0, 1.0);
-    vec3 ambient = surfaceColor * (0.025 + 0.04 * hitAo);
+    vec3 surfaceColor = diffuseIncidentContract
+        ? hitAlbedo
+        : mix(
+            hitAlbedo,
+            payload.material.F0,
+            clamp(payload.material.metallic, 0.0, 1.0));
+    // Diffuse cache entries use the exact first-bounce incident-radiance
+    // publication contract. Reflection/refraction transport preserves its
+    // brighter simple-environment approximation.
+    vec3 ambient = diffuseIncidentContract
+        ? hitAlbedo
+            * (vec3(0.025, 0.03, 0.04) + sunRadiance * 0.018)
+            * AMBIENT_FACTOR
+            * (0.12 + 0.38 * hitAo)
+        : surfaceColor * (0.025 + 0.04 * hitAo);
+    float directScale = diffuseIncidentContract ? 1.0 : 0.55;
     return max(
         payload.material.emission
-        + surfaceColor * sunRadiance * nDotL * visibility * 0.55
+        + surfaceColor * sunRadiance * nDotL * visibility * directScale
         + ambient,
         vec3(0.0));
 }
@@ -3321,7 +3389,10 @@ void populateRequestedDiffuseRadianceCache(vec3 sunDirection, vec3 sunRadiance) 
     }
 
     vec3 normal = diffuseRadianceNormal(key.w);
-    vec3 rayOrigin = request.rayOrigin.xyz + normal * 0.02;
+    // World-cache samples must not depend on whichever screen pixel won the
+    // request race. Sample the deterministic center of the keyed block face;
+    // deferred resolve blends neighboring compatible face entries.
+    vec3 rayOrigin = vec3(key.xyz) + vec3(0.5) + normal * 0.52;
     vec3 radiance = vec3(0.0);
     float hitDistance = 10000.0;
     const uint raysPerFill = 8u;
@@ -3336,6 +3407,7 @@ void populateRequestedDiffuseRadianceCache(vec3 sunDirection, vec3 sunRadiance) 
             sunDirection,
             sunRadiance,
             0.0,
+            true,
             sampleHitDistance);
         hitDistance = min(hitDistance, sampleHitDistance);
     }
@@ -3582,6 +3654,7 @@ void populateRequestedSpecularTransportCache(vec3 sunDirection, vec3 sunRadiance
             sunDirection,
             sunRadiance,
             0.0,
+            false,
             reflectionDistance);
     } else {
         int medium = int(detail & 0xffu);
@@ -3594,6 +3667,7 @@ void populateRequestedSpecularTransportCache(vec3 sunDirection, vec3 sunRadiance
             sunDirection,
             sunRadiance,
             ignoredBlockId,
+            false,
             reflectionDistance);
         refractedRadiance = traceSimpleRadiance(
             surfaceOrigin - normal * 0.02,
@@ -3601,6 +3675,7 @@ void populateRequestedSpecularTransportCache(vec3 sunDirection, vec3 sunRadiance
             sunDirection,
             sunRadiance,
             ignoredBlockId,
+            false,
             refractionDistance);
     }
 
@@ -3612,6 +3687,489 @@ void populateRequestedSpecularTransportCache(vec3 sunDirection, vec3 sunRadiance
     memoryBarrierBuffer();
     uint readyState = 0x80000000u | (specularTransportCacheHeader.y & 0x3fffffffu);
     atomicExchange(specularTransportCacheEntries[entryIndex].metadata.w, readyState);
+}
+
+uint surfaceDirectLightCacheHash(ivec4 key) {
+    uint value = uint(key.x) * 0x9e3779b9u;
+    value ^= uint(key.y) * 0x85ebca6bu;
+    value ^= uint(key.z) * 0xc2b2ae35u;
+    value ^= uint(key.w) * 0x27d4eb2du;
+    return diffuseRadianceHashMix(value ^ 0x6d2b79f5u);
+}
+
+uint surfaceDirectLightGeneration() {
+    return surfaceDirectLightCacheHeader.y & 0x1fffffffu;
+}
+
+uint surfaceDirectLightReadyState() {
+    return 0x80000000u | surfaceDirectLightGeneration();
+}
+
+uint surfaceDirectLightFillState() {
+    return 0x40000000u | surfaceDirectLightGeneration();
+}
+
+uint surfaceDirectLightPartialState() {
+    return 0x20000000u | surfaceDirectLightGeneration();
+}
+
+vec3 surfaceDirectLightSunDirection() {
+    vec3 sunDirWorld = vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ);
+    if (dot(sunDirWorld, sunDirWorld) < 0.000001) {
+        sunDirWorld = vec3(0.5, 1.0, 0.2);
+    }
+    sunDirWorld = normalize(sunDirWorld);
+    return sunDirWorld;
+}
+
+uint surfaceDirectLightSunSignature(vec3 direction) {
+    ivec3 quantized = ivec3(round(normalize(direction) * 32.0));
+    uint value = uint(quantized.x) * 0x9e3779b9u;
+    value ^= uint(quantized.y) * 0x85ebca6bu;
+    value ^= uint(quantized.z) * 0xc2b2ae35u;
+    return diffuseRadianceHashMix(value ^ 0x51ed270bu);
+}
+
+int claimSurfaceDirectLightCacheEntry(
+    ivec4 key,
+    uint sunSignature,
+    uvec2 dependencyVersion
+) {
+    uint entryCount = surfaceDirectLightCacheHeader.x;
+    uint probeCount = min(surfaceDirectLightCacheHeader.z, 8u);
+    if (entryCount == 0u || probeCount == 0u) return -1;
+
+    uint readyState = surfaceDirectLightReadyState();
+    uint fillState = surfaceDirectLightFillState();
+    uint partialState = surfaceDirectLightPartialState();
+    uint slot = surfaceDirectLightCacheHash(key) % entryCount;
+    int coldReadyIndex = -1;
+    uint coldReadyAge = 0u;
+    for (uint probe = 0u; probe < 8u; probe++) {
+        if (probe >= probeCount) break;
+        uint index = (slot + probe) % entryCount;
+        uint state = atomicAdd(surfaceDirectLightCacheEntries[index].metadata.y, 0u);
+        bool keyMatches = all(equal(surfaceDirectLightCacheEntries[index].key, key));
+        bool dependencyMatches = all(equal(
+            surfaceDirectLightCacheEntries[index].dependencyVersion.xy,
+            dependencyVersion));
+        if (keyMatches && !dependencyMatches
+                && (state == readyState || state == partialState)) {
+            if (atomicCompSwap(
+                    surfaceDirectLightCacheEntries[index].metadata.y,
+                    state,
+                    fillState) == state) {
+                surfaceDirectLightCacheEntries[index].metadata.x = 0u;
+                surfaceDirectLightCacheEntries[index].metadata.z = pc.frameIndex;
+                surfaceDirectLightCacheEntries[index].metadata.w = 0u;
+                surfaceDirectLightCacheEntries[index].directionalVisibility = uvec4(0u);
+                surfaceDirectLightCacheEntries[index].dependencyVersion =
+                    uvec4(dependencyVersion, 0u, 0u);
+                return int(index);
+            }
+            return -1;
+        }
+        if (state == readyState && keyMatches) {
+            atomicMax(surfaceDirectLightCacheEntries[index].metadata.z, pc.frameIndex);
+            uint sunState = atomicAdd(
+                surfaceDirectLightCacheEntries[index].directionalVisibility.y, 0u);
+            uint storedSunSignature = surfaceDirectLightCacheEntries[index].directionalVisibility.z;
+            return sunState == readyState && storedSunSignature == sunSignature
+                ? -1
+                : int(index);
+        }
+        if (state == partialState && keyMatches) {
+            if (atomicCompSwap(
+                    surfaceDirectLightCacheEntries[index].metadata.y,
+                    partialState,
+                    fillState) == partialState) {
+                return int(index);
+            }
+            return -1;
+        }
+        if (state == readyState) {
+            uint age = pc.frameIndex - surfaceDirectLightCacheEntries[index].metadata.z;
+            if (age >= 120u && (coldReadyIndex < 0 || age > coldReadyAge)) {
+                coldReadyIndex = int(index);
+                coldReadyAge = age;
+            }
+            continue;
+        }
+        if (state == fillState || state == partialState) continue;
+        if (atomicCompSwap(surfaceDirectLightCacheEntries[index].metadata.y, state, fillState) == state) {
+            surfaceDirectLightCacheEntries[index].key = key;
+            surfaceDirectLightCacheEntries[index].metadata.x = 0u;
+            surfaceDirectLightCacheEntries[index].metadata.z = pc.frameIndex;
+            surfaceDirectLightCacheEntries[index].metadata.w = 0u;
+            surfaceDirectLightCacheEntries[index].directionalVisibility = uvec4(0u);
+            surfaceDirectLightCacheEntries[index].dependencyVersion =
+                uvec4(dependencyVersion, 0u, 0u);
+            return int(index);
+        }
+    }
+
+    if (coldReadyIndex >= 0
+            && atomicCompSwap(
+                surfaceDirectLightCacheEntries[coldReadyIndex].metadata.y,
+                readyState,
+                fillState) == readyState) {
+        surfaceDirectLightCacheEntries[coldReadyIndex].key = key;
+        surfaceDirectLightCacheEntries[coldReadyIndex].metadata.x = 0u;
+        surfaceDirectLightCacheEntries[coldReadyIndex].metadata.z = pc.frameIndex;
+        surfaceDirectLightCacheEntries[coldReadyIndex].metadata.w = 0u;
+        surfaceDirectLightCacheEntries[coldReadyIndex].directionalVisibility = uvec4(0u);
+        surfaceDirectLightCacheEntries[coldReadyIndex].dependencyVersion =
+            uvec4(dependencyVersion, 0u, 0u);
+        return coldReadyIndex;
+    }
+    return -1;
+}
+
+float evaluateSurfaceDirectLightVisibility(
+    GpuSectionLight light,
+    vec3 worldPos,
+    vec3 normal
+) {
+    vec3 lightColor = vec3(light.colorEmission.rgb) * (1.0 / 255.0);
+    float emission = sectionLightNormalizedEmission(light);
+    if (emission <= 0.0
+            || dot(lightColor, vec3(0.2126, 0.7152, 0.0722)) <= 0.0001) {
+        return 0.0;
+    }
+
+    float radius = max(float(light.posRadiusFlags.w & 0xFFFF), 1.0);
+    vec3 lightPos = vec3(light.posRadiusFlags.xyz) + vec3(0.5);
+    vec3 toLight = lightPos - worldPos;
+    float dist2 = dot(toLight, toLight);
+    float maxDistance = sectionLightBlocklightMaxDistance(radius);
+    if (dist2 <= 0.0001 || dist2 > maxDistance * maxDistance) return 0.0;
+
+    float distance = sqrt(dist2);
+    // Visibility is geometry-only. IRLights shares one shadow result between
+    // diffuse and specular and applies the actual per-pixel normal afterward.
+    // Baking N.L from the representative block face makes normal-mapped pixels
+    // inherit the wrong light direction.
+    vec3 rayOrigin = worldPos + normal * 0.025;
+    vec3 rayToLight = lightPos - rayOrigin;
+    float rayDistance = length(rayToLight);
+    float visibility = rayDistance > 0.0001
+        ? alphaAwareVisibility(
+            rayOrigin,
+            rayToLight / rayDistance,
+            sectionLightVisibilityDistanceToSource(rayDistance, rayToLight / rayDistance))
+        : 1.0;
+    return visibility;
+}
+
+bool surfaceDirectLightCanAffectFace(
+    GpuSectionLight light,
+    ivec3 surfaceCell,
+    vec3 normal
+) {
+    vec3 lightColor = vec3(light.colorEmission.rgb) * (1.0 / 255.0);
+    float emission = sectionLightNormalizedEmission(light);
+    if (emission <= 0.0
+            || dot(lightColor, vec3(0.2126, 0.7152, 0.0722)) <= 0.0001) {
+        return false;
+    }
+
+    float radius = max(float(light.posRadiusFlags.w & 0xFFFF), 1.0);
+    vec3 faceCenter = vec3(surfaceCell) + vec3(0.5) + normal * 0.5;
+    vec3 lightPos = vec3(light.posRadiusFlags.xyz) + vec3(0.5);
+    vec3 delta = lightPos - faceCenter;
+    float normalDistance = dot(delta, normal);
+    // A point behind the owning face cannot contribute to that face's diffuse
+    // or GGX response. Keeping it in the finite coverage list wastes one of
+    // the 96 local-light slots and can omit the actual nearby emitter.
+    if (normalDistance <= 0.0) {
+        return false;
+    }
+
+    vec3 tangentU;
+    vec3 tangentV;
+    if (abs(normal.x) > 0.5) {
+        tangentU = vec3(0.0, 1.0, 0.0);
+        tangentV = vec3(0.0, 0.0, 1.0);
+    } else if (abs(normal.y) > 0.5) {
+        tangentU = vec3(1.0, 0.0, 0.0);
+        tangentV = vec3(0.0, 0.0, 1.0);
+    } else {
+        tangentU = vec3(1.0, 0.0, 0.0);
+        tangentV = vec3(0.0, 1.0, 0.0);
+    }
+
+    const float faceHalfExtent = 0.75;
+    float tangentDistanceU = max(abs(dot(delta, tangentU)) - faceHalfExtent, 0.0);
+    float tangentDistanceV = max(abs(dot(delta, tangentV)) - faceHalfExtent, 0.0);
+    float closestDistance2 =
+        normalDistance * normalDistance
+        + tangentDistanceU * tangentDistanceU
+        + tangentDistanceV * tangentDistanceV;
+    return closestDistance2 <= radius * radius;
+}
+
+void storeSurfaceDirectLightVisibility(
+    int entryIndex,
+    int coverageIndex,
+    ivec3 surfaceCell,
+    GpuSectionLight light,
+    int sampleIndex,
+    float visibility
+) {
+    uint quantizedVisibility = uint(round(clamp(visibility, 0.0, 1.0) * 3.0));
+    int identityScalar = coverageIndex * 3;
+    int identityVector = identityScalar >> 2;
+    int identityComponent = identityScalar & 3;
+    int payloadScalar = identityScalar + 1;
+    int payloadVector = payloadScalar >> 2;
+    int payloadComponent = payloadScalar & 3;
+    int visibilityScalar = identityScalar + 2;
+    int visibilityVector = visibilityScalar >> 2;
+    int visibilityComponent = visibilityScalar & 3;
+    if (sampleIndex == 0) {
+        ivec3 relativePosition = clamp(
+            light.posRadiusFlags.xyz - surfaceCell,
+            ivec3(-64),
+            ivec3(63));
+        uint packedRadius = uint(clamp(light.posRadiusFlags.w & 0xFFFF, 1, 127));
+        uint packedIdentity = uint(relativePosition.x + 64)
+            | (uint(relativePosition.y + 64) << 7u)
+            | (uint(relativePosition.z + 64) << 14u)
+            | ((light.colorEmission.a & 15u) << 21u)
+            | (packedRadius << 25u);
+        surfaceDirectLightCacheEntries[entryIndex]
+            .lightRecords[identityVector][identityComponent] = packedIdentity;
+        surfaceDirectLightCacheEntries[entryIndex]
+            .lightRecords[payloadVector][payloadComponent] =
+                (light.colorEmission.r & 255u)
+                | ((light.colorEmission.g & 255u) << 8u)
+                | ((light.colorEmission.b & 255u) << 16u);
+        surfaceDirectLightCacheEntries[entryIndex]
+            .lightRecords[visibilityVector][visibilityComponent] = 0u;
+    }
+    uint packed = surfaceDirectLightCacheEntries[entryIndex]
+        .lightRecords[visibilityVector][visibilityComponent];
+    uint shift = uint(sampleIndex & 15) * 2u;
+    packed = (packed & ~(3u << shift)) | (quantizedVisibility << shift);
+    surfaceDirectLightCacheEntries[entryIndex]
+        .lightRecords[visibilityVector][visibilityComponent] = packed;
+}
+
+vec3 surfaceDirectLightSamplePosition(
+    ivec3 surfaceCell,
+    vec3 normal,
+    int sampleIndex
+) {
+    vec3 tangentU;
+    vec3 tangentV;
+    if (abs(normal.x) > 0.5) {
+        tangentU = vec3(0.0, 1.0, 0.0);
+        tangentV = vec3(0.0, 0.0, 1.0);
+    } else if (abs(normal.y) > 0.5) {
+        tangentU = vec3(1.0, 0.0, 0.0);
+        tangentV = vec3(0.0, 0.0, 1.0);
+    } else {
+        tangentU = vec3(1.0, 0.0, 0.0);
+        tangentV = vec3(0.0, 1.0, 0.0);
+    }
+    int sampleX = sampleIndex & 3;
+    int sampleY = (sampleIndex >> 2) & 3;
+    float u = (float(sampleX) + 0.5) * 0.25 - 0.5;
+    float v = (float(sampleY) + 0.5) * 0.25 - 0.5;
+    return vec3(surfaceCell) + vec3(0.5) + normal * 0.5
+        + tangentU * u + tangentV * v;
+}
+
+bool claimSurfaceDirectionalVisibility(int entryIndex, uint sunSignature) {
+    uint readyState = surfaceDirectLightReadyState();
+    uint fillState = surfaceDirectLightFillState();
+    uint state = atomicAdd(
+        surfaceDirectLightCacheEntries[entryIndex].directionalVisibility.y, 0u);
+    uint storedSignature = surfaceDirectLightCacheEntries[entryIndex].directionalVisibility.z;
+    if ((state == readyState || state == fillState)
+            && storedSignature == sunSignature) {
+        return false;
+    }
+    if (state == fillState
+            || atomicCompSwap(
+                surfaceDirectLightCacheEntries[entryIndex].directionalVisibility.y,
+                state,
+                fillState) != state) {
+        return false;
+    }
+    surfaceDirectLightCacheEntries[entryIndex].directionalVisibility.x = 0u;
+    surfaceDirectLightCacheEntries[entryIndex].directionalVisibility.z = sunSignature;
+    surfaceDirectLightCacheEntries[entryIndex].directionalVisibility.w = pc.frameIndex;
+    return true;
+}
+
+void populateSurfaceDirectionalVisibility(
+    int entryIndex,
+    ivec3 surfaceCell,
+    vec3 normal,
+    vec3 sunDirection,
+    uint sunSignature
+) {
+    if (!claimSurfaceDirectionalVisibility(entryIndex, sunSignature)) return;
+
+    uint packedVisibility = 0u;
+    for (int sampleIndex = 0; sampleIndex < 4; sampleIndex++) {
+        vec3 samplePosition = surfaceDirectLightSamplePosition(
+            surfaceCell, normal, sampleIndex);
+        float visibility = alphaAwareVisibility(
+            samplePosition + normal * 0.025,
+            sunDirection,
+            10000.0);
+        uint quantized = uint(round(clamp(visibility, 0.0, 1.0) * 255.0));
+        packedVisibility |= quantized << (uint(sampleIndex) * 8u);
+    }
+    surfaceDirectLightCacheEntries[entryIndex].directionalVisibility.x = packedVisibility;
+    surfaceDirectLightCacheEntries[entryIndex].directionalVisibility.w = pc.frameIndex;
+    memoryBarrierBuffer();
+    atomicExchange(
+        surfaceDirectLightCacheEntries[entryIndex].directionalVisibility.y,
+        surfaceDirectLightReadyState());
+}
+
+void processSurfaceDirectLightRange(
+    int entryIndex,
+    int firstLight,
+    int rangeCount,
+    int cursor,
+    ivec3 surfaceCell,
+    vec3 normal,
+    inout int coverageCount,
+    inout int processedCount
+) {
+    const int coverageLimit = 96;
+    const int raysPerFill = 20;
+    for (int rangeIndex = 0; rangeIndex < rangeCount; rangeIndex++) {
+        if (coverageCount >= coverageLimit) break;
+        int lightIndex = firstLight + rangeIndex;
+        GpuSectionLight light = sectionLightRecords[lightIndex];
+        if (!surfaceDirectLightCanAffectFace(light, surfaceCell, normal)) {
+            continue;
+        }
+        for (int sampleIndex = 0; sampleIndex < 16; sampleIndex++) {
+            int sampleCursor = coverageCount * 16 + sampleIndex;
+            if (sampleCursor >= cursor && processedCount < raysPerFill) {
+                vec3 samplePosition = surfaceDirectLightSamplePosition(
+                    surfaceCell, normal, sampleIndex);
+                float visibility = evaluateSurfaceDirectLightVisibility(
+                    light, samplePosition, normal);
+                storeSurfaceDirectLightVisibility(
+                    entryIndex,
+                    coverageCount,
+                    surfaceCell,
+                    light,
+                    sampleIndex,
+                    visibility);
+                processedCount++;
+            }
+        }
+        coverageCount++;
+    }
+}
+
+void populateRequestedSurfaceDirectLightCache() {
+    uint requestIndex = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
+    uint requestCount = min(
+        surfaceDirectLightFillRequestHeader.x,
+        surfaceDirectLightFillRequestHeader.z);
+    if (requestIndex >= requestCount
+            || surfaceDirectLightFillRequestHeader.y != surfaceDirectLightCacheHeader.y) {
+        return;
+    }
+
+    SurfaceDirectLightFillRequest request = surfaceDirectLightFillRequests[requestIndex];
+    if (request.key.w < 0 || request.key.w > 5) return;
+    vec3 normal = diffuseRadianceNormal(request.key.w);
+    // Trace a deterministic representative point for the owning block face.
+    // The cached payload is visibility only; resolve evaluates lighting at the
+    // exact G-buffer position, so it no longer produces one RGB value per block.
+    ivec3 surfaceCell = request.key.xyz;
+    vec3 worldPos = vec3(surfaceCell) + vec3(0.5) + normal * 0.5;
+    uvec2 dependencyVersion;
+    vec3 ownerCellCenter = vec3(surfaceCell) + vec3(0.5);
+    if (!findSurfaceDependencyVersion(ownerCellCenter, dependencyVersion)) return;
+    vec3 sunDirection = surfaceDirectLightSunDirection();
+    uint sunSignature = surfaceDirectLightSunSignature(sunDirection);
+    int entryIndex = claimSurfaceDirectLightCacheEntry(
+        request.key, sunSignature, dependencyVersion);
+    if (entryIndex < 0) return;
+
+    populateSurfaceDirectionalVisibility(
+        entryIndex, surfaceCell, normal, sunDirection, sunSignature);
+    if (atomicAdd(surfaceDirectLightCacheEntries[entryIndex].metadata.y, 0u)
+            == surfaceDirectLightReadyState()) {
+        return;
+    }
+
+    int cursor = int(surfaceDirectLightCacheEntries[entryIndex].metadata.w);
+    int coverageCount = 0;
+    int processedCount = 0;
+    bool usedLightDirectory = false;
+
+#if SECTION_LIGHT_GRID_ENABLE != 0
+    if (sectionLightHeader.w > 0u) {
+        usedLightDirectory = true;
+        ivec3 baseSectionOrigin = ivec3(floor(ownerCellCenter / 16.0)) * 16;
+        for (int manhattan = 0; manhattan <= SECTION_LIGHT_GRID_SEARCH_RADIUS * 3; manhattan++) {
+            for (int dz = -SECTION_LIGHT_GRID_SEARCH_RADIUS; dz <= SECTION_LIGHT_GRID_SEARCH_RADIUS; dz++) {
+                for (int dy = -SECTION_LIGHT_GRID_SEARCH_RADIUS; dy <= SECTION_LIGHT_GRID_SEARCH_RADIUS; dy++) {
+                    for (int dx = -SECTION_LIGHT_GRID_SEARCH_RADIUS; dx <= SECTION_LIGHT_GRID_SEARCH_RADIUS; dx++) {
+                        if (abs(dx) + abs(dy) + abs(dz) != manhattan || coverageCount >= 96) continue;
+                        int firstLight;
+                        int rangeCount;
+                        if (!findSectionLightGridRange(
+                                baseSectionOrigin + ivec3(dx, dy, dz) * 16,
+                                firstLight,
+                                rangeCount)) {
+                            continue;
+                        }
+                        processSurfaceDirectLightRange(
+                            entryIndex,
+                            firstLight,
+                            rangeCount,
+                            cursor,
+                            surfaceCell,
+                            normal,
+                            coverageCount,
+                            processedCount);
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+    // Only old/no-directory layouts use the global fallback. An empty local
+    // group is genuinely dark; borrowing unrelated world emitters produces
+    // rotating, physically impossible light directions.
+    if (!usedLightDirectory) {
+        int totalLightCount = min(int(sectionLightHeader.x), 96);
+        processSurfaceDirectLightRange(
+            entryIndex,
+            0,
+            totalLightCount,
+            cursor,
+            surfaceCell,
+            normal,
+            coverageCount,
+            processedCount);
+    }
+
+    int totalSampleCount = coverageCount * 16;
+    int nextCursor = min(cursor + processedCount, totalSampleCount);
+    surfaceDirectLightCacheEntries[entryIndex].metadata.x = uint(coverageCount);
+    surfaceDirectLightCacheEntries[entryIndex].metadata.z = pc.frameIndex;
+    surfaceDirectLightCacheEntries[entryIndex].metadata.w = uint(nextCursor);
+    memoryBarrierBuffer();
+    atomicExchange(
+        surfaceDirectLightCacheEntries[entryIndex].metadata.y,
+        nextCursor >= totalSampleCount
+            ? surfaceDirectLightReadyState()
+            : surfaceDirectLightPartialState());
 }
 
 // ============================================================================
@@ -3760,6 +4318,14 @@ void main() {
 if (pc.cacheOnHit < 0) {
     populateRequestedSectionLightProbeRtCacheCell();
     uint cacheRequestIndex = gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x + gl_LaunchIDEXT.x;
+    bool hasSurfaceDirectRequest =
+        surfaceDirectLightFillRequestHeader.y == surfaceDirectLightCacheHeader.y
+        && cacheRequestIndex < min(
+            surfaceDirectLightFillRequestHeader.x,
+            surfaceDirectLightFillRequestHeader.z);
+    if (hasSurfaceDirectRequest) {
+        populateRequestedSurfaceDirectLightCache();
+    }
     bool hasDiffuseRequest =
         diffuseRadianceFillRequestHeader.y == diffuseRadianceCacheHeader.y
         && cacheRequestIndex < min(
@@ -3773,11 +4339,11 @@ if (pc.cacheOnHit < 0) {
     if (!hasDiffuseRequest && !hasSpecularRequest) {
         return;
     }
-    vec3 cacheSunDirView = vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ);
-    if (dot(cacheSunDirView, cacheSunDirView) < 0.000001) {
-        cacheSunDirView = vec3(0.5, 1.0, 0.2);
+    vec3 cacheSunDirWorld = vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ);
+    if (dot(cacheSunDirWorld, cacheSunDirWorld) < 0.000001) {
+        cacheSunDirWorld = vec3(0.5, 1.0, 0.2);
     }
-    vec3 cacheLightDir = normalize(mat3(cam.viewInverse) * normalize(cacheSunDirView));
+    vec3 cacheLightDir = normalize(cacheSunDirWorld);
     vec3 cacheBaseSunColor = vec3(pc.sunColorR, pc.sunColorG, pc.sunColorB) * SUN_INTENSITY;
     vec3 cacheSunColor = getSunColorFromElevation(cacheLightDir, cacheBaseSunColor);
     populateRequestedDiffuseRadianceCache(cacheLightDir, cacheSunColor);
@@ -3977,9 +4543,9 @@ if (pc.debugMode == 1) {
   }
 
   // Calculate sun direction and color globally for sky and lighting
-  vec3 sunDirView = vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ);
-  if (dot(sunDirView, sunDirView) < 0.000001) sunDirView = vec3(0.5, 1.0, 0.2); // Default
-  vec3 lightDir = normalize(mat3(cam.viewInverse) * normalize(sunDirView));
+  vec3 sunDirWorld = vec3(pc.sunDirX, pc.sunDirY, pc.sunDirZ);
+  if (dot(sunDirWorld, sunDirWorld) < 0.000001) sunDirWorld = vec3(0.5, 1.0, 0.2); // Default
+  vec3 lightDir = normalize(sunDirWorld);
   // Apply sun elevation-based color temperature for natural lighting
   // Low sun = warm orange (sunset/sunrise), high sun = neutral white
   vec3 baseSunColor = vec3(pc.sunColorR, pc.sunColorG, pc.sunColorB) * SUN_INTENSITY;
@@ -4672,6 +5238,7 @@ if (refractiveSurface) {
         lightDir,
         sunColor,
         blockId,
+        false,
         reflectionDistance);
 
     float ior = waterSurface ? 1.333 : (iceSurface ? 1.31 : (crystalSurface ? 2.20 : 1.50));
@@ -4688,6 +5255,7 @@ if (refractiveSurface) {
             lightDir,
             sunColor,
             blockId,
+            false,
             refractionDistance);
     }
 

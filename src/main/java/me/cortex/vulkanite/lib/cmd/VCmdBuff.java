@@ -208,6 +208,20 @@ public class VCmdBuff extends VObject {
         addBufferRef(dest);
     }
 
+    public void encodeFillBuffer(VRef<VBuffer> buffer, long offset, long size, int data) {
+        if (offset % 4 != 0) {
+            throw new IllegalArgumentException("offset must be 4-byte aligned");
+        }
+        if (size != VK_WHOLE_SIZE && size % 4 != 0) {
+            throw new IllegalArgumentException("size must be 4-byte aligned or VK_WHOLE_SIZE");
+        }
+        if (size != VK_WHOLE_SIZE && offset + size > buffer.get().size()) {
+            throw new IllegalArgumentException("offset + size exceeds buffer capacity");
+        }
+        vkCmdFillBuffer(this.buffer, buffer.get().buffer(), offset, size, data);
+        addBufferRef(buffer);
+    }
+
     public void encodeDataUpload(MemoryManager manager, long src, final VRef<VBuffer> dest, long destOffset,
             long size) {
         VRef<VBuffer> staging = manager.createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,

@@ -1,6 +1,7 @@
 package me.cortex.vulkanite.client;
 
 import me.cortex.vulkanite.acceleration.AccelerationManager;
+import me.cortex.vulkanite.client.config.VulkaniteConfig;
 import me.cortex.vulkanite.client.lighting.SectionLightManager;
 import me.cortex.vulkanite.client.rendering.DLSSBridge;
 import me.cortex.vulkanite.lib.base.VContext;
@@ -16,12 +17,15 @@ import me.jellysquid.mods.sodium.client.render.chunk.compile.ChunkBuildOutput;
 import net.minecraft.util.Util;
 import org.lwjgl.opengl.GL20;
 import org.lwjgl.vulkan.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 
 import static org.lwjgl.vulkan.EXTDescriptorIndexing.VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME;
+import static org.lwjgl.vulkan.EXTDebugUtils.VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRDeferredHostOperations.VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRExternalFenceCapabilities.VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME;
@@ -43,6 +47,8 @@ import static org.lwjgl.vulkan.KHRSpirv14.VK_KHR_SPIRV_1_4_EXTENSION_NAME;
 import static org.lwjgl.vulkan.VK10.vkDeviceWaitIdle;
 
 public class Vulkanite {
+    private static final Logger LOGGER = LoggerFactory.getLogger(Vulkanite.class);
+    private static final String KHRONOS_VALIDATION_LAYER = "VK_LAYER_KHRONOS_validation";
     public static final boolean IS_WINDOWS = Util.getOperatingSystem() == Util.OperatingSystem.WINDOWS;
 
     public static boolean IS_ENABLED = true;
@@ -60,6 +66,7 @@ public class Vulkanite {
 
     public Vulkanite() {
         ctx = createVulkanContext();
+        ctx.capabilities.logReport(LOGGER);
         // Hack: so that AccelerationManager can access Vulkanite.INSTANCE
         INSTANCE = this;
 
@@ -188,6 +195,10 @@ public class Vulkanite {
             emptyDescriptorSets.clear();
         }
         descriptorPools.clear();
+        if (ctx.validationEnabled) {
+            LOGGER.info("Vulkan validation summary: {} error(s), {} warning(s)",
+                    ctx.validationErrorCount(), ctx.validationWarningCount());
+        }
     }
 
     private static VContext createVulkanContext() {
@@ -197,6 +208,20 @@ public class Vulkanite {
         instanceExtensions.add(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
         instanceExtensions.add(VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME);
         instanceExtensions.add(VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME);
+
+        List<String> instanceLayers = new ArrayList<>();
+        boolean validationEnabled = VulkaniteConfig.getInstance().isVulkanValidationEnabled();
+        if (validationEnabled) {
+            requireValidationSupport();
+            instanceExtensions.add(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            instanceLayers.add(KHRONOS_VALIDATION_LAYER);
+            LOGGER.info("Vulkan validation enabled (layer {}, extension {})",
+                    KHRONOS_VALIDATION_LAYER, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        } else {
+            LOGGER.info("Vulkan validation disabled; enable with -D{}=true, {}=true, or vulkanValidationEnabled=true",
+                    VulkaniteConfig.VULKAN_VALIDATION_SYSTEM_PROPERTY,
+                    VulkaniteConfig.VULKAN_VALIDATION_ENVIRONMENT_VARIABLE);
+        }
 
         // Add NGX-required instance extensions for DLSS support
         // These MUST be enabled at instance creation time or NGX will report FeatureNotSupported
@@ -214,8 +239,7 @@ public class Vulkanite {
 
         var init = new VInitializer("Vulkan test", "Vulkanite", 1, 3,
                 instanceExtensions.toArray(new String[0]),
-                new String[] {
-                });
+                instanceLayers.toArray(new String[0]));
 
         // This copies whatever gpu the opengl context is on
         init.findPhysicalDevice();// glGetString(GL_RENDERER).split("/")[0]
@@ -306,6 +330,19 @@ public class Vulkanite {
                         }));
 
         return init.createContext();
+    }
+
+    private static void requireValidationSupport() {
+        if (!VInitializer.isInstanceLayerAvailable(KHRONOS_VALIDATION_LAYER)) {
+            throw new IllegalStateException("Vulkan validation was requested, but instance layer "
+                    + KHRONOS_VALIDATION_LAYER + " is unavailable. Install the Vulkan SDK validation layers "
+                    + "or disable Vulkanite validation.");
+        }
+        if (!VInitializer.isInstanceExtensionAvailable(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+            throw new IllegalStateException("Vulkan validation was requested, but instance extension "
+                    + VK_EXT_DEBUG_UTILS_EXTENSION_NAME + " is unavailable. Update the Vulkan loader "
+                    + "or disable Vulkanite validation.");
+        }
     }
 
     public AccelerationManager getAccelerationManager() {

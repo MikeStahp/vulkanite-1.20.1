@@ -6,6 +6,7 @@ public record CacheRequestStats(
         int diffuseRadianceBacklog,
         int reflectionBacklog,
         int refractionBacklog,
+        int surfaceDirectLightBacklog,
         int lastBatchSize,
         long enqueued,
         long merged,

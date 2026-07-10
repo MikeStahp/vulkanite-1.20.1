@@ -82,6 +82,8 @@ final class RtxPassGraph {
                     frame.diffuseRadianceFillRequestBuffer(),
                     frame.specularTransportCacheBuffer(),
                     frame.specularTransportFillRequestBuffer(),
+                    frame.surfaceDirectLightCacheBuffer(),
+                    frame.surfaceDirectLightFillRequestBuffer(),
                     frame.noisyOutput(),
                     frame.rayDispatchWidth(),
                     frame.rayDispatchHeight());
@@ -140,6 +142,8 @@ final class RtxPassGraph {
             VRef<VBuffer> diffuseRadianceFillRequestBuffer,
             VRef<VBuffer> specularTransportCacheBuffer,
             VRef<VBuffer> specularTransportFillRequestBuffer,
+            VRef<VBuffer> surfaceDirectLightCacheBuffer,
+            VRef<VBuffer> surfaceDirectLightFillRequestBuffer,
             VRef<VImage> noisyOutput,
             int renderWidth,
             int renderHeight,

@@ -83,11 +83,14 @@ The relevant project is Redi2Go's Photonics mod. The exact Minecraft 1.20.1
 `inferred` when mapped to Vulkanite):
 
 - Photonics lights deferred surface data rather than making local lighting part
-  of a monolithic final-color pass. Its history validation searches a 5x5
-  neighborhood and requires a close world position plus nearly identical normal.
-- Block lights are stored in 8-block spatial bins. A surface evaluates at most
-  20 unfinished local lights per frame and carries a cursor in temporal history,
-  so completed light work can be reused instead of starting from light zero.
+  of a monolithic final-color pass. Direct light is accumulated per screen pixel;
+  its temporal reprojection searches a 5x5 neighborhood and requires a close
+  world position plus nearly identical normal. It does not publish one direct
+  RGB value for an entire world block.
+- Block lights are stored in 8-block spatial bins. A reprojected surface pixel
+  evaluates at most 20 unfinished local lights per frame and carries a cursor in
+  temporal history, so completed light work can be reused instead of starting
+  from light zero.
 - Indirect light uses a distance-quantized world-surface key containing position
   and axis-normal orientation. A small open-addressed hash cache atomically
   accumulates samples; resolve gathers compatible tangent-plane entries and
@@ -104,17 +107,18 @@ The relevant project is Redi2Go's Photonics mod. The exact Minecraft 1.20.1
   release and is relevant only for selecting among many unfinished lights, not
   as justification for tracing valid cache hits.
 
-Decision for Vulkanite: build a separately keyed surface direct-light cache.
-Key it by section/cell, quantized surface position and normal, geometry version,
-and light-list generation. Store accumulated radiance plus a light cursor or
-coverage state. Section light bins identify relevant lights; only unfinished or
-invalid light slots may create RTX fill requests. Once coverage is complete and
-the versions still match, deferred resolve consumes the entry and the frame stays
-`NO_RT`. Use strict surface validation and edge rejection because the previous
-coarse probe-face reuse leaked across unrelated surfaces. Evaluate hierarchical
-voxel occupancy as the cheaper local-blocklight visibility backend in Part 10;
-do not replace Vulkanite's G-buffer with Photonics' full-screen primary software
-voxel tracing.
+Decision for Vulkanite: adapt Photonics' deferred direct separation to strict
+cache completion. Key a surface visibility entry by owning block face and light
+generation, but store the covered light-table indices plus RTX visibility rather
+than final RGB radiance. Section light bins identify relevant lights; only
+unfinished/invalid visibility slots may trace. Once complete, deferred resolve
+re-evaluates distance falloff, cosine, color, and material response at each exact
+G-buffer pixel and the frame stays `NO_RT`. This preserves RTX-shaped lighting
+without copying Photonics' perpetual probabilistic software-voxel refresh. Use
+strict surface validation and edge rejection because the previous coarse
+probe-face reuse leaked across unrelated surfaces. Evaluate hierarchical voxel
+occupancy only as a cheaper fill backend; do not replace Vulkanite's G-buffer
+with Photonics' full-screen primary software voxel tracing.
 
 ## Current Code-Verified Flow
 
@@ -722,8 +726,8 @@ manual-review rule.
 
 ### Part 10 - Shader Cost After Gating
 
-Status: **in progress** (`bounded-fill source optimization complete`; deferred
-surface-direct cache and manual runtime checkpoint pending)
+Status: **in progress** (`group-local light/shadow correction source-complete`;
+release-permutation cleanup and manual Ancient City checkpoint pending)
 
 - [x] Optimize raygen/closest-hit/any-hit only after RT is no longer mandatory
   every frame.
@@ -749,8 +753,10 @@ acceptable.
 
 Part 10 implementation notes (`code-verified` unless stated otherwise):
 
-- The request-only raygen has three compact request streams: section probes,
-  diffuse radiance, and combined reflection/refraction transport. One launch
+- The request-only raygen supports four compact request streams: legacy section
+  probes, diffuse radiance, combined reflection/refraction transport, and
+  exact-surface direct light. `cache_on_hit` no longer enqueues the legacy
+  section-probe stream because deferred resolve never reads that volume. One launch
   index can service one entry from every stream, so `CacheRequestBatch` now
   dispatches the maximum family-stream length instead of their sum. A balanced
   mixed batch can therefore use about one third as many raygen invocations while
@@ -763,12 +769,14 @@ Part 10 implementation notes (`code-verified` unless stated otherwise):
   local-light visibility rays; a diffuse entry traces eight deterministic
   continuation rays and only sun-tests a hit with nonzero sun contribution; a
   reflection entry traces one continuation; a refraction entry traces reflection
-  plus transmission. Full-frame blocklight discovery, primary visibility,
+  plus transmission; a surface-direct entry advances at most 20 light slots per
+  fill and covers at most 96 section-binned lights before becoming ready.
+  Full-frame blocklight discovery, primary visibility,
   ReSTIR sun work, and volumetric marching occur only in
   `full_rt_reference`, not in request-only dispatches. Volumetric shadow queries
   now also stop when sun radiance is effectively black.
 - Ready-state claims remain before all bounded ray work. An already-ready
-  section, diffuse, reflection, or refraction key returns without tracing; an
+  section, diffuse, reflection, refraction, or surface-direct key returns without tracing; an
   empty visible batch still selects `NO_RT` and skips TLAS construction.
 - Closest-hit and any-hit inspection found no safe fill-only removal: diffuse and
   specular continuation fills require textured albedo, normal, emission, alpha,
@@ -782,20 +790,127 @@ Part 10 implementation notes (`code-verified` unless stated otherwise):
   Those are useful miss-selection/visibility designs, but ReSTIR still traces
   selected visibility every rendered frame and therefore does not provide
   Vulkanite's strict completion rule by itself.
-- Vulkanite already has section-local light ranges and versioned all-face probe
-  completion. The Photonics audit reinforces the next local-light data change:
-  a separately keyed exact-surface direct-light cache with finite light
-  coverage. The earlier coarse probe-face surface reuse remains rejected because
-  it aliases unrelated surfaces across walls. This cache is intentionally still
-  pending rather than reviving that known-bad approximation.
+- Vulkanite now has a separate 32,768-entry surface direct-light visibility
+  cache. Keys use the owning one-block cell plus dominant geometric face;
+  a radius-two section dependency version invalidates only the nearby lighted
+  group when block geometry changes. Each 832-byte entry stores a finite
+  coverage cursor and up to 96 two-word light records: stable surface-relative
+  position/emission/radius/color plus four 2-bit RTX visibility samples. Four R8
+  directional-sun samples use an independent sun-direction signature. Partial
+  entries remain misses and advance at most 20 local-light rays per request.
+  Deferred resolve bilinearly reconstructs visibility across the face and
+  evaluates attenuation, cosine, diffuse response, and specular at the exact
+  G-buffer position. Light-table reordering no longer changes cached identities;
+  emitter and geometry edits invalidate only their radius-two lighted group.
+  Camera rotation changes neither key nor dependency version. The earlier coarse
+  probe-face radiance reuse remains rejected.
+- The first Ancient City runtime checkpoint exposed the dominant convergence
+  failures. The live table held 3,849 lights, while a representative feedback
+  interval had 3,276 section-probe, 3,276 reflection, and 3,020 surface-direct
+  requests. The gate later reported 28,604 fill frames against only 174 `NO_RT`
+  frames, including repeated bounded dispatches for only 2-10 new feedback
+  requests after backlog reached zero. Section-probe fills were dead work for
+  deferred resolve, and the old reflection threshold classified ordinary rough
+  dielectrics as reflective. `cache_on_hit` now clears/rejects legacy probe work;
+  reflection requests are limited to metals or unusually smooth/high-F0
+  dielectrics; and the coarser stable surface key removes sub-block/normal-map
+  churn. Runtime remeasurement is pending.
+- A later Ancient City log isolated camera-turn work: one discovery interval
+  queued 3,225 diffuse entries versus 458 surface-direct entries, and another
+  queued 356 versus 44. Once drained, the same run held `fillFrames=1329` while
+  `NO_RT` advanced past 100,000 frames with backlog zero. The gate therefore
+  converges; provisional screen-discovered diffuse GI was the dominant source of
+  view-dependent rebakes. Diffuse requests are now excluded from mandatory
+  feedback and fill gating until they are backed by a view-independent world
+  light field. Resolve keeps stable ambient instead.
+- A diffuse miss no longer presents flat albedo. Deferred resolve always retains
+  its lightmap/skylight fallback while cache data arrives. Ready local direct
+  visibility replaces the discrete vanilla blocklight guide rather than blending
+  it into the final result. Diffuse world-cache fills now sample deterministic
+  block-face centers, and resolve blends up to four compatible tangent-plane
+  neighbors with conservative eight-ray confidence instead of publishing an
+  unrelated high-confidence RGB estimate per block. Direct sun and analytic sun
+  specular use four-sample cached RTX directional visibility when ready, with
+  squared skylight as the stable miss fallback. Roofed/underground surfaces do
+  not receive the former permanent sun term, and ready directional shadows no
+  longer collapse to one scalar per block.
+- Iris' public `sunPosition` uniform is camera/view space, so using it as a world
+  cache signature made camera rotation resemble a sun change. Vulkanite now
+  obtains Iris' raw world-space celestial position and flips only the shadow ray
+  at night, matching Photonics' `sunVecWorld`/`shadowVec` split. The resolved
+  world-light base contains camera-independent direct, diffuse, and minimum
+  lighting; local specular, cached specular transport, reflection/refraction,
+  and Fresnel response are additive view-dependent layers. They may request
+  their own direction-keyed data, but never invalidate or replace the stable
+  world-light base.
+- The section directory is authoritative even when a nearby group contains zero
+  emitters. The ray fill no longer falls back to the first global light records,
+  which previously let unrelated distant lights create incorrect directions and
+  shadow shapes in empty local groups.
+- Exact IRLights/IRLite `photon.irlights` source establishes the desired local
+  emitter model: an omnidirectional point vector is recomputed from exact world
+  position per pixel; the finite radial window is
+  `(1 - (distance / radius)^4)^2`; one geometry-only shadow visibility is shared
+  by diffuse and GGX specular. Vulkanite now applies those equations to block
+  emitters. It no longer expands emitter range with probe-cascade scale, no
+  longer bakes representative-face `N.L` into visibility, and stores radius in
+  each stable cached light identity. Hardware ray queries replace IRLights'
+  point cube-map shadow bake, while visibility remains resident until the
+  emitter or nearby geometry changes.
+- The next runtime checkpoint showed the gate converges while stationary, but
+  movement still exposes receiver-face misses and the user clarified the bad
+  shadows are from blocklights, not sun/cascade shadows. Source diagnosis:
+  surface-direct local lighting was reserving one of its 96 covered-light slots
+  for every nearby section-light record before proving that the emitter can
+  affect the receiver face. In dense Ancient City sections, irrelevant or
+  back-facing emitters could exhaust the finite coverage list before the correct
+  nearby blocklights were recorded. Vulkanite now rejects zero-emission,
+  out-of-radius, and behind-face local emitters before they consume coverage or
+  RTX rays. The follow-up pollution audit found two more local-cache identity
+  leaks: the persistent block-face key was derived from the shaded/PBR normal
+  stored in the G-buffer, and entity pixels could publish into the same world
+  block-face cache as terrain. Terrain G-buffer normals now keep their shaded
+  RGB for BRDF/DLSS but store a separate negative flat-face marker in alpha;
+  entity G-buffer normals store no terrain-face marker. Feedback and resolve
+  refuse to use or request surface-direct blocklight cache entries unless that
+  marker is present, so normal maps and entities no longer author persistent
+  blocklight visibility. The fill shader also scans the full section-light
+  range until 96 relevant contributors are found instead of considering only
+  the first 96 raw records. Cache layout generation is bumped to 10 so old
+  polluted surface entries are rebuilt. This is still a receiver-surface bridge;
+  the final IRLights-style target is an emitter/light-space shadow cache.
+- The next user checkpoint confirmed normals were fine, but local blocklight
+  shadows still collapsed into black or white block faces. Source diagnosis:
+  each cached local emitter had only four 2-bit receiver-face visibility
+  samples, so a sparse binary ray result could replace the entire blocklight
+  fallback with a whole-face shadow or whole-face light. The surface-direct
+  entry layout now stores three words per covered emitter: stable identity,
+  packed RGB color, and a 4x4 grid of 2-bit RTX visibility samples. Resolve
+  bilinearly reconstructs that grid at the exact G-buffer pixel before applying
+  IRLights-style distance falloff, `N.L`, diffuse response, and GGX specular.
+  Cache layout generation is bumped to 11 and the cache budget rises from about
+  26 MiB to about 38 MiB. This is still a receiver-face cache, but it should no
+  longer publish a single on/off shadow state for an entire block face.
+- Follow-up user checkpoint: shadows are improved and mostly correct, but the
+  cache still rebuilds too often, miss fallback is visually weak, and local
+  lighting is too bright/unaesthetic. Resolve no longer uses a generic warm
+  lightmap as the primary miss appearance. On local-cache misses it now samples
+  nearby `GpuSectionLight` records directly, using the live emitter RGB,
+  emission, radius, finite IRLights/Frostbite falloff, per-pixel direction,
+  `N.L`, diffuse response, and GGX specular without RTX visibility. The old
+  vanilla lightmap tint remains only as a low safety floor. Cached local direct
+  uses the same evaluator and its hardcoded `5.0` gain is replaced by a lower
+  `2.20` direct scale; the unshadowed section-light fallback uses `1.45`. This
+  should make cache fill/rebuild frames closer in color and value to the final
+  cached result while keeping valid RTX visibility authoritative.
 - A Photonics-style voxel hierarchy is not yet copied into Vulkanite
   (`target`, not implemented): Vulkanite has no equivalent resident occupancy
   tree, and building one only for local-light tests would add a second geometry
   validity system. Keep TLAS alpha-aware visibility until a voxel hierarchy can
   demonstrate correct thin geometry, transparency, and block-edge behavior.
-- `compileJava` and a Vulkan 1.2 `glslc` compile of the preprocessed active
-  `ray0.rgen` both pass. No automated capture or visual benchmark was run under
-  the manual-review rule.
+- `compileJava` and Vulkan 1.2 `glslc` compiles of the preprocessed active
+  `ray0.rgen` and both embedded compute shaders pass. No automated capture or
+  visual benchmark was run under the manual-review rule.
 
 ### Part 11 - Reconstruction, Upscaling, and Guides
 
@@ -903,7 +1018,7 @@ regression.
 | 7 - Reflection/refraction cache | Codex | in progress | Bounded request-only transport fills, validated screen history, and non-RT resolve are source-complete; manual checks require Part 8 same-session RT gating. |
 | 8 - Frame RT gating | Codex | in progress | Bounded `CACHE_FILL_ONLY`/`NO_RT` orchestration restored as the active architecture; prior live gate evidence remains, and the restored build needs the manual visual/log checkpoint. |
 | 9 - Descriptors/images/pipelines | Codex | complete | `NO_RT` skips RT descriptor work; stable frame-image views are reused by feedback, resolve, and RT; cache resources remain resident; barriers and layout split audited. |
-| 10 - Shader cost after gating | unassigned | not started | Optimize only remaining cache-fill RT work. |
+| 10 - Shader cost after gating | Codex | in progress | Surface-direct fills now cache RTX visibility/light identity and shade exact pixels; diffuse entries blend on the tangent plane. Stable frame rate is runtime-verified; revised lighting quality needs the Ancient City recheck. |
 | 11 - Reconstruction/guides | unassigned | not started | Keep DLSS/RR valid when RT is skipped. |
 | 12 - Lifecycle/recovery | unassigned | not started | Cache invalidation across reload/resize/world changes. |
 | 13 - Memory/cache budgets | unassigned | not started | Keep cache memory bounded. |
@@ -954,6 +1069,12 @@ Allowed states: `not started`, `in progress`, `blocked`, `complete`, `rejected`.
 | 2026-06-20 | Codex | 14 | current dirty tree, manual review | BLAS shutdown ownership | worker had no retained stop/join path | cooperative cancel, wake, join, and owned-resource cleanup path | code-verified | source inspection; `git diff --check`; `./gradlew classes` | Retained pending user shutdown observation |
 | 2026-06-20 | Codex | 14 | clean live tree at start of pass, manual review | Section probe executor shutdown ownership | `destroy()` cleared manager state then relied on `shutdownNow` while running tasks could still publish results | manager marks shutdown, cancels queued probe work, waits up to `vulkanite.probeShutdownJoinMs`, discards late results, then frees state | code-verified | source inspection; `git diff --check`; `./gradlew classes` | Retained pending user shutdown observation |
 | 2026-06-22 | Codex | 8-9 | current dirty tree, manual review | Steady-state RT dispatch and stable view churn | `cache_on_hit` forced render-resolution RT every frame and cache resolve created about fifteen short-lived storage views per frame | non-empty miss batches dispatch at most `256x1`; empty batches select `NO_RT`; storage views persist from frame-image allocation until resize/destroy | code-verified; runtime checkpoint pending | forced Java compile; preprocessed raygen passed Vulkan 1.2 validation; source/runtime shader hashes match; source flow and destruction order inspected; `git diff --check` | Retained; restart and confirm fill-to-`NO_RT` transition plus visual behavior |
+| 2026-06-22 | User/Codex | 10 | Ancient City live run, `run/logs/latest.log` | Slow bake, flat albedo during motion, oversaturated publication, unstable/no directional shadowing | 3,849 active lights coincided with 3,276 dead section-probe requests, 3,276 broad reflection requests, 3,020 surface-direct requests, and 28,604 fill frames versus 174 `NO_RT` frames; resolve deliberately showed flat albedo on diffuse miss and cached radiance was not bounded to its fallback | remove unused probe work from `cache_on_hit`; narrow reflection eligibility; stabilize surface identity to block+face; retain lit fallback on misses; clamp/blend cache publication; skylight-occlude analytic sun diffuse/specular | code-verified; runtime recheck pending | User observation plus live log/source correlation; Java and affected shader compiles pass | Retain for manual Ancient City restart; true cascaded/directional visibility cache is still not implemented |
+| 2026-06-22 | User/Codex | 10 | Ancient City after first stabilization pass | Frame pacing and local-light shape | frame rate is now very stable, but every block has visibly different cached lighting and the result does not behave like RTX | first surface-direct implementation stored one final RGB value per block face and mixed it with discrete vanilla blocklight; diffuse cache also published an eight-ray estimate per block at high confidence | surface entries now store light indices plus quantized RTX visibility; resolve computes continuous per-pixel falloff/cosine/material/specular from live lights; diffuse fills use deterministic face centers and tangent-plane interpolation | code-verified; runtime recheck pending | User visual observation; exact Photonics 0.2.5 direct/indirect shader paths re-read; Java and all affected shaders compile | Retain architecture correction; do not regress to final-radiance-per-block caching |
+| 2026-06-22 | User/Codex | 10 | Ancient City latest checkpoint and `run/logs/latest.log` | Movement reload and blocklight shadow artifacts | stationary view reached sustained `NO_RT`, but movement raised `enqueued` from 86,369 to 191,480 and fallback samples from 673,484 to 1,498,263; user clarified the issue is blocklight, not sun | local surface-direct fill now rejects zero-emission, out-of-radius, and behind-face emitters before they consume one of 96 covered-light slots or RTX rays; cache layout generation bumped to 9 | code-verified; runtime recheck pending | IRLights Photon patch and Photonics behavior rechecked; `ray0.rgen` and `CacheInvalidationTracker` inspected; Java compile, preprocessed raygen, raygen `glslc`, and shaderpack drift passed | Retain blocklight contributor filter; next target remains emitter/light-space shadow cache if receiver-face bridge still reloads while moving |
+| 2026-06-22 | User/Codex | 10 | Ancient City cache pollution audit | Persistent blocklight cache pollution | surface-direct keys could be authored from PBR/animated normals and entity pixels, and section ranges only considered the first 96 raw light records before declaring a receiver face complete | terrain now writes a hidden flat-face marker in `colortex3.a`, entities write no terrain marker, feedback/resolve only use the blocklight surface cache for marked terrain faces, the fill shader scans full section-light ranges until 96 relevant emitters are found, and cache layout generation is bumped to 10 | code-verified; runtime recheck pending | `gbuffers_terrain.fsh`, `gbuffers_entities.fsh`, `CacheFeedbackPass`, `CacheResolvePass`, `ray0.rgen`, and `CacheInvalidationTracker` inspected; Java compile, Iris-style fragment syntax checks, preprocessed raygen `glslc`, embedded compute `glslc`, shaderpack drift, and `git diff --check` passed | Retain pollution hardening; restart required so G-buffer alpha marker and layout version 10 take effect |
+| 2026-06-22 | User/Codex | 10 | Ancient City local blocklight checkpoint | Blocklight faces mostly black or white; only rare shadows correct | surface-direct local visibility stored four 2-bit samples per emitter and could replace the fallback with a whole-face binary result | each cached local emitter now stores a 4x4 2-bit RTX visibility grid, resolve bilinearly reconstructs visibility per exact pixel, entry layout grows to 1216 bytes, and cache layout generation is bumped to 11 | code-verified; runtime recheck pending | user observation; `SurfaceDirectLightCache`, `ray0.rgen`, `CacheResolvePass`, `CacheFeedbackPass`, and invalidation layout inspected; Java compile, preprocessed raygen `glslc`, embedded feedback/resolve compute `glslc`, shaderpack drift, and `git diff --check` passed | Retain 4x4 receiver-face visibility as the next checkpoint; if still face-blocky, move to emitter/light-space shadow cache |
+| 2026-06-22 | User/Codex | 10 | Ancient City local-light values checkpoint | Shadows mostly improved, but rebuilds remain visible, fallback is weak, and local light is too bright/unaesthetic | cache-hit direct used a hardcoded `5.0` gain and miss fallback used generic warm vanilla blocklight color | cache-hit direct and miss fallback now share a section-light evaluator based on live emitter RGB/emission/radius, IRLights finite falloff, exact direction, `N.L`, diffuse response, and GGX specular; cached direct scale is `2.20`, fallback scale is `1.45`, and generic lightmap tint is only a safety floor | code-verified; runtime recheck pending | user observation; `CacheResolvePass` inspected/updated; Java compile, preprocessed raygen `glslc`, embedded feedback/resolve compute `glslc`, shaderpack drift, and `git diff --check` passed | Retain live section-light values/colors in fallback; next review should compare brightness/color during movement vs warmed cache |
 | - | - | - | - | - | - | - | - | - | - |
 
 ## Changed-File Ledger
@@ -995,6 +1116,16 @@ Allowed states: `not started`, `in progress`, `blocked`, `complete`, `rejected`.
 | 2026-06-22 | Codex | architecture override | `VulkaniteConfig.java`, `RtxFrameDecision.java`, `VulkanPipeline.java`, `RtxPassGraph.java`, `RenderPassExecutor.java`, `CacheInvalidationTracker.java`, tracked/runtime `ray0.rgen`, `run/config/vulkanite.properties`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Replace G-buffer scan/request gating with full-frame primary RT and organic diffuse/specular/refraction/section-probe cache publication at visible hits; retain old request resources only for descriptor compatibility | Forced Java compile; preprocessed/injected raygen passed Vulkan 1.2 `glslangValidator`; shaderpack sync/drift validation; `git diff --check` |
 | 2026-06-22 | Codex | 8-9 | `VulkaniteConfig.java`, `RtxFrameDecision.java`, `VulkanPipeline.java`, `RtxPassGraph.java`, `RenderPassExecutor.java`, `RtxFrameImages.java`, `CacheFeedbackPass.java`, `CacheResolvePass.java`, tracked/runtime `ray0.rgen`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Restore trace-misses/resolve-hits gating, asynchronous deferred miss discovery, request-sized RT fill, same-frame compute resolve, failed-fill requeue, orchestration/cache metrics, and persistent frame-image views | Forced Java compile and tests (`NO-SOURCE`) passed; preprocessed raygen plus embedded feedback/resolve compute shaders passed Vulkan 1.2 `glslangValidator`; source/runtime raygen SHA-256 match; `git diff --check` passed with line-ending warnings only |
 | 2026-06-22 | Codex | 10 research | `plans/OPTIMIZATION_AGENT_FLOW.md` | Correct the research target to the Photonics Minecraft mod; inspect exact 1.20.1 `0.2.5` deferred lighting/cache shaders and separate them from the newer ReSTIR branch | Exact release shader inspection plus current source-branch comparison; plan-only change |
+| 2026-06-22 | Codex | 10 | `SurfaceDirectLightCache.java`, request/cache orchestration classes, `CacheFeedbackPass.java`, `CacheResolvePass.java`, tracked/runtime `ray0.rgen`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Add a separately keyed, versioned surface direct-light cache with finite per-entry section-light coverage so valid local-light surfaces stop requesting RTX | Exact Photonics 1.20.1 `0.2.5` jar and `64tree` source inspected; forced Java compile and tests; preprocessed raygen and embedded feedback/resolve compute shaders passed Vulkan 1.2 `glslc`; shaderpack drift and `git diff --check` |
+| 2026-06-22 | Codex | 10 visual stabilization | `VulkanPipeline.java`, `CacheFeedbackPass.java`, `CacheResolvePass.java`, `CacheRequestKey.java`, tracked/runtime `ray0.rgen`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Stop unused section-probe warm-up, reduce reflection/surface-key churn, preserve stable lighting on misses, and bound cache brightness publication | Java plus embedded feedback/resolve compute and preprocessed raygen compile; tests, shaderpack drift, and final whitespace check recorded in Latest Handoff |
+| 2026-06-22 | User/Codex | 10 Photonics/RTX correction | `SectionLightManager.java`, `SurfaceDirectLightCache.java`, `VulkanPipeline.java`, `CacheFeedbackPass.java`, `CacheResolvePass.java`, tracked/runtime `ray0.rgen`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Replace per-block final-radiance caching with bounded RTX visibility records and exact-pixel deferred direct evaluation; stabilize/interpolate diffuse world samples | Exact Photonics 0.2.5 shaders re-inspected; Java and embedded feedback/resolve compute plus preprocessed raygen compile; final Gradle/drift/whitespace results in Latest Handoff |
+| 2026-06-22 | User/Codex | 10 group-local shadows | `SectionLightManager.java`, `SurfaceDirectLightCache.java`, `CacheInvalidationTracker.java`, `VulkanPipeline.java`, `CacheFeedbackPass.java`, `CacheResolvePass.java`, tracked/runtime `ray0.rgen`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Stop screen-discovered diffuse GI from gating camera turns; add four-sample local and directional RTX visibility; rebuild surface light only for changed radius-two block groups or sun signature | Ancient City logs correlated by request family; Java and three shaders compiled; final Gradle/drift/whitespace results in Latest Handoff |
+| 2026-06-22 | User/Codex | 10 camera-independent base | `MixinCelestialUniforms.java`, `SurfaceDirectLightCache.java`, `CacheInvalidationTracker.java`, `VulkanPipeline.java`, `CacheFeedbackPass.java`, `CacheResolvePass.java`, tracked/runtime `ray0.rgen`, `ray0_0.rmiss`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Use Iris' raw world-space celestial direction; store stable surface-relative local-light records; remove unrelated global-light fallback; split stable world lighting from additive camera-dependent response | Iris celestial bytecode and exact Photonics 0.2.5 world-sun/shadow-vector flow inspected; Java and affected shaders compiled; final Gradle/drift/whitespace results in Latest Handoff |
+| 2026-06-22 | User/Codex | 10 IRLights emitter correction | `SurfaceDirectLightCache.java`, `CacheInvalidationTracker.java`, `CacheResolvePass.java`, tracked/runtime `ray0.rgen`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Replace expanded smoothstep blocklight with IRLights finite point-light falloff; cache geometry-only RTX visibility and evaluate exact per-pixel direction/normal/GGX response | Exact MIT IRLights/IRLite `photon.irlights` point-light surface path inspected; forced Java and affected shaders compiled; final Gradle/drift/whitespace results in Latest Handoff |
+| 2026-06-22 | User/Codex | 10 blocklight contributor filter | `CacheInvalidationTracker.java`, tracked/runtime `ray0.rgen`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Match IRLights/Photonics local-light rejection order by proving a block emitter can affect the receiver face before it consumes finite surface-cache coverage or RTX rays; invalidate old polluted surface entries with layout version 9 | User clarified the issue is blocklight; IRLights Photon patch rechecked; Java compile, preprocessed raygen, raygen `glslc`, and shaderpack drift passed |
+| 2026-06-22 | User/Codex | 10 blocklight pollution hardening | `shaderpacks/VulkaniteRT/shaders/gbuffers_terrain.fsh`, `shaderpacks/VulkaniteRT/shaders/gbuffers_entities.fsh`, `CacheFeedbackPass.java`, `CacheResolvePass.java`, `CacheInvalidationTracker.java`, tracked/runtime `ray0.rgen`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Split shaded normals from persistent terrain-face cache identity, prevent entity pixels from authoring block-face light cache entries, scan full section-light ranges for relevant emitters, and invalidate old entries with layout version 10 | Java compile; Iris-style fragment syntax checks; preprocessed raygen and embedded feedback/resolve compute shaders compiled with Vulkan 1.2 `glslc`; shaderpack drift and `git diff --check` passed |
+| 2026-06-22 | User/Codex | 10 local visibility 4x4 | `SurfaceDirectLightCache.java`, `CacheInvalidationTracker.java`, `CacheFeedbackPass.java`, `CacheResolvePass.java`, tracked/runtime `ray0.rgen`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Replace the four-sample whole-face local blocklight mask with a 4x4 cached RTX visibility grid per emitter and invalidate old entries with layout version 11 | Java compile; preprocessed raygen and embedded feedback/resolve compute shaders compiled with Vulkan 1.2 `glslc`; shaderpack drift and `git diff --check` passed |
+| 2026-06-22 | User/Codex | 10 local values/fallback | `CacheResolvePass.java`, `plans/OPTIMIZATION_AGENT_FLOW.md` | Use live section-light RGB/emission/radius for no-RT local-light fallback, lower cached local direct gain, and keep vanilla blocklight only as a safety floor | Java compile; preprocessed raygen and embedded feedback/resolve compute shaders compiled with Vulkan 1.2 `glslc`; shaderpack drift and `git diff --check` passed |
 
 ## Rejected Experiments
 
@@ -1099,54 +1230,107 @@ Before ending a part, the agent must:
 ## Latest Handoff
 
 - Agent/date: Codex / 2026-06-22
-- Part/status: Part 8 gate restored; Part 9 complete in source; manual runtime
-  checkpoint pending.
-- Completed checklist items: `cache_on_hit` again selects bounded
-  `CACHE_FILL_ONLY` only for a non-empty miss batch and otherwise selects
-  `NO_RT`. Deferred feedback ingestion, all four request families, same-frame
-  resolve, failed-fill requeue, cache metrics, and async submission ownership
-  are reconnected. RT descriptors/TLAS/entity texture interop are skipped on
-  `NO_RT`, and stable frame-image views are reused across feedback, resolve, and
-  RT instead of being recreated per frame. The Photonics mod review is recorded
-  above and feeds a surface direct-light-cache experiment into Part 10.
-- Pre-existing dirty files that overlapped this part: this plan and the full
-  retained Part 2-8 integration diff, including `VulkanPipeline.java`, cache
-  passes, request/cache classes, G-buffer shaders, mixins, and `ray0.rgen`.
-  Existing work was preserved.
-- Files changed by this agent: `VulkaniteConfig.java`, `RtxFrameDecision.java`,
-  `VulkanPipeline.java`, `RtxPassGraph.java`, `RenderPassExecutor.java`,
-  `RtxFrameImages.java`, `CacheFeedbackPass.java`, `CacheResolvePass.java`,
-  tracked/runtime `ray0.rgen`, and this plan.
-- Commands/checks and results: targeted source/diff/synchronization inspection;
-  `./gradlew compileJava --rerun-tasks` and tests (`NO-SOURCE`) passed;
-  preprocessed raygen and both embedded compute shaders passed
-  `glslangValidator -V --target-env vulkan1.2`; tracked/runtime raygen SHA-256
-  hashes match; `git diff --check` passed with line-ending warnings only.
-- Before/after measurements with sample count: none; manual-review mode remains
-  active and no automated captures or benchmark scenes were run.
-- Visual and temporal correctness checks: source contracts and raygen compilation
-  passed. The restored gate has not yet been run in this build; lighting,
-  material, motion, and full-reference comparison remain user-owned.
-- Synchronization/lifetime checks: command retirement still happens before
-  feedback ingestion; feedback slots become readable only after their queue
-  execution completes; failed pre-submit fills requeue. The RT-write to
-  compute-read/write barrier precedes feedback/resolve. Stable views close
-  before their images after queue idle on resize/destroy.
-- Rejected experiments: full-frame primary RT on every cache frame is superseded
-  because it cannot stop tracing after convergence. Photonics' probabilistic
-  refresh/long-running accumulation is not copied because Vulkanite requires an
-  explicit versioned completion state and `NO_RT` on valid hits.
-- Known risks, limitations, or blockers: one-block/normal cache identity can
-  still alias distinct coplanar surfaces inside one block, and the hit/fallback
-  counters sample the feedback grid rather than every resolve pixel. The hard
-  local-light patch and blocky wall-shadow observations remain unresolved until
-  the manual comparison; section probe lighting still lacks a separately keyed
-  stable surface-visibility cache.
-- Exact next action: implement the Part 10 blocklight audit first: add a
-  versioned surface direct-light cache with per-entry light coverage, fed by the
-  existing spatial section-light lists. After that, restart with
-  `rtxCacheMode=cache_on_hit`, confirm `decision=NO_RT` after coverage completes,
-  and compare the same cave/wall view with `full_rt_reference`.
+- Part/status: Part 10 local blocklight values/fallback tuning complete in source;
+  revised Ancient City movement/blocklight checkpoint pending.
+- Completed checklist items: the user clarified the artifact is blocklight, not
+  sun. The temporary receiver-face sun rollback was undone. Surface entries
+  still cache stable local block-light identities plus four receiver-face RTX
+  visibility samples, and resolve still evaluates IRLights-style finite
+  point-light falloff, exact per-pixel light direction, `N.L`, and GGX response.
+  The fill path now proves an emitter can affect the receiver block face before
+  it consumes one of the 96 finite covered-light slots or any RTX ray. Zero
+  emission, out-of-radius, and behind-face emitters are rejected first. The
+  pollution audit then split shaded normals from cache identity: terrain writes
+  a hidden flat-face marker in `colortex3.a`, entities write no terrain marker,
+  and feedback/resolve only use the persistent surface-direct blocklight cache
+  for marked terrain faces. The fill shader scans each section-light range until
+  it finds up to 96 relevant emitters instead of stopping after the first 96 raw
+  records. After the user reported mostly black/white block faces, local
+  emitter visibility was upgraded from four 2-bit receiver-face samples to a
+  4x4 2-bit visibility grid per cached emitter. Resolve reconstructs that grid
+  at the exact pixel before evaluating falloff and BRDF. After the next
+  checkpoint showed improved shadows but excessive brightness and weak miss
+  fallback, resolve was changed to use live section-light RGB/emission/radius
+  for the no-RT fallback too. Cached direct and fallback now share the same
+  IRLights-style evaluator; cached direct scale is reduced from the old
+  hardcoded `5.0` to `2.20`, fallback uses `1.45`, and vanilla blocklight color
+  remains only as a safety floor.
+- IRLights/Photonics alignment: IRLights' Photon patch rejects lights outside
+  radius before shading, then shares one shadow visibility between diffuse and
+  specular. Photonics bins local lights and advances bounded visibility work.
+  Vulkanite now follows that rejection order for block emitters, while keeping
+  strict cache completion and `NO_RT` on hits.
+- Pre-existing dirty files that overlapped this part: this plan and the retained
+  Part 2-9 integration diff, including pipeline/cache passes, request classes,
+  G-buffer shaders, mixins, and `ray0.rgen`. Existing work was preserved.
+- Files changed by this agent: `SectionLightManager.java`, `SurfaceDirectLightCache.java`,
+  `CacheRequestFamily.java`, `CacheRequestKey.java`, `CacheRequestBatch.java`,
+  `CacheRequestQueue.java`, `CacheRequestStats.java`,
+  `CacheInvalidationTracker.java`, `VulkanPipeline.java`, `RtxPassGraph.java`,
+  `RenderPassExecutor.java`, `PipelineDescriptorSets.java`,
+  `CacheFeedbackPass.java`, `CacheResolvePass.java`, tracked/runtime
+  `ray0.rgen`, `ray0_0.rmiss`, `gbuffers_terrain.fsh`,
+  `gbuffers_entities.fsh`, `MixinCelestialUniforms.java`, and this plan.
+- Commands/checks and results: `./gradlew compileJava --rerun-tasks` passed with
+  the two existing deprecation-annotation warnings. `python preprocess_shader.py
+  ray0.rgen shaderpacks/VulkaniteRT/shaders
+  temp/ray0_surface4x4.preprocessed.rgen --clean` passed. `glslc
+  --target-env=vulkan1.2` compiled the preprocessed raygen and the extracted
+  embedded feedback/resolve compute shaders; the latest value/fallback pass
+  also compiled `temp/ray0_local_values.preprocessed.rgen` and extracted
+  `feedback_local_values.comp`/`resolve_local_values.comp`. The preprocessed terrain/entity
+  fragment shaders passed `glslangValidator -S frag`; standalone Vulkan `glslc`
+  is not applicable to those Iris shaders because Iris supplies sampler
+  bindings and vertex input locations at runtime. `./gradlew
+  validateVulkaniteShaderpackDrift` passed after syncing runtime shaderpacks.
+  `git diff --check` passed with line-ending warnings only.
+- Before/after measurements with sample count: latest log before this patch:
+  stationary view reached sustained `NO_RT`, then movement raised `enqueued`
+  from 86,369 to 191,480 and fallback samples from 673,484 to 1,498,263. No
+  automated after-capture was run; revised movement/shadow behavior is pending
+  user runtime review.
+- Visual and temporal correctness checks: user reported "we are so close" but
+  movement still reloads and blocklight shadows still appear blocky / fragmented.
+  Source diagnosis says the finite receiver-face local cache was admitting
+  irrelevant nearby emitters before relevant contributors, and could also accept
+  cache identities from shaded normal-map normals or entity pixels. The user
+  then clarified the remaining artifact as mostly whole black/white blocklight
+  faces with only rare correct shadows; source diagnosis identified the old
+  four-sample local mask as too coarse. The latest user checkpoint says most
+  shadows now look correct, but rebuilds remain too visible, fallback is weak,
+  and local light is too bright. Camera/view changes still do not alter
+  local-light identity or dependency version, but newly visible local-light
+  receiver faces can still be discovered until the next light/emitter-space
+  shadow cache replaces this bridge.
+- Synchronization/lifetime checks: cache upload transfer barriers cover RT and
+  compute readers; RT writes become visible before feedback/resolve; cache and
+  fill buffers close after their frame references and are destroyed on pipeline
+  shutdown.
+- Rejected experiments: coarse probe-face surface aliasing remains rejected.
+  Photonics' probabilistic refresh, 2048-sample accumulation, and current ReSTIR
+  per-frame visibility are not copied because they do not satisfy strict
+  convergence to `NO_RT`. Its voxel 64-tree is deferred until Vulkanite has a
+  single authoritative occupancy/validity model.
+- Known risks, limitations, or blockers: surface coverage remains capped at 96
+  local lights, and local visibility now uses a 4x4 grid of 2-bit samples per
+  emitter. Light and geometry edits are radius-two group-local, but a group with
+  more than 96 emitters is truncated deterministically. The cache is about 38
+  MiB. A 4x4 receiver-face grid is still not a dense emitter/light-space shadow
+  map.
+  Direction-keyed reflection/refraction can still trace when a
+  genuinely unseen view response is requested, but it is additive and cannot
+  erase the already-resolved base image. The active local-light cache is still
+  receiver-surface based, so moving into genuinely unseen surfaces can still
+  fill. True RTX-like stability requires the next cache to be keyed by emitter
+  and light-space direction/depth, not by receiver block face.
+- Exact next action: fully restart so the G-buffer face marker and cache layout
+  version 11 take effect, then repeat the same Ancient City movement. Check
+  whether blocklight color/brightness during movement is closer to the warmed
+  cache, whether fallback no longer flashes flat orange, and whether movement enqueues fewer
+  surface-direct requests. If it still reloads on newly visible walls, start the
+  emitter/light-space shadow cache: cache per-block-emitter direction-depth or
+  cubemap-like visibility buckets and resolve receiver pixels from that resident
+  light cache.
 
 ## Required Handoff Template
 

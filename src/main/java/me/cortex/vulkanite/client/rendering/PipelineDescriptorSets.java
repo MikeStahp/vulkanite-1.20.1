@@ -65,6 +65,8 @@ public final class PipelineDescriptorSets {
                     new ShaderReflection.Binding("", 27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 29, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
             });
 
     // Cache for base common set without G-buffer bindings (for full path tracers)
@@ -88,6 +90,8 @@ public final class PipelineDescriptorSets {
                     new ShaderReflection.Binding("", 27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 29, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
             });
 
     // Cache for VulkaniteRT hybrid set - matches actual bindings used by PBR
@@ -129,6 +133,8 @@ public final class PipelineDescriptorSets {
                     new ShaderReflection.Binding("", 27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                     new ShaderReflection.Binding("", 29, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                    new ShaderReflection.Binding("", 31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
             });
 
     private PipelineDescriptorSets() {
@@ -180,6 +186,8 @@ public final class PipelineDescriptorSets {
                 new ShaderReflection.Binding("", 27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                 new ShaderReflection.Binding("", 28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
                 new ShaderReflection.Binding("", 29, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                new ShaderReflection.Binding("", 30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
+                new ShaderReflection.Binding("", 31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0, false),
         });
     }
 

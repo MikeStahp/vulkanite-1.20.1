@@ -1,6 +1,7 @@
 package me.cortex.vulkanite.lib.base.initalizer;
 
 import me.cortex.vulkanite.lib.base.VContext;
+import me.cortex.vulkanite.lib.base.DeviceCapabilities;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
@@ -14,6 +15,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static me.cortex.vulkanite.lib.other.VUtil._CHECK_;
 import static org.lwjgl.system.MemoryStack.stackPush;
@@ -27,7 +29,12 @@ public class VInitializer {
     private VkPhysicalDevice physicalDevice;
     private VkDevice device;
     private int queueCount;
+    private int queueFamilyIndex = -1;
+    private DeviceCapabilities capabilities;
     private long debugMessenger = 0;
+    private VkDebugUtilsMessengerCallbackEXT debugCallback;
+    private final AtomicInteger validationWarningCount = new AtomicInteger();
+    private final AtomicInteger validationErrorCount = new AtomicInteger();
 
     public VInitializer(String appName, String engineName, int major, int minor, String[] extensions, String[] layers) {
         try (MemoryStack stack = stackPush()) {
@@ -45,13 +52,29 @@ public class VInitializer {
                     .ppEnabledLayerNames(
                             stack.pointers(Arrays.stream(layers).map(stack::UTF8).toArray(ByteBuffer[]::new)));
 
-            PointerBuffer result = stack.pointers(0);
-            _CHECK_(vkCreateInstance(instanceCreateInfo, null, result));
-
-            instance = new VkInstance(result.get(0), instanceCreateInfo);
-
+            VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo = null;
             if (Arrays.asList(extensions).contains(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
-                VkDebugUtilsMessengerCreateInfoEXT debugCreateInfo = VkDebugUtilsMessengerCreateInfoEXT.calloc(stack)
+                debugCallback = VkDebugUtilsMessengerCallbackEXT.create(
+                        (messageSeverity, messageTypes, pCallbackData, pUserData) -> {
+                            boolean validationMessage =
+                                    (messageTypes & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) != 0;
+                            if (validationMessage
+                                    && (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
+                                validationErrorCount.incrementAndGet();
+                            } else if (validationMessage
+                                    && (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0) {
+                                validationWarningCount.incrementAndGet();
+                            }
+
+                            VkDebugUtilsMessengerCallbackDataEXT callbackData =
+                                    VkDebugUtilsMessengerCallbackDataEXT.create(pCallbackData);
+                            System.err.println("[Vulkanite/Validation]["
+                                    + debugSeverityName(messageSeverity) + "]["
+                                    + debugTypeNames(messageTypes) + "] "
+                                    + callbackData.pMessageString());
+                            return VK_FALSE;
+                        });
+                debugCreateInfo = VkDebugUtilsMessengerCreateInfoEXT.calloc(stack)
                         .sType$Default()
                         .messageSeverity(VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT
                                 | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT
@@ -59,21 +82,47 @@ public class VInitializer {
                         .messageType(VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT
                                 | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT
                                 | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT)
-                        .pfnUserCallback((messageSeverity, messageTypes, pCallbackData, pUserData) -> {
-                            VkDebugUtilsMessengerCallbackDataEXT callbackData = VkDebugUtilsMessengerCallbackDataEXT
-                                    .create(pCallbackData);
-                            System.err.println("Validation layer: " + callbackData.pMessageString());
-                            Thread.dumpStack();
-                            return VK_FALSE;
-                        });
+                        .pfnUserCallback(debugCallback);
+            }
 
+            PointerBuffer result = stack.pointers(0);
+            _CHECK_(vkCreateInstance(instanceCreateInfo, null, result));
+
+            instance = new VkInstance(result.get(0), instanceCreateInfo);
+
+            if (debugCreateInfo != null) {
                 var pDebugMessenger = stack.mallocLong(1);
                 _CHECK_(vkCreateDebugUtilsMessengerEXT(instance, debugCreateInfo, null, pDebugMessenger));
                 debugMessenger = pDebugMessenger.get(0);
-                // Runtime.getRuntime().addShutdownHook(new Thread(() ->
-                // vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, null)));
             }
         }
+    }
+
+    private static String debugSeverityName(int severity) {
+        if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0) {
+            return "ERROR";
+        }
+        if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) != 0) {
+            return "WARNING";
+        }
+        if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) != 0) {
+            return "INFO";
+        }
+        return "VERBOSE";
+    }
+
+    private static String debugTypeNames(int types) {
+        List<String> names = new ArrayList<>(3);
+        if ((types & VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT) != 0) {
+            names.add("GENERAL");
+        }
+        if ((types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) != 0) {
+            names.add("VALIDATION");
+        }
+        if ((types & VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT) != 0) {
+            names.add("PERFORMANCE");
+        }
+        return String.join("|", names);
     }
 
     public void findPhysicalDevice() {
@@ -132,13 +181,16 @@ public class VInitializer {
             }
         }
 
+        queueFamilyIndex = selectQueueFamily(queuePriorities.length);
+        capabilities = DeviceCapabilities.detect(physicalDevice, deviceExtensions, queueFamilyIndex);
+
         try (MemoryStack stack = stackPush()) {
 
             queueCount = queuePriorities.length;
             var queueCreateInfos = VkDeviceQueueCreateInfo.calloc(1, stack)
                     .sType$Default()
                     .pQueuePriorities(stack.floats(queuePriorities))
-                    .queueFamilyIndex(0);
+                    .queueFamilyIndex(queueFamilyIndex);
 
             VkDeviceCreateInfo createInfo = VkDeviceCreateInfo.calloc(stack)
                     .sType$Default()
@@ -177,6 +229,42 @@ public class VInitializer {
         }
     }
 
+    private int selectQueueFamily(int requestedQueueCount) {
+        if (requestedQueueCount <= 0) {
+            throw new IllegalArgumentException("At least one Vulkan queue is required");
+        }
+
+        try (MemoryStack stack = stackPush()) {
+            int[] count = new int[1];
+            vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, count, null);
+            VkQueueFamilyProperties.Buffer families = VkQueueFamilyProperties.calloc(count[0], stack);
+            vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, count, families);
+
+            int requiredFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+            int bestFamily = -1;
+            int bestQueueCount = -1;
+            for (int family = 0; family < families.capacity(); family++) {
+                VkQueueFamilyProperties properties = families.get(family);
+                if ((properties.queueFlags() & requiredFlags) != requiredFlags
+                        || properties.queueCount() < requestedQueueCount) {
+                    continue;
+                }
+                if (properties.queueCount() > bestQueueCount) {
+                    bestFamily = family;
+                    bestQueueCount = properties.queueCount();
+                }
+            }
+
+            if (bestFamily < 0) {
+                throw new IllegalStateException("No graphics/compute/transfer queue family exposes "
+                        + requestedQueueCount + " queues");
+            }
+            System.out.println("[Vulkanite] Selected Vulkan queue family " + bestFamily
+                    + " with " + bestQueueCount + " queues");
+            return bestFamily;
+        }
+    }
+
     private static VkLayerProperties.Buffer getInstanceLayers(MemoryStack stack) {
         int[] res = new int[1];
         _CHECK_(vkEnumerateInstanceLayerProperties(res, null));
@@ -187,6 +275,17 @@ public class VInitializer {
         return layerProperties;
     }
 
+    public static boolean isInstanceLayerAvailable(String requestedLayer) {
+        try (MemoryStack stack = stackPush()) {
+            for (VkLayerProperties layer : getInstanceLayers(stack)) {
+                if (requestedLayer.equals(layer.layerNameString())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
     private static VkExtensionProperties.Buffer getInstanceExtensions(MemoryStack stack) {
         int[] res = new int[1];
         _CHECK_(vkEnumerateInstanceExtensionProperties((String) null, res, null));
@@ -195,6 +294,17 @@ public class VInitializer {
         if (res[0] != extensionProperties.capacity())
             throw new IllegalStateException();
         return extensionProperties;
+    }
+
+    public static boolean isInstanceExtensionAvailable(String requestedExtension) {
+        try (MemoryStack stack = stackPush()) {
+            for (VkExtensionProperties extension : getInstanceExtensions(stack)) {
+                if (requestedExtension.equals(extension.extensionNameString())) {
+                    return true;
+                }
+            }
+            return false;
+        }
     }
 
     private PointerBuffer getPhysicalDevices(MemoryStack stack) {
@@ -234,6 +344,11 @@ public class VInitializer {
 
     public VContext createContext() {
         // TODO:FIXME: DONT HARDCODE THE FACT IT HAS DEVICE ADDRESSES
-        return new VContext(device, physicalDevice, instance, queueCount, true, debugMessenger != 0);
+        if (queueFamilyIndex < 0 || capabilities == null) {
+            throw new IllegalStateException("Vulkan device capabilities were not initialized");
+        }
+        return new VContext(device, physicalDevice, instance, queueCount, queueFamilyIndex,
+                true, debugMessenger != 0, capabilities, debugCallback,
+                validationWarningCount, validationErrorCount);
     }
 }

@@ -19,8 +19,9 @@ import java.util.Objects;
 public final class CacheInvalidationTracker {
     private static final Logger LOGGER = LoggerFactory.getLogger(CacheInvalidationTracker.class);
     private static final CacheInvalidationTracker GLOBAL = new CacheInvalidationTracker();
-    private static final long CACHE_LAYOUT_VERSION = 4L;
+    private static final long CACHE_LAYOUT_VERSION = 11L;
     private static final long SKY_TIME_BUCKET_TICKS = 100L;
+    private static final int SURFACE_DEPENDENCY_SECTION_RADIUS = 2;
 
     private final EnumMap<CacheRequestFamily, Long> familyGenerations =
             new EnumMap<>(CacheRequestFamily.class);
@@ -71,8 +72,8 @@ public final class CacheInvalidationTracker {
                 entityGeneration,
                 false,
                 sectionKey,
-                section == null ? 0 : section.geometryVersion,
-                section == null ? 0 : section.lightVersion,
+                section == null ? 0 : geometryVersionFor(key.family(), section),
+                section == null ? 0 : lightVersionFor(key.family(), section),
                 section != null,
                 section != null && section.active);
     }
@@ -124,10 +125,11 @@ public final class CacheInvalidationTracker {
         if (section == null || !section.active || !stamp.sectionKnown() || !stamp.sectionActive()) {
             return false;
         }
-        if (stamp.sectionGeometryVersion() != section.geometryVersion) {
+        if (stamp.sectionGeometryVersion() != geometryVersionFor(key.family(), section)) {
             return false;
         }
-        return !requiresLightVersion(key.family()) || stamp.sectionLightVersion() == section.lightVersion;
+        return !requiresLightVersion(key.family())
+                || stamp.sectionLightVersion() == lightVersionFor(key.family(), section);
     }
 
     public synchronized void recordWorld(String nextDimensionId) {
@@ -154,16 +156,19 @@ public final class CacheInvalidationTracker {
         }
         long sectionKey = sectionPos.asLong();
         SectionVersion section = sectionVersions.get(sectionKey);
-        boolean firstActivation = section == null;
+        boolean firstActivation = section == null || !section.everActivated;
         if (firstActivation) {
-            section = new SectionVersion();
-            sectionVersions.put(sectionKey, section);
+            if (section == null) {
+                section = new SectionVersion();
+                sectionVersions.put(sectionKey, section);
+            }
         }
         if (!section.active) {
             section.active = true;
             geometryChanged = true;
             lightChanged = true;
         }
+        section.everActivated = true;
         if (geometryChanged) {
             section.geometryVersion = incrementInt(section.geometryVersion);
             // A section's first activation has no prior entries in its keyspace
@@ -179,6 +184,7 @@ public final class CacheInvalidationTracker {
                 sceneLightGeneration++;
             }
         }
+        bumpSurfaceDependencyVersions(sectionPos, geometryChanged, lightChanged);
     }
 
     public synchronized void recordSectionRemoval(ChunkSectionPos sectionPos) {
@@ -191,6 +197,7 @@ public final class CacheInvalidationTracker {
         section.lightVersion = incrementInt(section.lightVersion);
         sceneGeometryGeneration++;
         sceneLightGeneration++;
+        bumpSurfaceDependencyVersions(sectionPos, true, true);
     }
 
     public synchronized void clearSectionVersions() {
@@ -310,6 +317,16 @@ public final class CacheInvalidationTracker {
         return familyGenerations.getOrDefault(family, 1L);
     }
 
+    public synchronized int surfaceGeometryVersion(ChunkSectionPos sectionPos) {
+        SectionVersion section = sectionPos == null ? null : sectionVersions.get(sectionPos.asLong());
+        return section == null ? 0 : section.surfaceGeometryVersion;
+    }
+
+    public synchronized int surfaceLightVersion(ChunkSectionPos sectionPos) {
+        SectionVersion section = sectionPos == null ? null : sectionVersions.get(sectionPos.asLong());
+        return section == null ? 0 : section.surfaceLightVersion;
+    }
+
     private void bumpFamily(CacheRequestFamily family) {
         familyGenerations.put(family, familyGeneration(family) + 1L);
     }
@@ -331,13 +348,12 @@ public final class CacheInvalidationTracker {
 
     private static boolean requiresLightVersion(CacheRequestFamily family) {
         return family == CacheRequestFamily.SECTION_PROBE_CELL
-                || family == CacheRequestFamily.DIFFUSE_RADIANCE;
+                || family == CacheRequestFamily.DIFFUSE_RADIANCE
+                || family == CacheRequestFamily.SURFACE_DIRECT_LIGHT;
     }
 
     private static boolean requiresSkyVersion(CacheRequestFamily family) {
-        return family == CacheRequestFamily.DIFFUSE_RADIANCE
-                || family == CacheRequestFamily.REFLECTION
-                || family == CacheRequestFamily.REFRACTION;
+        return false;
     }
 
     private static boolean requiresMaterialVersion(CacheRequestFamily family) {
@@ -358,11 +374,57 @@ public final class CacheInvalidationTracker {
     }
 
     private static boolean requiresSceneGeometryVersion(CacheRequestFamily family) {
-        return family != CacheRequestFamily.SECTION_PROBE_CELL;
+        return family != CacheRequestFamily.SECTION_PROBE_CELL
+                && family != CacheRequestFamily.SURFACE_DIRECT_LIGHT;
     }
 
     private static boolean requiresSceneLightVersion(CacheRequestFamily family) {
-        return family != CacheRequestFamily.SECTION_PROBE_CELL;
+        return family != CacheRequestFamily.SECTION_PROBE_CELL
+                && family != CacheRequestFamily.SURFACE_DIRECT_LIGHT;
+    }
+
+    private void bumpSurfaceDependencyVersions(
+            ChunkSectionPos changedSection,
+            boolean geometryChanged,
+            boolean lightChanged) {
+        if (!geometryChanged && !lightChanged) {
+            return;
+        }
+        int sx = changedSection.getSectionX();
+        int sy = changedSection.getSectionY();
+        int sz = changedSection.getSectionZ();
+        for (int dz = -SURFACE_DEPENDENCY_SECTION_RADIUS;
+                dz <= SURFACE_DEPENDENCY_SECTION_RADIUS;
+                dz++) {
+            for (int dy = -SURFACE_DEPENDENCY_SECTION_RADIUS;
+                    dy <= SURFACE_DEPENDENCY_SECTION_RADIUS;
+                    dy++) {
+                for (int dx = -SURFACE_DEPENDENCY_SECTION_RADIUS;
+                        dx <= SURFACE_DEPENDENCY_SECTION_RADIUS;
+                        dx++) {
+                    long key = ChunkSectionPos.asLong(sx + dx, sy + dy, sz + dz);
+                    SectionVersion dependent = sectionVersions.computeIfAbsent(key, ignored -> new SectionVersion());
+                    if (geometryChanged) {
+                        dependent.surfaceGeometryVersion = incrementInt(dependent.surfaceGeometryVersion);
+                    }
+                    if (lightChanged) {
+                        dependent.surfaceLightVersion = incrementInt(dependent.surfaceLightVersion);
+                    }
+                }
+            }
+        }
+    }
+
+    private static int geometryVersionFor(CacheRequestFamily family, SectionVersion section) {
+        return family == CacheRequestFamily.SURFACE_DIRECT_LIGHT
+                ? section.surfaceGeometryVersion
+                : section.geometryVersion;
+    }
+
+    private static int lightVersionFor(CacheRequestFamily family, SectionVersion section) {
+        return family == CacheRequestFamily.SURFACE_DIRECT_LIGHT
+                ? section.surfaceLightVersion
+                : section.lightVersion;
     }
 
     private static int incrementInt(int value) {
@@ -372,7 +434,10 @@ public final class CacheInvalidationTracker {
     private static final class SectionVersion {
         private int geometryVersion;
         private int lightVersion;
+        private int surfaceGeometryVersion;
+        private int surfaceLightVersion;
         private boolean active;
+        private boolean everActivated;
     }
 
     private record SkySignature(long timeBucket, boolean raining, boolean thundering) {

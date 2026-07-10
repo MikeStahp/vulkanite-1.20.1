@@ -48,6 +48,7 @@ public class CommandManager {
     private long targetFrameTimeNs = 16666667; // 60 FPS target
     private boolean framePacingEnabled = false;
     private final VkDevice device;
+    private final int queueFamilyIndex;
     private final Queue[] queues;
     private final long[] observedExecutions;
     private final ThreadLocal<VRef<VCommandPool>> threadLocalPool = ThreadLocal.withInitial(() -> {
@@ -56,12 +57,13 @@ public class CommandManager {
         return pool;
     });
 
-    public CommandManager(VkDevice device, int queues) {
+    public CommandManager(VkDevice device, int queues, int queueFamilyIndex) {
         this.device = device;
+        this.queueFamilyIndex = queueFamilyIndex;
         this.queues = new Queue[queues];
         this.observedExecutions = new long[queues];
         for (int i = 0; i < queues; i++) {
-            this.queues[i] = new Queue(i, device);
+            this.queues[i] = new Queue(i, queueFamilyIndex, device);
         }
     }
 
@@ -70,7 +72,7 @@ public class CommandManager {
     }
 
     public VRef<VCommandPool> createPool(int flags) {
-        return new VRef<>(new VCommandPool(device, flags));
+        return new VRef<>(new VCommandPool(device, queueFamilyIndex, flags));
     }
 
     public VCommandPool getSingleUsePool() {
@@ -366,10 +368,10 @@ public class CommandManager {
         public AtomicLong timeline = new AtomicLong(1);
         public AtomicLong completedTimestamp = new AtomicLong(0);
 
-        public Queue(int queueId, VkDevice device) {
+        public Queue(int queueId, int queueFamilyIndex, VkDevice device) {
             try (var stack = stackPush()) {
                 var pQ = stack.pointers(0);
-                vkGetDeviceQueue(device, 0, queueId, pQ);
+                vkGetDeviceQueue(device, queueFamilyIndex, queueId, pQ);
 
                 this.queue = new VkQueue(pQ.get(0), device);
 

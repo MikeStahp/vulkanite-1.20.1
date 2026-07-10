@@ -7,5 +7,6 @@ public enum CacheRequestFamily {
     SECTION_PROBE_CELL,
     DIFFUSE_RADIANCE,
     REFLECTION,
-    REFRACTION
+    REFRACTION,
+    SURFACE_DIRECT_LIGHT
 }

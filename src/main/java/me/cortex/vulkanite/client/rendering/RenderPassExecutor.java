@@ -118,6 +118,8 @@ public final class RenderPassExecutor {
             VRef<VBuffer> diffuseRadianceFillRequestBuffer,
             VRef<VBuffer> specularTransportCacheBuffer,
             VRef<VBuffer> specularTransportFillRequestBuffer,
+            VRef<VBuffer> surfaceDirectLightCacheBuffer,
+            VRef<VBuffer> surfaceDirectLightFillRequestBuffer,
             VRef<VImage> scaledOutputImage, // DLSS: Scaled output image for binding 12 (or null to use Iris target)
             int rayDispatchWidth,
             int rayDispatchHeight) {
@@ -356,6 +358,10 @@ public final class RenderPassExecutor {
                         "SpecularTransportCache");
                 bindOptionalStorageBuffer(updater, setReflection, 29, specularTransportFillRequestBuffer,
                         "SpecularTransportFillRequests");
+                bindOptionalStorageBuffer(updater, setReflection, 30, surfaceDirectLightCacheBuffer,
+                        "SurfaceDirectLightCache");
+                bindOptionalStorageBuffer(updater, setReflection, 31, surfaceDirectLightFillRequestBuffer,
+                        "SurfaceDirectLightFillRequests");
 
                 updater.apply();
 

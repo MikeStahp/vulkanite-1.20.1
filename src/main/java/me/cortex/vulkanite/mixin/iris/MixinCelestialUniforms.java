@@ -12,4 +12,7 @@ public interface MixinCelestialUniforms {
 
     @Invoker("getMoonPosition")
     public Vector4f invokeGetMoonPosition();
+
+    @Invoker("getCelestialPositionInWorldSpace")
+    public Vector4f invokeGetCelestialPositionInWorldSpace(float celestialY);
 }

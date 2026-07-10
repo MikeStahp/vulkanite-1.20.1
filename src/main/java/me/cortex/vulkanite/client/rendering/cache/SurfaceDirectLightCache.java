@@ -21,15 +21,20 @@ import static org.lwjgl.vulkan.VK10.VK_PIPELINE_STAGE_TRANSFER_BIT;
 import static org.lwjgl.vulkan.VK10.VK_WHOLE_SIZE;
 
 /**
- * Bounded GPU cache for reflection and refraction continuation-ray results.
+ * Versioned direct-light visibility cache for quantized world surfaces.
  *
- * <p>Entries use one-block world cells and store incident transport plus continuation hit distances. Surface
- * Fresnel, tint, and absorption remain resolve-time operations so neighboring
- * materials cannot silently share a final shaded color.</p>
+ * <p>Each RTX invocation advances a finite cursor through the existing
+ * section-local light ranges. Partial entries remain misses; only entries whose
+ * complete relevant light set has been covered become steady-state hits. Each
+ * covered slot stores stable surface-relative position/emission/radius/color and a 4x4
+ * quantized RTX visibility grid across the block face. A separate four-sample directional visibility
+ * payload is stamped by sun-direction signature; the
+ * deferred resolver evaluates attenuation and material response at the actual
+ * pixel instead of publishing one RGB value for an entire block face.</p>
  */
-public final class SpecularTransportCache {
+public final class SurfaceDirectLightCache {
     private static final int FILL_REQUEST_BUFFER_BYTES =
-            CacheLayouts.SpecularTransport.HEADER_BYTES + CacheLayouts.MAX_FILL_REQUESTS * CacheLayouts.SpecularTransport.FILL_REQUEST_RECORD_BYTES;
+            CacheLayouts.SurfaceDirect.HEADER_BYTES + CacheLayouts.MAX_FILL_REQUESTS * CacheLayouts.SurfaceDirect.FILL_REQUEST_RECORD_BYTES;
     private static final int HASH_PROBE_LIMIT = 8;
     private static final int FRAMES_IN_FLIGHT = 3;
 
@@ -42,23 +47,23 @@ public final class SpecularTransportCache {
     private boolean cacheStorageInitialized;
     private boolean cacheNeedsFullClear;
 
-    public SpecularTransportCache() {
+    public SurfaceDirectLightCache() {
         this(CacheInvalidationTracker.global());
     }
 
-    SpecularTransportCache(CacheInvalidationTracker invalidationTracker) {
+    SurfaceDirectLightCache(CacheInvalidationTracker invalidationTracker) {
         this.invalidationTracker = invalidationTracker;
     }
 
     public synchronized VRef<VBuffer> ensureCacheGpuBuffer(VContext ctx, VCmdBuff cmd) {
         ensureCacheCapacity(ctx);
-
         int generation = currentGeneration();
         if (generation != uploadedGeneration || cacheNeedsFullClear) {
             boolean fullClear = !cacheStorageInitialized || cacheNeedsFullClear;
-            int uploadBytes = fullClear ? CacheLayouts.SpecularTransport.HEADER_BYTES : CacheLayouts.SpecularTransport.CACHE_BUFFER_BYTES;
-            ByteBuffer data = scratchCache(fullClear ? CacheLayouts.SpecularTransport.HEADER_BYTES : CacheLayouts.SpecularTransport.CACHE_BUFFER_BYTES);
-            data.putInt(CacheLayouts.SpecularTransport.MAX_ENTRIES);
+            int uploadBytes = fullClear ? CacheLayouts.SurfaceDirect.HEADER_BYTES : CacheLayouts.SurfaceDirect.CACHE_BUFFER_BYTES;
+            ByteBuffer data = scratch(cacheClearScratch, fullClear ? CacheLayouts.SurfaceDirect.HEADER_BYTES : CacheLayouts.SurfaceDirect.CACHE_BUFFER_BYTES);
+            cacheClearScratch = data;
+            data.putInt(CacheLayouts.SurfaceDirect.MAX_ENTRIES);
             data.putInt(generation);
             data.putInt(HASH_PROBE_LIMIT);
             data.putInt(0);
@@ -70,11 +75,11 @@ public final class SpecularTransportCache {
             cmd.encodeDataUpload(ctx.memory, MemoryUtil.memAddress(data), cacheBuffer, 0, uploadBytes);
             
             if (fullClear) {
-                cmd.encodeFillBuffer(cacheBuffer, CacheLayouts.SpecularTransport.HEADER_BYTES, VK_WHOLE_SIZE, 0);
+                cmd.encodeFillBuffer(cacheBuffer, CacheLayouts.SurfaceDirect.HEADER_BYTES, VK_WHOLE_SIZE, 0);
                 cmd.encodeBufferBarrier(
                         cacheBuffer,
                         0,
-                        CacheLayouts.SpecularTransport.CACHE_BUFFER_BYTES,
+                        CacheLayouts.SurfaceDirect.CACHE_BUFFER_BYTES,
                         VK_PIPELINE_STAGE_TRANSFER_BIT,
                         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -83,7 +88,7 @@ public final class SpecularTransportCache {
                 cmd.encodeBufferBarrier(
                         cacheBuffer,
                         0,
-                        CacheLayouts.SpecularTransport.HEADER_BYTES,
+                        CacheLayouts.SurfaceDirect.HEADER_BYTES,
                         VK_PIPELINE_STAGE_TRANSFER_BIT,
                         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -94,7 +99,6 @@ public final class SpecularTransportCache {
             cacheStorageInitialized = true;
             cacheNeedsFullClear = false;
         }
-
         return cacheBuffer.addRef();
     }
 
@@ -104,9 +108,9 @@ public final class SpecularTransportCache {
             CacheRequestBatch batch,
             int frameIndex) {
         ensureFillRequestCapacity(ctx);
-
         int generation = currentGeneration();
-        ByteBuffer data = scratchFillRequests(FILL_REQUEST_BUFFER_BYTES);
+        ByteBuffer data = scratch(fillRequestScratch, FILL_REQUEST_BUFFER_BYTES);
+        fillRequestScratch = data;
         data.putInt(0);
         data.putInt(generation);
         data.putInt(CacheLayouts.MAX_FILL_REQUESTS);
@@ -115,23 +119,16 @@ public final class SpecularTransportCache {
         int requestCount = 0;
         if (batch != null) {
             for (CacheRequest request : batch.requests()) {
-                CacheRequestFamily family = request.key().family();
                 if (requestCount >= CacheLayouts.MAX_FILL_REQUESTS
-                        || (family != CacheRequestFamily.REFLECTION
-                                && family != CacheRequestFamily.REFRACTION)
+                        || request.key().family() != CacheRequestFamily.SURFACE_DIRECT_LIGHT
                         || !invalidationTracker.isCurrent(request.key(), request.versionStamp())) {
                     continue;
                 }
-
                 CacheRequestKey key = request.key();
                 data.putInt(key.gridCellX());
                 data.putInt(key.gridCellY());
                 data.putInt(key.gridCellZ());
-                data.putInt(key.variantKey());
-                data.putInt(family == CacheRequestFamily.REFLECTION ? 0 : 1);
-                data.putInt(key.detailKey());
-                data.putInt(0);
-                data.putInt(0);
+                data.putInt(key.variantKey() & 0xFFF);
                 data.putFloat(request.sampleX());
                 data.putFloat(request.sampleY());
                 data.putFloat(request.sampleZ());
@@ -141,7 +138,7 @@ public final class SpecularTransportCache {
         }
 
         data.putInt(0, requestCount);
-        data.position(CacheLayouts.SpecularTransport.HEADER_BYTES + requestCount * CacheLayouts.SpecularTransport.FILL_REQUEST_RECORD_BYTES);
+        data.position(CacheLayouts.SurfaceDirect.HEADER_BYTES + requestCount * CacheLayouts.SurfaceDirect.FILL_REQUEST_RECORD_BYTES);
         data.flip();
         int uploadBytes = data.remaining();
         VRef<VBuffer> fillRequestBuffer = fillRequestBuffers[frameIndex % FRAMES_IN_FLIGHT];
@@ -181,14 +178,12 @@ public final class SpecularTransportCache {
     }
 
     private void ensureCacheCapacity(VContext ctx) {
-        if (cacheBuffer != null) {
-            return;
-        }
+        if (cacheBuffer != null) return;
         cacheBuffer = ctx.memory.createBuffer(
-                CacheLayouts.SpecularTransport.CACHE_BUFFER_BYTES,
+                CacheLayouts.SurfaceDirect.CACHE_BUFFER_BYTES,
                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        cacheBuffer.get().setDebugUtilsObjectName("Specular transport cache");
+        cacheBuffer.get().setDebugUtilsObjectName("Surface direct-light cache");
         uploadedGeneration = 0;
         cacheStorageInitialized = false;
         cacheNeedsFullClear = true;
@@ -201,7 +196,7 @@ public final class SpecularTransportCache {
                         FILL_REQUEST_BUFFER_BYTES,
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                fillRequestBuffers[i].get().setDebugUtilsObjectName("Specular transport fill requests " + i);
+                fillRequestBuffers[i].get().setDebugUtilsObjectName("Surface direct-light fill requests " + i);
             }
         }
     }
@@ -210,13 +205,11 @@ public final class SpecularTransportCache {
         long hash = 0x9e3779b97f4a7c15L;
         hash = mix(hash, invalidationTracker.worldId());
         hash = mix(hash, invalidationTracker.shaderpackGeneration());
-        hash = mix(hash, invalidationTracker.skyGeneration());
-        hash = mix(hash, invalidationTracker.materialGeneration());
         hash = mix(hash, invalidationTracker.cacheLayoutGeneration());
-        hash = mix(hash, invalidationTracker.familyGeneration(CacheRequestFamily.REFLECTION));
-        hash = mix(hash, invalidationTracker.familyGeneration(CacheRequestFamily.REFRACTION));
-        hash = mix(hash, invalidationTracker.sceneGeometryGeneration());
-        hash = mix(hash, invalidationTracker.sceneLightGeneration());
+        hash = mix(hash, invalidationTracker.familyGeneration(CacheRequestFamily.SURFACE_DIRECT_LIGHT));
+        // Geometry and emitter invalidation are radius-2 and stored per entry.
+        // Cached lights use stable surface-relative identities, so unrelated
+        // table insertions do not flush the world cache.
         int generation = (int) (hash ^ (hash >>> 32));
         return generation == 0 ? 1 : generation;
     }
@@ -224,16 +217,6 @@ public final class SpecularTransportCache {
     private static long mix(long hash, long value) {
         hash ^= value + 0x9e3779b97f4a7c15L + (hash << 6) + (hash >>> 2);
         return hash;
-    }
-
-    private ByteBuffer scratchCache(int requiredBytes) {
-        cacheClearScratch = scratch(cacheClearScratch, requiredBytes);
-        return cacheClearScratch;
-    }
-
-    private ByteBuffer scratchFillRequests(int requiredBytes) {
-        fillRequestScratch = scratch(fillRequestScratch, requiredBytes);
-        return fillRequestScratch;
     }
 
     private static ByteBuffer scratch(ByteBuffer scratch, int requiredBytes) {
@@ -249,9 +232,7 @@ public final class SpecularTransportCache {
     }
 
     private static ByteBuffer freeScratch(ByteBuffer scratch) {
-        if (scratch != null) {
-            MemoryUtil.memFree(scratch);
-        }
+        if (scratch != null) MemoryUtil.memFree(scratch);
         return null;
     }
 }
