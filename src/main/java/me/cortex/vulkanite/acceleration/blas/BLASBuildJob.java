@@ -13,12 +13,18 @@ import java.util.Optional;
 public record BLASBuildJob(
         List<BLASTriangleData> geometries,
         JobPassThroughData data,
+        Optional<ShadowTriangleBLASInput> shadowTriangleInput,
+        boolean filteredShadowGeometry,
         Optional<ProceduralBLASInput> proceduralInput,
         ProceduralBLASDisposition proceduralDisposition) {
 
     public BLASBuildJob {
         geometries = List.copyOf(geometries);
         Objects.requireNonNull(data, "data");
+        shadowTriangleInput = Objects.requireNonNull(shadowTriangleInput, "shadowTriangleInput");
+        if (shadowTriangleInput.isPresent() && !filteredShadowGeometry) {
+            throw new IllegalArgumentException("A filtered shadow input requires filtered ownership");
+        }
         proceduralInput = Objects.requireNonNull(proceduralInput, "proceduralInput");
         Objects.requireNonNull(proceduralDisposition, "proceduralDisposition");
         if ((proceduralDisposition == ProceduralBLASDisposition.REPLACE) != proceduralInput.isPresent()) {
@@ -27,6 +33,6 @@ public record BLASBuildJob(
     }
 
     public BLASBuildJob(List<BLASTriangleData> geometries, JobPassThroughData data) {
-        this(geometries, data, Optional.empty(), ProceduralBLASDisposition.CLEAR);
+        this(geometries, data, Optional.empty(), false, Optional.empty(), ProceduralBLASDisposition.CLEAR);
     }
 }

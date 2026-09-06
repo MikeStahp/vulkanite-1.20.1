@@ -79,6 +79,10 @@ layout(push_constant) uniform PushConstants {
 	int debugMode;
 	int debugCellIndex; // For DLSS debug mode: which cell to display (0-5), -1 for grid view
 	int cacheOnHit;
+	int shadowComparisonSamplingPermille;
+	float shadowComparisonDistanceTolerance;
+	int hybridShadowEnabled;
+	int hybridShadowPadding;
 } pc;
 
 // Shader options (defaults from shaders.properties)
@@ -278,6 +282,17 @@ layout(push_constant) uniform PushConstants {
 
 
 layout(binding = 1) uniform accelerationStructureEXT acc;
+// Opt-in Phase 3 debug traversal. Java binds the procedural TLAS here only
+// while a procedural visualization is selected; normal lighting still traces acc.
+layout(binding = 32) uniform accelerationStructureEXT proceduralDebugAcc;
+// Unified Phase 7 production visibility structure. Material/reflection rays keep using acc.
+layout(binding = 34) uniform accelerationStructureEXT hybridShadowAcc;
+
+// Phase 4 debug-only counters. The buffer is cleared when comparison mode is
+// entered and then accumulates until the mode, world, or pipeline changes.
+layout(binding = 33, std430) buffer HybridShadowComparisonBuffer {
+    uint shadowComparisonWords[];
+};
 
 // Block textures
 layout(binding = 3) uniform sampler2D blockTex;
@@ -426,6 +441,409 @@ layout(binding = 11) uniform sampler2D gbufferExtra;       // colortex5 - Additi
 layout(location = 1) rayPayloadEXT float shadowPayload;
 layout(location = 0) rayPayloadEXT Payload payload;
 
+struct ProceduralDebugPayload {
+    vec4 worldHitAndDistance;
+    vec4 normalAndIds;
+    vec4 blockLocalPosition;
+};
+
+layout(location = 2) rayPayloadEXT ProceduralDebugPayload proceduralDebugPayload;
+
+#if VULKANITE_COMPILE_DIAGNOSTICS
+const uint COMPARISON_TOTAL = 0u;
+const uint COMPARISON_BOTH_HIT = 1u;
+const uint COMPARISON_DANGEROUS_MISS = 2u;
+const uint COMPARISON_EXTRA_HIT = 3u;
+const uint COMPARISON_BOTH_MISS = 4u;
+const uint COMPARISON_DISTANCE_AGREE = 5u;
+const uint COMPARISON_DISTANCE_MISMATCH = 6u;
+const uint COMPARISON_DISTANCE_SUM_FIXED = 7u;
+const uint COMPARISON_DISTANCE_MAX_BITS = 8u;
+const uint COMPARISON_COUNTER_SATURATIONS = 9u;
+const uint COMPARISON_DISTANCE_SAMPLES = 10u;
+const uint COMPARISON_BRICK_SIZE_BASE = 12u; // 4, 8, 16, unknown/miss
+const uint COMPARISON_OCTANT_BASE = 16u;
+const uint COMPARISON_INSIDE_START = 24u;
+const uint COMPARISON_MATERIAL_BASE = 25u; // opaque, cutout, special, entity, unknown
+const uint COMPARISON_SECTION_OVERFLOW = 30u;
+const uint COMPARISON_SOLID_INTERIOR_START = 31u;
+const uint COMPARISON_SECTION_BASE = 32u;
+const uint COMPARISON_SECTION_RECORD_WORDS = 5u;
+const uint COMPARISON_SECTION_RECORD_COUNT = 64u;
+const uint COMPARISON_DISTANCE_BUCKET_BASE = 352u;
+// dangerous owned/triangle-only/unknown, then distance owned/triangle-only/unknown
+const uint COMPARISON_OWNERSHIP_BUCKET_BASE = 360u;
+const uint COMPARISON_FLAG_DANGEROUS_MISS = 1u;
+const uint COMPARISON_FLAG_EXTRA_HIT = 2u;
+const uint COMPARISON_FLAG_DISTANCE_MISMATCH = 4u;
+
+const uint REFLECTION_COMPARISON_DISTANCE = 1u;
+const uint REFLECTION_COMPARISON_GEOMETRY_NORMAL = 2u;
+const uint REFLECTION_COMPARISON_MATERIAL_ID = 4u;
+const uint REFLECTION_COMPARISON_ALBEDO = 8u;
+const uint REFLECTION_COMPARISON_EMISSION = 16u;
+const uint REFLECTION_COMPARISON_PBR = 32u;
+
+uint comparisonPixelFlags;
+uint reflectionComparisonFlags;
+bool reflectionComparisonSampled;
+vec3 reflectionComparisonTint;
+#endif
+
+void resetMaterialPayload() {
+    payload.hitData = vec4(0.0, 0.0, 0.0, -1.0);
+    payload.geometryNormal = vec3(0.0);
+    payload.shadowTransmission = vec3(1.0);
+    payload.ignore_block_id = i16vec2(0);
+    payload.material.albedo = vec3(0.0);
+    payload.material.F0 = vec3(0.04);
+    payload.material.metallic = 0.0;
+    payload.material.roughness = 1.0;
+    payload.material.subsurface_scattering = 0.0;
+    payload.material.emission = vec3(0.0);
+    payload.material.normal = vec3(0.0, 1.0, 0.0);
+    payload.material.ambientOcclusion = 1.0;
+    payload.material.translucent = 1.0;
+    payload.material.block_id = i16vec2(0);
+    payload.material.light_texture = vec3(0.0);
+    payload.wetStrength_global = 0.0;
+    payload.wetness_global = 0.0;
+    payload.inside_block = false;
+    payload.prev_distance = 0.0;
+}
+
+#if VULKANITE_COMPILE_DIAGNOSTICS
+bool shouldCompareReflectionPrimary() {
+    if (pc.debugMode != 11) {
+        return false;
+    }
+    uint sampleLimit = uint(clamp(pc.shadowComparisonSamplingPermille, 1, 1000));
+    uint seed = uint(gl_LaunchIDEXT.x)
+        ^ (uint(gl_LaunchIDEXT.y) * 0x9e3779b9u)
+        ^ (cam.frameId * 0x85ebca6bu);
+    seed ^= seed >> 16u;
+    seed *= 0x7feb352du;
+    seed ^= seed >> 15u;
+    return seed % 1000u < sampleLimit;
+}
+
+vec3 proceduralIdColor(uint value) {
+    vec3 seed = vec3(float(value), float(value ^ 0x9e37u), float(value ^ 0x79b9u));
+    return fract(sin(seed * vec3(12.9898, 78.233, 37.719)) * 43758.5453);
+}
+
+vec3 proceduralDistanceColor(float distance) {
+    float normalized = 1.0 - exp(-max(distance, 0.0) * (1.0 / 32.0));
+    return clamp(vec3(
+        1.5 - abs(4.0 * normalized - 3.0),
+        1.5 - abs(4.0 * normalized - 2.0),
+        1.5 - abs(4.0 * normalized - 1.0)), 0.0, 1.0);
+}
+
+bool traceProceduralHit(
+    vec3 origin,
+    vec3 direction,
+    float rayMinimum,
+    float rayMaximum,
+    out float hitDistance,
+    out uint brickSize,
+    out bool originInsideBrick,
+    out bool originInsideSolid,
+    out ivec3 sectionCoordinate
+) {
+    proceduralDebugPayload.worldHitAndDistance = vec4(0.0, 0.0, 0.0, -1.0);
+    proceduralDebugPayload.normalAndIds = vec4(0.0);
+    proceduralDebugPayload.blockLocalPosition = vec4(0.0);
+    traceRayEXT(
+        proceduralDebugAcc,
+        gl_RayFlagsOpaqueEXT,
+        0x02,
+        0,
+        0,
+        2,
+        origin,
+        rayMinimum,
+        direction,
+        rayMaximum,
+        2);
+
+    hitDistance = proceduralDebugPayload.worldHitAndDistance.w;
+    uint metadata = floatBitsToUint(proceduralDebugPayload.blockLocalPosition.w);
+    brickSize = metadata & 0xffu;
+    originInsideBrick = (metadata & 0x100u) != 0u;
+    originInsideSolid = (metadata & 0x200u) != 0u;
+    sectionCoordinate = ivec3(floor(proceduralDebugPayload.worldHitAndDistance.xyz / 16.0));
+    return hitDistance >= 0.0;
+}
+
+float traceProceduralShadowReference(
+    vec3 origin,
+    vec3 direction,
+    float rayMinimum,
+    float rayMaximum
+) {
+    // The standalone procedural TLAS stores record 2 on its instances. The
+    // trace-time offset of 3 therefore selects production shadow record 5.
+    // Keep this binary path identical to the pre-hybrid Phase 5 shadow leg:
+    // assume occlusion, let miss record 1 publish visibility, and never run a
+    // closest-hit shader after the exact procedural intersection accepts a hit.
+    shadowPayload = 0.0;
+    traceRayEXT(
+        proceduralDebugAcc,
+        gl_RayFlagsOpaqueEXT
+            | gl_RayFlagsTerminateOnFirstHitEXT
+            | gl_RayFlagsSkipClosestHitShaderEXT,
+        0x02,
+        3,
+        0,
+        1,
+        origin,
+        rayMinimum,
+        direction,
+        rayMaximum,
+        1);
+    return shadowPayload;
+}
+
+vec3 decodeTerrainPosition(Vertex vertex) {
+    return vec3(vertex.position.xyz) * (32.0 / 65536.0) - 8.0;
+}
+
+bool reconstructTriangleOwnerCell(
+    Quad quad,
+    mat4x3 objectToWorld,
+    out ivec3 worldCell
+) {
+    vec3 objectCenter = vec3(0.0);
+    bool hasMidBlock = false;
+    for (int vertexIndex = 0; vertexIndex < 4; vertexIndex++) {
+        ivec3 midBlock = ivec3(quad.vertices[vertexIndex].mid_block);
+        hasMidBlock = hasMidBlock || any(notEqual(midBlock, ivec3(0)));
+        objectCenter += decodeTerrainPosition(quad.vertices[vertexIndex])
+            + vec3(midBlock) * (1.0 / 64.0);
+    }
+    if (!hasMidBlock) {
+        worldCell = ivec3(0);
+        return false;
+    }
+
+    // Iris stores mid_block as (owning block center - vertex) * 64. Averaging
+    // the four independently reconstructed centers removes quantization noise.
+    vec3 worldCenter = objectToWorld * vec4(objectCenter * 0.25, 1.0);
+    worldCell = ivec3(floor(worldCenter));
+    return true;
+}
+
+bool proceduralOwnsCell(ivec3 worldCell) {
+    float ignoredDistance;
+    uint ignoredBrickSize;
+    bool ignoredInside;
+    bool ignoredInsideSolid;
+    ivec3 ignoredSection;
+    // The quarter-block ray cannot leave the cell. Starting at its center makes
+    // this an occupancy/ownership probe, independent of the original grazing ray.
+    return traceProceduralHit(
+        vec3(worldCell) + vec3(0.5),
+        vec3(1.0, 0.0, 0.0),
+        0.001,
+        0.25,
+        ignoredDistance,
+        ignoredBrickSize,
+        ignoredInside,
+        ignoredInsideSolid,
+        ignoredSection);
+}
+
+vec3 traceProceduralDebug(vec3 origin, vec3 direction, int debugMode) {
+    float ignoredDistance;
+    uint ignoredBrickSize;
+    bool ignoredInside;
+    bool ignoredInsideSolid;
+    ivec3 ignoredSection;
+    if (!traceProceduralHit(origin, direction, 0.001, 10000.0,
+            ignoredDistance, ignoredBrickSize, ignoredInside, ignoredInsideSolid, ignoredSection)) {
+        return vec3(0.01, 0.015, 0.025);
+    }
+    if (debugMode == 3) {
+        return proceduralDistanceColor(proceduralDebugPayload.worldHitAndDistance.w);
+    }
+    if (debugMode == 4) {
+        return normalize(proceduralDebugPayload.normalAndIds.xyz) * 0.5 + 0.5;
+    }
+
+    uint packedIds = floatBitsToUint(proceduralDebugPayload.normalAndIds.w);
+    uint brickId = packedIds & 0xffffu;
+    uint localCellId = packedIds >> 16u;
+    return proceduralIdColor(debugMode == 5 ? brickId : localCellId);
+}
+
+void atomicSaturatingAddComparison(uint word, uint value) {
+    uint previous = atomicAdd(shadowComparisonWords[word], value);
+    if (previous > 0xffffffffu - value) {
+        // Keep the common path at one atomic operation. Overflow is exceptional;
+        // racing overflow writers all converge back to the saturated value.
+        atomicMax(shadowComparisonWords[word], 0xffffffffu);
+        atomicAdd(shadowComparisonWords[COMPARISON_COUNTER_SATURATIONS], 1u);
+    }
+}
+
+void recordComparisonSection(ivec3 sectionCoordinate) {
+    uint hash = uint(sectionCoordinate.x) * 0x8da6b343u
+        ^ uint(sectionCoordinate.y) * 0xd8163841u
+        ^ uint(sectionCoordinate.z) * 0xcb1ab31fu;
+    hash ^= hash >> 16u;
+    uint key = hash | 1u;
+    for (uint probe = 0u; probe < COMPARISON_SECTION_RECORD_COUNT; probe++) {
+        uint slot = (hash + probe) & (COMPARISON_SECTION_RECORD_COUNT - 1u);
+        uint base = COMPARISON_SECTION_BASE + slot * COMPARISON_SECTION_RECORD_WORDS;
+        uint state = atomicAdd(shadowComparisonWords[base], 0u);
+        if (state == key) {
+            atomicSaturatingAddComparison(base + 4u, 1u);
+            return;
+        }
+        if (state == 0u && atomicCompSwap(shadowComparisonWords[base], 0u, key) == 0u) {
+            shadowComparisonWords[base + 1u] = uint(sectionCoordinate.x);
+            shadowComparisonWords[base + 2u] = uint(sectionCoordinate.y);
+            shadowComparisonWords[base + 3u] = uint(sectionCoordinate.z);
+            shadowComparisonWords[base + 4u] = 1u;
+            return;
+        }
+    }
+    atomicSaturatingAddComparison(COMPARISON_SECTION_OVERFLOW, 1u);
+}
+
+void recordDistanceMismatchBucket(float difference) {
+    uint bucket = difference <= 0.02 ? 0u
+        : (difference <= 0.05 ? 1u
+        : (difference <= 0.1 ? 2u
+        : (difference <= 0.5 ? 3u
+        : (difference <= 1.0 ? 4u
+        : (difference <= 2.0 ? 5u
+        : (difference <= 16.0 ? 6u : 7u))))));
+    atomicSaturatingAddComparison(COMPARISON_DISTANCE_BUCKET_BASE + bucket, 1u);
+}
+
+bool shouldCompareShadowRay(vec3 rayOrigin, vec3 rayDirection) {
+    if (pc.debugMode < 7 || pc.debugMode > 9) {
+        return false;
+    }
+    uint sampleLimit = uint(clamp(pc.shadowComparisonSamplingPermille, 1, 1000));
+    uint seed = floatBitsToUint(rayOrigin.x) ^ (floatBitsToUint(rayOrigin.y) * 0x9e3779b9u)
+        ^ (floatBitsToUint(rayOrigin.z) * 0x85ebca6bu)
+        ^ (floatBitsToUint(rayDirection.x) * 0xc2b2ae35u)
+        ^ (floatBitsToUint(rayDirection.y) * 0x27d4eb2du)
+        ^ (floatBitsToUint(rayDirection.z) * 0x165667b1u)
+        ^ uint(gl_LaunchIDEXT.x + gl_LaunchIDEXT.y * gl_LaunchSizeEXT.x)
+        ^ cam.frameId;
+    seed ^= seed >> 16u;
+    seed *= 0x7feb352du;
+    seed ^= seed >> 15u;
+    return seed % 1000u < sampleLimit;
+}
+
+void recordShadowComparison(
+    bool triangleHit,
+    float triangleDistance,
+    uint materialClass,
+    uint triangleOwnershipClass,
+    ivec3 triangleOwnerCell,
+    vec3 rayOrigin,
+    vec3 rayDirection,
+    float rayMinimum,
+    float rayMaximum
+) {
+    if (!shouldCompareShadowRay(rayOrigin, rayDirection)) {
+        return;
+    }
+
+    float proceduralDistance;
+    uint brickSize;
+    bool originInsideBrick;
+    bool originInsideSolid;
+    ivec3 proceduralSection;
+    bool proceduralHit = traceProceduralHit(
+        rayOrigin, rayDirection, rayMinimum, rayMaximum,
+        proceduralDistance, brickSize, originInsideBrick, originInsideSolid, proceduralSection);
+    vec3 proceduralHitPosition = proceduralDebugPayload.worldHitAndDistance.xyz;
+    vec3 proceduralHitNormal = normalize(proceduralDebugPayload.normalAndIds.xyz);
+    ivec3 proceduralHitCell = ivec3(floor(
+        proceduralHitPosition - proceduralHitNormal * 2.0e-5));
+
+    atomicSaturatingAddComparison(COMPARISON_TOTAL, 1u);
+    bool mismatch = false;
+    if (triangleHit && proceduralHit) {
+        atomicSaturatingAddComparison(COMPARISON_BOTH_HIT, 1u);
+        float difference = abs(triangleDistance - proceduralDistance);
+        if (originInsideSolid) {
+            atomicSaturatingAddComparison(COMPARISON_SOLID_INTERIOR_START, 1u);
+            return;
+        }
+        atomicMax(shadowComparisonWords[COMPARISON_DISTANCE_MAX_BITS], floatBitsToUint(difference));
+        atomicSaturatingAddComparison(
+            COMPARISON_DISTANCE_SUM_FIXED,
+            uint(clamp(round(difference * 64.0), 0.0, 4194303.0)));
+        atomicSaturatingAddComparison(COMPARISON_DISTANCE_SAMPLES, 1u);
+        if (difference <= pc.shadowComparisonDistanceTolerance) {
+            atomicSaturatingAddComparison(COMPARISON_DISTANCE_AGREE, 1u);
+        } else {
+            atomicSaturatingAddComparison(COMPARISON_DISTANCE_MISMATCH, 1u);
+            recordDistanceMismatchBucket(difference);
+            comparisonPixelFlags |= COMPARISON_FLAG_DISTANCE_MISMATCH;
+            mismatch = true;
+        }
+    } else if (triangleHit) {
+        atomicSaturatingAddComparison(COMPARISON_DANGEROUS_MISS, 1u);
+        comparisonPixelFlags |= COMPARISON_FLAG_DANGEROUS_MISS;
+        mismatch = true;
+    } else if (proceduralHit) {
+        atomicSaturatingAddComparison(COMPARISON_EXTRA_HIT, 1u);
+        comparisonPixelFlags |= COMPARISON_FLAG_EXTRA_HIT;
+        materialClass = 4u;
+        mismatch = true;
+    } else {
+        atomicSaturatingAddComparison(COMPARISON_BOTH_MISS, 1u);
+    }
+
+    if (!mismatch) {
+        return;
+    }
+
+    if (triangleHit) {
+        uint ownershipBucket = 2u;
+        if (triangleOwnershipClass == 1u) {
+            ownershipBucket = 1u;
+        } else if (triangleOwnershipClass == 2u) {
+            bool owned = proceduralOwnsCell(triangleOwnerCell);
+            ownershipBucket = owned ? 0u : 1u;
+            if (proceduralHit && owned && any(notEqual(triangleOwnerCell, proceduralHitCell))) {
+                // Both are valid solid occluders, but the two paths selected a
+                // different caster. This is not a same-surface distance error.
+                ownershipBucket = 3u;
+            }
+        }
+        uint mismatchKindOffset = proceduralHit ? 3u : 0u;
+        atomicSaturatingAddComparison(
+            COMPARISON_OWNERSHIP_BUCKET_BASE + mismatchKindOffset + ownershipBucket,
+            1u);
+    }
+
+    uint brickBucket = brickSize == 4u ? 0u : (brickSize == 8u ? 1u : (brickSize == 16u ? 2u : 3u));
+    atomicSaturatingAddComparison(COMPARISON_BRICK_SIZE_BASE + brickBucket, 1u);
+    uint octant = (rayDirection.x < 0.0 ? 1u : 0u)
+        | (rayDirection.y < 0.0 ? 2u : 0u)
+        | (rayDirection.z < 0.0 ? 4u : 0u);
+    atomicSaturatingAddComparison(COMPARISON_OCTANT_BASE + octant, 1u);
+    if (originInsideBrick) {
+        atomicSaturatingAddComparison(COMPARISON_INSIDE_START, 1u);
+    }
+    atomicSaturatingAddComparison(COMPARISON_MATERIAL_BASE + min(materialClass, 4u), 1u);
+    vec3 mismatchPosition = proceduralHit
+        ? proceduralHitPosition
+        : rayOrigin + rayDirection * triangleDistance;
+    recordComparisonSection(ivec3(floor(mismatchPosition / 16.0)));
+}
+#endif
+
 bool finiteVec4(vec4 v) {
     return !any(isnan(v)) && !any(isinf(v));
 }
@@ -454,16 +872,44 @@ vec2 queryFragmentUv(Quad quad, uint primitiveIndex, vec2 barycentrics) {
 }
 
 float alphaAwareVisibility(vec3 rayOrigin, vec3 rayDirection, float rayDistance) {
+#if VULKANITE_COMPILE_DIAGNOSTICS
+    bool comparisonPath = pc.debugMode >= 7 && pc.debugMode <= 9;
+    bool doubleTraceReferencePath = pc.debugMode == 10;
+#else
+    const bool comparisonPath = false;
+    const bool doubleTraceReferencePath = false;
+#endif
+
+    // Inline ray queries expose procedural AABBs only as candidates; they do
+    // not execute the SBT intersection shader. Use a pipeline trace for the
+    // unified TLAS so record 5 runs the exact brick-local DDA before accepting
+    // an opaque voxel hit. Records 3 and 4 retain terrain/entity alpha tests;
+    // closest-hit shading is skipped because binary visibility needs only the
+    // initial occluded value or miss record 1's visible value.
+#if VULKANITE_HYBRID_SHADOW_PIPELINE
+    if (!comparisonPath && !doubleTraceReferencePath && pc.hybridShadowEnabled != 0) {
+        shadowPayload = 0.0;
+        traceRayEXT(
+            hybridShadowAcc,
+            gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+            0x07,
+            0,
+            0,
+            1,
+            rayOrigin,
+            0.001,
+            rayDirection,
+            rayDistance,
+            1);
+        return shadowPayload;
+    }
+#endif
+
+    // Triangle-only fallback and comparison reference path. Keeping this on
+    // the material TLAS preserves unsupported/disabled-device behavior.
     rayQueryEXT query;
-    rayQueryInitializeEXT(
-        query,
-        acc,
-        gl_RayFlagsTerminateOnFirstHitEXT,
-        0xFF,
-        rayOrigin,
-        0.001,
-        rayDirection,
-        rayDistance);
+    rayQueryInitializeEXT(query, acc, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
+        rayOrigin, 0.001, rayDirection, rayDistance);
 
     while (rayQueryProceedEXT(query)) {
         uint sbtOffset = rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(query, false);
@@ -494,7 +940,58 @@ float alphaAwareVisibility(vec3 rayOrigin, vec3 rayDirection, float rayDistance)
         }
     }
 
-    return rayQueryGetIntersectionTypeEXT(query, true) == 0 ? 1.0 : 0.0;
+    bool triangleHit = rayQueryGetIntersectionTypeEXT(query, true) != 0u;
+
+#if VULKANITE_COMPILE_DIAGNOSTICS
+    // Phase 5 reference path: preserve the old two-trace contract without
+    // comparison overlays or readback. A shadow is blocked when either the
+    // material triangle TLAS or the procedural TLAS reports an opaque hit.
+    if (doubleTraceReferencePath) {
+        float proceduralVisibility = traceProceduralShadowReference(
+            rayOrigin,
+            rayDirection,
+            0.001,
+            rayDistance);
+        bool proceduralHit = proceduralVisibility <= 0.0;
+        return triangleHit || proceduralHit ? 0.0 : 1.0;
+    }
+
+    float triangleDistance = triangleHit
+        ? rayQueryGetIntersectionTEXT(query, true)
+        : rayDistance;
+    uint materialClass = 4u;
+    uint triangleOwnershipClass = 0u; // unknown, known triangle-only, terrain cell to probe
+    ivec3 triangleOwnerCell = ivec3(0);
+    if (triangleHit) {
+        uint sbtOffset = rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(query, true);
+        if (sbtOffset != 0u) {
+            materialClass = 3u;
+            triangleOwnershipClass = 1u;
+        } else {
+            uint geometryIndex = nonuniformEXT(
+                rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)
+                + rayQueryGetIntersectionGeometryIndexEXT(query, true));
+            uint primitiveIndex = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+            Quad quad = geometryBuffers[geometryIndex].quads[primitiveIndex >> 1u];
+            float blockId = float(quad.vertices[0].block_id.x);
+            materialClass = isFoliageMaterial(blockId)
+                ? 1u
+                : ((isWaterMaterial(blockId) || isGlassMaterial(blockId) || isIceMaterial(blockId)) ? 2u : 0u);
+            if (reconstructTriangleOwnerCell(
+                    quad,
+                    rayQueryGetIntersectionObjectToWorldEXT(query, true),
+                    triangleOwnerCell)) {
+                triangleOwnershipClass = 2u;
+            }
+        }
+    }
+
+    recordShadowComparison(
+        triangleHit, triangleDistance, materialClass,
+        triangleOwnershipClass, triangleOwnerCell,
+        rayOrigin, rayDirection, 0.001, rayDistance);
+#endif
+    return triangleHit ? 0.0 : 1.0;
 }
 
 vec3 applyLinearColorGrade(vec3 color) {
@@ -4313,6 +4810,12 @@ void writeSkyDlssSidecars(ivec2 pixel) {
 // ============================================================================
 
 void main() {
+#if VULKANITE_COMPILE_DIAGNOSTICS
+comparisonPixelFlags = 0u;
+reflectionComparisonFlags = 0u;
+reflectionComparisonSampled = false;
+reflectionComparisonTint = vec3(0.0);
+#endif
 // A negative mode is a bounded request-only dispatch. It fills cache misses and
 // exits before any full-frame visibility or lighting work.
 if (pc.cacheOnHit < 0) {
@@ -4415,27 +4918,128 @@ if (pc.debugMode == 1) {
  vec2 jitteredPixelCenter = vec2(originalPixelCoord) + vec2(0.5) + cam.jitterData.xy;
  vec2 rayUv = jitteredPixelCenter / launchSize;
   
-  vec3 target = mix(mix(corner0, corner2, rayUv.y), mix(corner1, corner3, rayUv.y), rayUv.x);
+ vec3 target = mix(mix(corner0, corner2, rayUv.y), mix(corner1, corner3, rayUv.y), rayUv.x);
   vec3 direction = normalize((cam.viewInverse * vec4(target, 0.0)).xyz);
   
   ivec2 pixelCoord = ivec2(rayP * launchSize);
 
+#if VULKANITE_COMPILE_DIAGNOSTICS
+  if (pc.debugMode >= 3 && pc.debugMode <= 6) {
+    vec3 debugColor = traceProceduralDebug(origin, direction, pc.debugMode);
+    imageStore(outputImage, originalPixelCoord, vec4(debugColor, 1.0));
+    return;
+  }
+#endif
+
   // Initialize payload
-  payload.hitData = vec4(0, 0, 0, -1);
-  payload.geometryNormal = vec3(0);
-  payload.material.albedo = vec3(0);
-  payload.material.emission = vec3(0);
-  payload.material.roughness = 1.0;
-  payload.material.metallic = 0.0;
-  payload.material.F0 = vec3(0.04);
-  payload.material.normal = vec3(0, 1, 0);
-  payload.material.block_id = i16vec2(0);
-  payload.material.ambientOcclusion = 1.0;
-  payload.material.translucent = 1.0;
-  payload.shadowTransmission = vec3(1);
-  payload.ignore_block_id = i16vec2(0);
-  payload.inside_block = false;
-  payload.prev_distance = 0.0;
+  resetMaterialPayload();
+
+#if VULKANITE_COMPILE_DIAGNOSTICS
+  if (shouldCompareReflectionPrimary()) {
+    reflectionComparisonSampled = true;
+
+    // The material TLAS is forced to its complete triangle layout by Java while
+    // mode 11 is active. Save this payload so the diagnostic trace cannot alter
+    // the triangle-owned rendering path that follows below.
+    traceRayEXT(
+        acc,
+        gl_RayFlagsNoneEXT,
+        0xFF,
+        0,
+        0,
+        0,
+        origin,
+        0.001,
+        direction,
+        10000.0,
+        0);
+    Payload trianglePayload = payload;
+
+    resetMaterialPayload();
+    // Standalone procedural instances select record 2. The trace-time offset
+    // of 4 therefore selects the material-capable procedural record 6.
+    traceRayEXT(
+        proceduralDebugAcc,
+        gl_RayFlagsOpaqueEXT,
+        0x02,
+        4,
+        0,
+        0,
+        origin,
+        0.001,
+        direction,
+        10000.0,
+        0);
+
+    bool triangleHit = trianglePayload.hitData.w >= 0.0;
+    bool proceduralHit = payload.hitData.w >= 0.0;
+    if (triangleHit != proceduralHit) {
+        // Red is triangle-only coverage; blue is procedural-only coverage.
+        reflectionComparisonTint = triangleHit
+            ? vec3(1.0, 0.01, 0.0)
+            : vec3(0.0, 0.35, 1.0);
+    } else if (!triangleHit) {
+        reflectionComparisonTint = vec3(0.04, 0.42, 0.12);
+    } else {
+        if (abs(trianglePayload.hitData.w - payload.hitData.w)
+                > pc.shadowComparisonDistanceTolerance) {
+            reflectionComparisonFlags |= REFLECTION_COMPARISON_DISTANCE;
+        }
+
+        vec3 triangleGeometryNormal = normalize(trianglePayload.geometryNormal);
+        vec3 proceduralGeometryNormal = normalize(payload.geometryNormal);
+        if (dot(triangleGeometryNormal, proceduralGeometryNormal) < 0.995) {
+            reflectionComparisonFlags |= REFLECTION_COMPARISON_GEOMETRY_NORMAL;
+        }
+
+        if (any(notEqual(
+                ivec2(trianglePayload.material.block_id),
+                ivec2(payload.material.block_id)))) {
+            reflectionComparisonFlags |= REFLECTION_COMPARISON_MATERIAL_ID;
+        }
+
+        vec3 albedoDifference = abs(
+            trianglePayload.material.albedo - payload.material.albedo);
+        if (max(max(albedoDifference.x, albedoDifference.y), albedoDifference.z) > 0.04) {
+            // This sampled-color check also exposes most atlas-UV mismatches;
+            // the shared Payload ABI does not carry raw atlas UV coordinates.
+            reflectionComparisonFlags |= REFLECTION_COMPARISON_ALBEDO;
+        }
+
+        vec3 emissionDifference = abs(
+            trianglePayload.material.emission - payload.material.emission);
+        if (max(max(emissionDifference.x, emissionDifference.y), emissionDifference.z) > 0.02) {
+            reflectionComparisonFlags |= REFLECTION_COMPARISON_EMISSION;
+        }
+
+        vec3 f0Difference = abs(trianglePayload.material.F0 - payload.material.F0);
+        float maxF0Difference = max(max(f0Difference.x, f0Difference.y), f0Difference.z);
+        if (abs(trianglePayload.material.roughness - payload.material.roughness) > 0.03
+                || abs(trianglePayload.material.metallic - payload.material.metallic) > 0.03
+                || maxF0Difference > 0.04) {
+            reflectionComparisonFlags |= REFLECTION_COMPARISON_PBR;
+        }
+
+        // Priority makes one mismatch class unambiguous per pixel. The thin
+        // legend strip at output time shows the complete color ordering.
+        reflectionComparisonTint = (reflectionComparisonFlags & REFLECTION_COMPARISON_DISTANCE) != 0u
+            ? vec3(1.0, 0.48, 0.0)
+            : ((reflectionComparisonFlags & REFLECTION_COMPARISON_GEOMETRY_NORMAL) != 0u
+                ? vec3(1.0, 0.0, 0.8)
+                : ((reflectionComparisonFlags & REFLECTION_COMPARISON_MATERIAL_ID) != 0u
+                    ? vec3(1.0, 0.92, 0.0)
+                    : ((reflectionComparisonFlags & REFLECTION_COMPARISON_ALBEDO) != 0u
+                        ? vec3(0.0, 0.9, 1.0)
+                        : ((reflectionComparisonFlags & REFLECTION_COMPARISON_EMISSION) != 0u
+                            ? vec3(0.62, 0.1, 1.0)
+                            : ((reflectionComparisonFlags & REFLECTION_COMPARISON_PBR) != 0u
+                                ? vec3(0.55, 1.0, 0.05)
+                                : vec3(0.04, 0.72, 0.16))))));
+    }
+
+    payload = trianglePayload;
+  }
+#endif
   
   vec3 albedo;
   vec3 normal;
@@ -5691,6 +6295,79 @@ imageStore(blocklightDetailImage, screenCoord,
 		// This is what we computed above - just use the color as-is
 	}
 }
+#if VULKANITE_COMPILE_DIAGNOSTICS
+else if (pc.debugMode >= 7 && pc.debugMode <= 9) {
+    bool dangerousMiss = (comparisonPixelFlags & COMPARISON_FLAG_DANGEROUS_MISS) != 0u;
+    bool extraHit = (comparisonPixelFlags & COMPARISON_FLAG_EXTRA_HIT) != 0u;
+    bool distanceMismatch = (comparisonPixelFlags & COMPARISON_FLAG_DISTANCE_MISMATCH) != 0u;
+    if (pc.debugMode == 8) {
+        color.rgb = dangerousMiss ? vec3(1.0, 0.02, 0.0) : color.rgb * 0.16;
+    } else if (pc.debugMode == 9) {
+        color.rgb = extraHit ? vec3(0.0, 0.45, 1.0) : color.rgb * 0.16;
+    } else {
+        if (dangerousMiss) {
+            color.rgb = mix(color.rgb, vec3(1.0, 0.0, 0.0), 0.85);
+        } else if (extraHit) {
+            color.rgb = mix(color.rgb, vec3(0.0, 0.4, 1.0), 0.8);
+        } else if (distanceMismatch) {
+            color.rgb = mix(color.rgb, vec3(1.0, 0.75, 0.0), 0.75);
+        }
+
+        // Two compact cumulative-total bars. The first partitions all four hit
+        // outcomes; the second partitions agreeing and differing hit distances.
+        // Counters persist across frames, so the bars stabilize even though ray
+        // invocations within the current dispatch have no global barrier.
+        float pixelY = float(originalPixelCoord.y);
+        float normalizedX = (float(originalPixelCoord.x) + 0.5) / launchSize.x;
+        if (pixelY < 10.0) {
+            float total = max(float(atomicAdd(shadowComparisonWords[COMPARISON_TOTAL], 0u)), 1.0);
+            float bothEnd = float(atomicAdd(shadowComparisonWords[COMPARISON_BOTH_HIT], 0u)) / total;
+            float dangerousEnd = bothEnd
+                + float(atomicAdd(shadowComparisonWords[COMPARISON_DANGEROUS_MISS], 0u)) / total;
+            float extraEnd = dangerousEnd
+                + float(atomicAdd(shadowComparisonWords[COMPARISON_EXTRA_HIT], 0u)) / total;
+            color.rgb = normalizedX < bothEnd
+                ? vec3(0.05, 0.8, 0.18)
+                : (normalizedX < dangerousEnd
+                    ? vec3(1.0, 0.0, 0.0)
+                    : (normalizedX < extraEnd ? vec3(0.0, 0.4, 1.0) : vec3(0.08)));
+        } else if (pixelY < 20.0) {
+            float distanceTotal = max(
+                float(atomicAdd(shadowComparisonWords[COMPARISON_DISTANCE_AGREE], 0u))
+                + float(atomicAdd(shadowComparisonWords[COMPARISON_DISTANCE_MISMATCH], 0u)), 1.0);
+            float agreeEnd = float(atomicAdd(
+                shadowComparisonWords[COMPARISON_DISTANCE_AGREE], 0u)) / distanceTotal;
+            color.rgb = normalizedX < agreeEnd
+                ? vec3(0.1, 0.65, 0.22)
+                : vec3(1.0, 0.72, 0.0);
+        }
+    }
+} else if (pc.debugMode == 11) {
+    if (reflectionComparisonSampled) {
+        color.rgb = mix(color.rgb * 0.18, reflectionComparisonTint, 0.82);
+    } else {
+        // Make a reduced sampling rate visually explicit instead of implying
+        // that untraced pixels agree.
+        float luma = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
+        color.rgb = vec3(luma) * 0.22;
+    }
+
+    // Compact color key, left-to-right: triangle-only, procedural-only,
+    // distance, geometric normal, material id, sampled albedo, emission, PBR, agree.
+    if (originalPixelCoord.y < 6) {
+        int key = clamp(int(originalP.x * 9.0), 0, 8);
+        color.rgb = key == 0 ? vec3(1.0, 0.01, 0.0)
+            : (key == 1 ? vec3(0.0, 0.35, 1.0)
+            : (key == 2 ? vec3(1.0, 0.48, 0.0)
+            : (key == 3 ? vec3(1.0, 0.0, 0.8)
+            : (key == 4 ? vec3(1.0, 0.92, 0.0)
+            : (key == 5 ? vec3(0.0, 0.9, 1.0)
+            : (key == 6 ? vec3(0.62, 0.1, 1.0)
+            : (key == 7 ? vec3(0.55, 1.0, 0.05)
+            : vec3(0.04, 0.72, 0.16))))))));
+    }
+}
+#endif
   // When debug mode is off, we just output the computed color
 
 #if SECTION_LIGHT_PROBE_DEBUG_MODE != 0

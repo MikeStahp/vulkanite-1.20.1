@@ -60,10 +60,18 @@ dependencies {
 
     testImplementation platform('org.junit:junit-bom:5.10.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'
+    // Minecraft's mapped classes require Loader's access and Mixin transforms.
+    testImplementation "net.fabricmc:fabric-loader-junit:${project.loader_version}"
 }
 
 tasks.named('test') {
     useJUnitPlatform()
+    // Loader/Mixin initialization can emit config and logs; keep them with
+    // generated test output instead of in the checkout or the game directory.
+    workingDir = layout.buildDirectory.dir("test-runtime").get().asFile
+    doFirst {
+        workingDir.mkdirs()
+    }
 }
 
 processResources {
@@ -105,6 +113,12 @@ tasks.withType(JavaExec).configureEach {
             "--add-opens=java.base/java.lang=ALL-UNNAMED",
             "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
             "--add-opens=java.base/java.util=ALL-UNNAMED"
+    // Forward explicit development selections to the launched JVM. Defaults and
+    // feature dependencies belong to the runtime configuration, including the
+    // default-off hybrid and diagnostic paths.
+    project.properties.findAll { key, value -> key.startsWith("vulkanite.") }.each { key, value ->
+        systemProperty key, value.toString()
+    }
 }
 
 java {

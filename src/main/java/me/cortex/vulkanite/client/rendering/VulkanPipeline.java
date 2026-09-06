@@ -1,5 +1,6 @@
 package me.cortex.vulkanite.client.rendering;
 
+import me.cortex.vulkanite.acceleration.HybridAccelerationConfig;
 import me.cortex.vulkanite.acceleration.AccelerationManager;
 import me.cortex.vulkanite.client.Vulkanite;
 import me.cortex.vulkanite.client.config.DLSSConfig;
@@ -23,7 +24,9 @@ import me.cortex.vulkanite.lib.memory.VBuffer;
 import me.cortex.vulkanite.lib.memory.VGImage;
 import me.cortex.vulkanite.lib.memory.VImage;
 import me.cortex.vulkanite.lib.other.DeviceLostException;
+import me.cortex.vulkanite.lib.other.GpuTimestampMath;
 import me.cortex.vulkanite.lib.other.VImageView;
+import me.cortex.vulkanite.lib.other.VQueryPool;
 import me.cortex.vulkanite.lib.other.VSampler;
 import me.cortex.vulkanite.lib.other.VUtil;
 import me.cortex.vulkanite.lib.other.sync.VSemaphore;
@@ -48,8 +51,11 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
@@ -79,6 +85,14 @@ public class VulkanPipeline {
     private static final int MAX_CACHE_REQUEST_BACKLOG = 16_384;
     private static final int MAX_CACHE_REQUESTS_PER_FRAME = 256;
     private static final long FRAME_PATH_LOG_INTERVAL_NANOS = 5_000_000_000L;
+    private static final long SHADOW_COMPARISON_LOG_INTERVAL_NANOS = 5_000_000_000L;
+    private static final boolean PHASE7_GPU_TIMING = Boolean.getBoolean("vulkanite.phase7GpuTiming");
+    private static final int RAY_TIMING_SLOTS = 16;
+    private static final int RAY_TIMING_QUERIES_PER_SLOT = 2;
+    private static final int RAY_TIMING_START = 0;
+    private static final int RAY_TIMING_END = 1;
+    private static final int RAY_TIMING_WARMUP_SAMPLES = 30;
+    private static final int RAY_TIMING_WINDOW_SAMPLES = 120;
 
     public record CustomTexture(String name, VRef<VGImage> image) {
     }
@@ -111,9 +125,17 @@ public class VulkanPipeline {
     private final DLSSDProcessor dlssdProcessor;
     private final PipelineRequirements pipelineRequirements;
     private final boolean supportsEntities;
+    private final boolean supportsProceduralDebug;
+    private final boolean supportsHybridShadow;
+    private final boolean supportsProceduralReflection;
+    private final boolean proceduralReflectionRequested;
+    private final VRef<VBuffer> shadowComparisonBuffer;
+    private final VRef<VBuffer> shadowComparisonReadbackBuffer;
+    private final VRef<VQueryPool> rayTimestampQueryPool;
+    private final RayTimingSlot[] rayTimingSlots = new RayTimingSlot[RAY_TIMING_SLOTS];
+    private final Map<RayTimingKey, RayTimingWindow> rayTimingWindows = new HashMap<>();
     private final EntityCapture capture = new EntityCapture();
 
-    private RtxPassGraph passGraph;
     private String currentShaderpackName;
     private boolean shaderpackInitialized;
     private boolean entityCacheStateActive;
@@ -130,11 +152,43 @@ public class VulkanPipeline {
     private long cacheFillDispatches;
     private long rtDispatchesSkipped;
     private boolean destroyed;
+    private boolean proceduralDebugUnavailableLogged;
+    private boolean shadowComparisonActive;
+    private boolean shadowComparisonReadbackPending;
+    private long nextShadowComparisonLogNanos;
+    private int rayTimingCursor;
+    private long rayTimingSequence;
+    private long rayTimingDrops;
+    private RayTimingSlot rayTimingAwaitingSubmission;
 
     public VulkanPipeline(VContext ctx, AccelerationManager accelerationManager, RaytracingShaderSet[] passes,
             int[] ssboIds, List<CustomTexture> customTextures) {
         this.ctx = ctx;
         this.accelerationManager = accelerationManager;
+        for (int i = 0; i < rayTimingSlots.length; i++) {
+            rayTimingSlots[i] = new RayTimingSlot(i);
+        }
+        if (PHASE7_GPU_TIMING && ctx.properties.timestampValidBits > 0) {
+            rayTimestampQueryPool = VQueryPool.create(
+                    ctx.device,
+                    RAY_TIMING_SLOTS * RAY_TIMING_QUERIES_PER_SLOT,
+                    VK_QUERY_TYPE_TIMESTAMP);
+            ctx.setDebugUtilsObjectName(
+                    rayTimestampQueryPool.get().pool,
+                    VK_OBJECT_TYPE_QUERY_POOL,
+                    "Phase 7 Ray Dispatch GPU Timing");
+            LOGGER.info("[Vulkanite][Phase7GPU] event=ray_timing_enabled slots={} warmupSamples={} windowSamples={} validBits={} periodNs={}",
+                    RAY_TIMING_SLOTS,
+                    RAY_TIMING_WARMUP_SAMPLES,
+                    RAY_TIMING_WINDOW_SAMPLES,
+                    ctx.properties.timestampValidBits,
+                    ctx.properties.timestampPeriodNanos);
+        } else {
+            rayTimestampQueryPool = null;
+            if (PHASE7_GPU_TIMING) {
+                LOGGER.warn("[Vulkanite][Phase7GPU] event=ray_timing_unavailable reason=no_timestamp_bits");
+            }
+        }
 
         for (int i = 0; i < irisRenderTargetViews.length; i++) {
             irisRenderTargetViews[i] = new SharedImageViewTracker(ctx, null);
@@ -210,7 +264,42 @@ public class VulkanPipeline {
         supportsEntities = passes != null
                 && passes.length > 0
                 && Arrays.stream(passes).allMatch(pass -> pass.getRayHitCount() > 1);
-        passGraph = new RtxPassGraph(raytracePipelines, renderPassExecutor);
+        supportsProceduralDebug = ctx.capabilities.proceduralAabbBlas()
+                && passes != null
+                && passes.length > 0
+                && Arrays.stream(passes).allMatch(RaytracingShaderSet::hasProceduralDebugHitGroup);
+        supportsHybridShadow = ctx.capabilities.proceduralAabbBlas()
+                && passes != null
+                && passes.length > 0
+                && Arrays.stream(passes).allMatch(RaytracingShaderSet::hasProceduralShadowHitGroups);
+        supportsProceduralReflection = ctx.capabilities.proceduralAabbBlas()
+                && passes != null
+                && passes.length > 0
+                && Arrays.stream(passes).allMatch(RaytracingShaderSet::hasProceduralReflectionHitGroup);
+        proceduralReflectionRequested = HybridAccelerationConfig.fromSystemProperties().proceduralReflections();
+        accelerationManager.setProceduralReflectionEnabled(
+                proceduralReflectionRequested && supportsProceduralReflection);
+        if (proceduralReflectionRequested && !supportsProceduralReflection) {
+            LOGGER.warn("Procedural reflections requested with -D{}=true, but the device or SBT record 6 is incompatible; retaining triangle reflections",
+                    HybridAccelerationConfig.REFLECTION_PROPERTY);
+        }
+        if (supportsProceduralDebug) {
+            shadowComparisonBuffer = ctx.memory.createBuffer(
+                    HybridShadowComparisonLayout.BUFFER_BYTES,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                            | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            shadowComparisonBuffer.get().setDebugUtilsObjectName("Hybrid Shadow Comparison Diagnostics");
+            shadowComparisonReadbackBuffer = ctx.memory.createBuffer(
+                    HybridShadowComparisonLayout.BUFFER_BYTES,
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            shadowComparisonReadbackBuffer.get().setDebugUtilsObjectName(
+                    "Hybrid Shadow Comparison Readback");
+        } else {
+            shadowComparisonBuffer = null;
+            shadowComparisonReadbackBuffer = null;
+        }
 
         boolean hasRt = !raytracePipelines.isEmpty();
         pipelineRequirements = new PipelineRequirements(hasRt, hasRt, hasRt, hasRt, hasRt, hasRt);
@@ -219,10 +308,7 @@ public class VulkanPipeline {
     }
 
     private void buildRayPipelines(RaytracingShaderSet[] passes, int[] ssboIds) {
-        var commonSetExpected = PipelineDescriptorSets.createCommonSetExpected(MAX_IRIS_RENDER_TARGETS);
-        var commonSetExpectedSingle = PipelineDescriptorSets.createCommonSetExpectedSingle();
-        var commonSetExpectedBase = PipelineDescriptorSets.createCommonSetExpectedBase();
-        var commonSetExpectedVulkaniteRT = PipelineDescriptorSets.createCommonSetExpectedVulkaniteRT();
+        var commonSetExpected = PipelineDescriptorSets.createCommonSetExpected();
         var geomSetExpected = PipelineDescriptorSets.createGeomSetExpected();
         var entityTextureSetExpected = PipelineDescriptorSets.createEntityTextureSetExpected();
         var customTexSetExpected = PipelineDescriptorSets.createCustomTexSetExpected(customTextureViews.length);
@@ -246,10 +332,7 @@ public class VulkanPipeline {
                         continue;
                     }
 
-                    if (set.validate(commonSetExpected)
-                            || set.validate(commonSetExpectedSingle)
-                            || set.validate(commonSetExpectedBase)
-                            || set.validate(commonSetExpectedVulkaniteRT)) {
+                    if (set.validate(commonSetExpected)) {
                         commonSet = setIdx;
                     } else if (set.validate(geomSetExpected)) {
                         geomSet = setIdx;
@@ -266,7 +349,10 @@ public class VulkanPipeline {
                 }
 
                 raytracePipelines.add(new RtPipeline(
-                        pipeline, commonSet, geomSet, entityTextureSet, customTexSet, ssboSet));
+                        pipeline, commonSet, geomSet, entityTextureSet, customTexSet, ssboSet,
+                        passes[i].hasProceduralDebugHitGroup(),
+                        passes[i].hasProceduralShadowHitGroups(),
+                        passes[i].hasProceduralReflectionHitGroup()));
             }
         } catch (Exception e) {
             destroy();
@@ -280,7 +366,7 @@ public class VulkanPipeline {
 
     public void renderPostShadows(List<VRef<VGImage>> vgOutImgs, Camera camera, ShaderStorageBuffer[] ssbos,
             MixinCelestialUniforms celestialUniforms, VRef<VImageView>[] gbufferViews) {
-        if (passGraph == null || passGraph.isEmpty() || vgOutImgs == null || vgOutImgs.isEmpty()) {
+        if (raytracePipelines.isEmpty() || vgOutImgs == null || vgOutImgs.isEmpty()) {
             beginCompatibilityFrame(false, camera);
             return;
         }
@@ -317,6 +403,8 @@ public class VulkanPipeline {
         VRef<VSemaphore> glReadySemaphore = null;
         VRef<VSemaphore> vulkanDoneSemaphore = null;
         VRef<VAccelerationStructure> tlas = null;
+        VRef<VAccelerationStructure> proceduralTlas = null;
+        VRef<VAccelerationStructure> hybridShadowTlas = null;
         VRef<me.cortex.vulkanite.lib.cmd.VCmdBuff> cmdRef = null;
         CacheRequestBatch frameRequestBatch = null;
         RtxFrameDecision frameDecision = RtxFrameDecision.DISABLED;
@@ -333,6 +421,22 @@ public class VulkanPipeline {
             int frameIndex = SystemTimeUniforms.COUNTER.getAsInt();
             frameRequestBatch = collectCacheRequests(camera, frameIndex, rtxCacheMode);
             frameDecision = RtxFrameDecision.decide(rtxCacheMode, frameRequestBatch.hasWork());
+            DLSSConfig.DebugType debugType = dlssConfig.getDebugType();
+            boolean reflectionComparisonRequested = isProceduralReflectionComparison(debugType);
+            boolean proceduralDebugRequested = isProceduralDebug(debugType);
+            boolean proceduralDebugSupported = supportsProceduralDebug
+                    && (!reflectionComparisonRequested || supportsProceduralReflection);
+            // Keep acc as the complete triangle reference while mode 11 compares
+            // it against the standalone procedural TLAS.
+            accelerationManager.setProceduralReflectionEnabled(
+                    proceduralReflectionRequested
+                            && supportsProceduralReflection
+                            && !reflectionComparisonRequested);
+            if (proceduralDebugRequested && proceduralDebugSupported) {
+                // A visualization must run a full-screen ray dispatch even when
+                // the cache-first renderer would otherwise resolve without RT.
+                frameDecision = RtxFrameDecision.FULL_RT_REFERENCE;
+            }
             updateTransientEntityGeometry(
                     frameDecision.needsTlas(),
                     frameDecision == RtxFrameDecision.NO_RT,
@@ -363,6 +467,14 @@ public class VulkanPipeline {
             if (frameDecision.needsTlas()) {
                 profiler.push("build_tlas");
                 tlas = accelerationManager.buildTLAS(0, cmd);
+                if (supportsHybridShadow) {
+                    hybridShadowTlas = accelerationManager.buildHybridShadowTLAS(0, cmd);
+                } else {
+                    accelerationManager.discardHybridShadowInstanceSnapshot();
+                }
+                if (proceduralDebugRequested && proceduralDebugSupported) {
+                    proceduralTlas = accelerationManager.buildProceduralTLAS(0, cmd);
+                }
                 profiler.pop();
             }
 
@@ -372,7 +484,7 @@ public class VulkanPipeline {
 
             if (frameDecision != RtxFrameDecision.DISABLED) {
                 profiler.push("encode_rtx");
-                encodeRtxFrame(cmd, tlas, vgOutImgs, outImgs, camera, ssbos, celestialUniforms,
+                encodeRtxFrame(cmd, tlas, proceduralTlas, hybridShadowTlas, vgOutImgs, outImgs, camera, ssbos, celestialUniforms,
                         gbufferViews, renderWidth, renderHeight,
                         frameDecision, frameRequestBatch, frameIndex);
                 profiler.pop();
@@ -384,10 +496,14 @@ public class VulkanPipeline {
             vulkanDoneSemaphore = new VRef<>(vulkanDone.get());
             long execution = ctx.cmd.submit(
                     0, cmdRef, Arrays.asList(glReadySemaphore), Arrays.asList(vulkanDoneSemaphore), null);
+            accelerationManager.markHybridTlasTimingSubmitted(execution);
+            markRayTimingSubmitted(execution);
             cacheFeedbackPass.markEncodedFeedbackSubmitted(execution);
             recordFrameDecision(frameDecision);
             vulkanDone.get().glWait(EMPTY_GL_SEMAPHORE_IDS, imageBatch.glIds(), imageBatch.glLayouts());
         } catch (DeviceLostException e) {
+            accelerationManager.cancelUnsubmittedHybridTlasTiming();
+            cancelUnsubmittedRayTiming();
             cacheFeedbackPass.discardEncodedFeedback();
             cacheFeedbackPass.invalidateScreenHistory();
             requeueFailedCacheFill(frameDecision, frameRequestBatch);
@@ -395,15 +511,23 @@ public class VulkanPipeline {
             Vulkanite.IS_ENABLED = false;
             throw e;
         } catch (Exception e) {
+            accelerationManager.cancelUnsubmittedHybridTlasTiming();
+            cancelUnsubmittedRayTiming();
             cacheFeedbackPass.discardEncodedFeedback();
             cacheFeedbackPass.invalidateScreenHistory();
             requeueFailedCacheFill(frameDecision, frameRequestBatch);
             LOGGER.error("Hybrid RTX frame failed", e);
             updateTemporalPathState(false);
         } finally {
+            accelerationManager.cancelUnsubmittedHybridTlasTiming();
+            cancelUnsubmittedRayTiming();
             if (tlas != null) {
                 tlas.close();
             }
+            if (proceduralTlas != null) {
+                proceduralTlas.close();
+            }
+            if (hybridShadowTlas != null) hybridShadowTlas.close();
             if (glReadySemaphore != null) {
                 glReadySemaphore.close();
             }
@@ -430,6 +554,7 @@ public class VulkanPipeline {
     private void beginCommandFrame() {
         ctx.cmd.processPendingSubmissions();
         ctx.cmd.newFrame();
+        pollCompletedRayTimings();
     }
 
     private void updateTransientEntityGeometry(
@@ -507,6 +632,8 @@ public class VulkanPipeline {
     private void encodeRtxFrame(
             me.cortex.vulkanite.lib.cmd.VCmdBuff cmd,
             VRef<VAccelerationStructure> tlas,
+            VRef<VAccelerationStructure> proceduralTlas,
+            VRef<VAccelerationStructure> hybridShadowTlas,
             List<VRef<VGImage>> vgOutImgs,
             List<VRef<VImage>> outImgs,
             Camera camera,
@@ -547,7 +674,37 @@ public class VulkanPipeline {
         // for the raw world-space sun vector; shaders flip only the shadow ray
         // at night, matching Photonics without corrupting day/night ambience.
         var sunPos = celestialUniforms.invokeGetCelestialPositionInWorldSpace(100.0f);
-        int debugMode = mapDebugMode(dlssConfig.getDebugType());
+        DLSSConfig.DebugType debugType = dlssConfig.getDebugType();
+        int debugMode = mapDebugMode(debugType);
+        boolean proceduralDebugSupported = supportsProceduralDebug
+                && (!isProceduralReflectionComparison(debugType) || supportsProceduralReflection);
+        if (isProceduralDebug(debugType)
+                && (!proceduralDebugSupported || proceduralTlas == null)) {
+            debugMode = 0;
+            if (!proceduralDebugUnavailableLogged) {
+                proceduralDebugUnavailableLogged = true;
+                LOGGER.warn("Procedural debug view requested, but no compatible procedural TLAS is available");
+            }
+        } else {
+            proceduralDebugUnavailableLogged = false;
+        }
+        if (requiresProceduralShadowHitGroup(dlssConfig.getDebugType()) && !supportsHybridShadow) {
+            debugMode = 0;
+        }
+        boolean comparisonRequested = isShadowComparison(dlssConfig.getDebugType())
+                && proceduralTlas != null && shadowComparisonBuffer != null;
+        boolean comparisonReadbackRequested = prepareShadowComparisonReadback(
+                dlssConfig, comparisonRequested);
+        if (comparisonRequested && !shadowComparisonActive) {
+            cmd.encodeFillBuffer(shadowComparisonBuffer, 0,
+                    HybridShadowComparisonLayout.BUFFER_BYTES, 0);
+            cmd.encodeMemoryBarrier(
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        }
+        shadowComparisonActive = comparisonRequested;
         VRef<VBuffer> sectionLightBuffer = null;
         VRef<VBuffer> sectionLightProbeBuffer = null;
         VRef<VBuffer> sectionLightProbeFeedbackBuffer = null;
@@ -583,12 +740,15 @@ public class VulkanPipeline {
                         surfaceDirectLightCache.ensureFillRequestGpuBuffer(ctx, cmd, cacheRequestBatch, frameIndex);
             }
 
-            RtxPassGraph.Frame frame = new RtxPassGraph.Frame(
+            RtxFrame frame = new RtxFrame(
                     cmd,
                     ubo.buffer(),
                     ubo.offset(),
                     ubo.size(),
                     tlas,
+                    proceduralTlas,
+                    hybridShadowTlas,
+                    shadowComparisonBuffer,
                     blockAtlasView,
                     blockAtlasNormalView,
                     blockAtlasSpecularView,
@@ -611,14 +771,14 @@ public class VulkanPipeline {
                     dlssConfig.isReSTIREnabled() ? 1 : 0,
                     debugMode,
                     dlssConfig.getDebugCellIndex(),
+                    HybridShadowComparisonLayout.clampSamplingPermille(
+                            dlssConfig.getShadowComparisonSamplingPercent()),
+                    HybridShadowComparisonLayout.clampDistanceTolerance(
+                            dlssConfig.getShadowComparisonDistanceTolerance()),
                     frameDecision.isCacheFillOnly() ? -1 : 0,
                     frameImages.storageViews(frameIndex),
                     frameImages.currentReservoir(frameIndex),
                     frameImages.previousReservoir(frameIndex),
-                    frameImages.currentSpecularHistory(frameIndex),
-                    frameImages.previousSpecularHistory(frameIndex),
-                    frameImages.currentSpecularSurfaceHistory(frameIndex),
-                    frameImages.previousSpecularSurfaceHistory(frameIndex),
                     frameImages.diffuseAlbedoMetallic(),
                     frameImages.specularAlbedo(),
                     frameImages.normalRoughness(),
@@ -645,7 +805,28 @@ public class VulkanPipeline {
                             : renderWidth,
                     frameDecision.isCacheFillOnly() ? 1 : renderHeight);
             if (frameDecision.usesRayTracing()) {
-                passGraph.execute(frame);
+                RayTimingSlot timingSlot = beginRayTiming(cmd, frame, frameDecision);
+                try {
+                    for (RtPipeline pass : raytracePipelines) {
+                        renderPassExecutor.execute(pass, frame);
+                    }
+                    finishRayTiming(cmd, timingSlot);
+                } catch (RuntimeException | Error exception) {
+                    cancelRayTiming(timingSlot);
+                    throw exception;
+                }
+                if (comparisonReadbackRequested) {
+                    cmd.encodeMemoryBarrier(
+                            VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_ACCESS_TRANSFER_READ_BIT);
+                    cmd.encodeBufferCopy(
+                            shadowComparisonBuffer, 0,
+                            shadowComparisonReadbackBuffer, 0,
+                            HybridShadowComparisonLayout.BUFFER_BYTES);
+                    shadowComparisonReadbackPending = true;
+                }
                 // Visible rays publish transport payloads and then mark entries ready.
                 // Make those writes visible to later compute consumers.
                 cmd.encodeMemoryBarrier(
@@ -656,8 +837,6 @@ public class VulkanPipeline {
             }
             if (frameDecision.usesCacheResolve()) {
                 cacheFeedbackPass.execute(frame);
-            }
-            if (frameDecision.usesCacheResolve()) {
                 cacheResolvePass.execute(frame, true);
                 cacheFeedbackPass.markScreenHistoryResolved();
             }
@@ -951,6 +1130,7 @@ public class VulkanPipeline {
             surfaceDirectLightCache.reset();
             Vulkanite.INSTANCE.getSectionLightManager().clear();
             resetTemporalHistory();
+            shadowComparisonActive = false;
         }
 
         if (mc.world == null || mc.gameRenderer == null) {
@@ -1020,12 +1200,310 @@ public class VulkanPipeline {
         return Math.max(1.0f / 240.0f, Math.min(delta, 0.25f));
     }
 
-    private static int mapDebugMode(DLSSConfig.DebugType debugType) {
+    static int mapDebugMode(DLSSConfig.DebugType debugType) {
         return switch (debugType) {
             case NONE -> 0;
             case INPUT, OUTPUT -> 1;
             case MOTION_VECTORS, DEPTH, NORMALS -> 2;
+            case PROCEDURAL_DISTANCE -> 3;
+            case PROCEDURAL_NORMALS -> 4;
+            case PROCEDURAL_BRICK_IDS -> 5;
+            case PROCEDURAL_VOXEL_IDS -> 6;
+            case SHADOW_COMPARISON -> 7;
+            case SHADOW_DANGEROUS_MISSES -> 8;
+            case SHADOW_EXTRA_HITS -> 9;
+            case SHADOW_DOUBLE_TRACE_REFERENCE -> 10;
+            case PROCEDURAL_REFLECTION_COMPARISON -> 11;
         };
+    }
+
+    static boolean isProceduralDebug(DLSSConfig.DebugType debugType) {
+        return switch (debugType) {
+            case PROCEDURAL_DISTANCE, PROCEDURAL_NORMALS,
+                    PROCEDURAL_BRICK_IDS, PROCEDURAL_VOXEL_IDS,
+                    SHADOW_COMPARISON, SHADOW_DANGEROUS_MISSES, SHADOW_EXTRA_HITS,
+                    SHADOW_DOUBLE_TRACE_REFERENCE, PROCEDURAL_REFLECTION_COMPARISON -> true;
+            default -> false;
+        };
+    }
+
+    static boolean isProceduralReflectionComparison(DLSSConfig.DebugType debugType) {
+        return debugType == DLSSConfig.DebugType.PROCEDURAL_REFLECTION_COMPARISON;
+    }
+
+    static boolean isShadowComparison(DLSSConfig.DebugType debugType) {
+        return switch (debugType) {
+            case SHADOW_COMPARISON, SHADOW_DANGEROUS_MISSES, SHADOW_EXTRA_HITS -> true;
+            default -> false;
+        };
+    }
+
+    static boolean requiresProceduralShadowHitGroup(DLSSConfig.DebugType debugType) {
+        return isShadowComparison(debugType)
+                || debugType == DLSSConfig.DebugType.SHADOW_DOUBLE_TRACE_REFERENCE;
+    }
+
+    private boolean prepareShadowComparisonReadback(DLSSConfig config, boolean comparisonRequested) {
+        boolean loggingEnabled = comparisonRequested
+                && config.isShadowComparisonStructuredLogging()
+                && shadowComparisonReadbackBuffer != null;
+        if (!loggingEnabled) {
+            shadowComparisonReadbackPending = false;
+            nextShadowComparisonLogNanos = 0L;
+            return false;
+        }
+
+        long now = System.nanoTime();
+        if (shadowComparisonReadbackPending) {
+            // This opt-in diagnostic favors exact evidence over frame pacing. The
+            // queue wait occurs at most once per interval and never in normal play.
+            ctx.cmd.waitQueueIdle(0);
+            logShadowComparisonSnapshot(config);
+            shadowComparisonReadbackPending = false;
+            nextShadowComparisonLogNanos = now + SHADOW_COMPARISON_LOG_INTERVAL_NANOS;
+            // Begin a fresh bounded sample window in the command buffer being
+            // recorded now, after the completed snapshot has been consumed.
+            shadowComparisonActive = false;
+            return false;
+        }
+        if (nextShadowComparisonLogNanos == 0L) {
+            nextShadowComparisonLogNanos = now + SHADOW_COMPARISON_LOG_INTERVAL_NANOS;
+            return false;
+        }
+        return now >= nextShadowComparisonLogNanos;
+    }
+
+    private void logShadowComparisonSnapshot(DLSSConfig config) {
+        long pointer = shadowComparisonReadbackBuffer.get().map();
+        HybridShadowComparisonSnapshot snapshot;
+        try {
+            snapshot = HybridShadowComparisonSnapshot.read(
+                    MemoryUtil.memByteBuffer(pointer, HybridShadowComparisonLayout.BUFFER_BYTES));
+        } finally {
+            shadowComparisonReadbackBuffer.get().unmap();
+        }
+        LOGGER.info("[Vulkanite] Hybrid shadow comparison sample: {}",
+                snapshot.structuredSummary(
+                        config.getShadowComparisonSamplingPercent(),
+                        HybridShadowComparisonLayout.clampDistanceTolerance(
+                                config.getShadowComparisonDistanceTolerance())));
+    }
+
+    private RayTimingSlot beginRayTiming(
+            me.cortex.vulkanite.lib.cmd.VCmdBuff cmd,
+            RtxFrame frame,
+            RtxFrameDecision frameDecision) {
+        if (rayTimestampQueryPool == null || frameDecision != RtxFrameDecision.FULL_RT_REFERENCE) {
+            return null;
+        }
+
+        String path;
+        if (frame.debugMode() == 0 && frame.hybridShadowTlas() != null) {
+            path = "hybrid";
+        } else if (frame.debugMode() == 10 && frame.proceduralTlas() != null) {
+            // Mode 10 is the unadorned Phase 5 triangle || procedural reference.
+            // Modes 7-9 include diagnostic counters/overlays and are intentionally
+            // excluded from the performance comparison.
+            path = "double_trace_reference";
+        } else {
+            return null;
+        }
+
+        if (rayTimingAwaitingSubmission != null) {
+            rayTimingDrops++;
+            LOGGER.warn("[Vulkanite][Phase7GPU] event=ray_timing_drop reason=uncommitted_recording queryDrops={}",
+                    rayTimingDrops);
+            return null;
+        }
+
+        RayTimingSlot slot = null;
+        for (int i = 0; i < rayTimingSlots.length; i++) {
+            int index = (rayTimingCursor + i) % rayTimingSlots.length;
+            if (rayTimingSlots[index].state == RayTimingState.FREE) {
+                slot = rayTimingSlots[index];
+                rayTimingCursor = (index + 1) % rayTimingSlots.length;
+                break;
+            }
+        }
+        if (slot == null) {
+            rayTimingDrops++;
+            LOGGER.warn("[Vulkanite][Phase7GPU] event=ray_timing_drop reason=query_ring_full queryDrops={}",
+                    rayTimingDrops);
+            return null;
+        }
+
+        slot.sequence = ++rayTimingSequence;
+        slot.path = path;
+        slot.frameIndex = frame.frameIndex();
+        slot.decision = frameDecision.name();
+        slot.width = frame.rayDispatchWidth();
+        slot.height = frame.rayDispatchHeight();
+        slot.passCount = raytracePipelines.size();
+        slot.state = RayTimingState.RECORDING;
+
+        int queryBase = slot.index * RAY_TIMING_QUERIES_PER_SLOT;
+        cmd.resetQueryPool(rayTimestampQueryPool, queryBase, RAY_TIMING_QUERIES_PER_SLOT);
+        cmd.writeTimestamp(
+                rayTimestampQueryPool,
+                queryBase + RAY_TIMING_START,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+        return slot;
+    }
+
+    private void finishRayTiming(me.cortex.vulkanite.lib.cmd.VCmdBuff cmd, RayTimingSlot slot) {
+        if (slot == null) {
+            return;
+        }
+        if (slot.state != RayTimingState.RECORDING) {
+            throw new IllegalStateException("Ray timing slot is not recording");
+        }
+        int queryBase = slot.index * RAY_TIMING_QUERIES_PER_SLOT;
+        cmd.writeTimestamp(
+                rayTimestampQueryPool,
+                queryBase + RAY_TIMING_END,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
+        slot.state = RayTimingState.RECORDED;
+        rayTimingAwaitingSubmission = slot;
+    }
+
+    private void markRayTimingSubmitted(long execution) {
+        RayTimingSlot slot = rayTimingAwaitingSubmission;
+        if (slot == null) {
+            return;
+        }
+        if (slot.state != RayTimingState.RECORDED) {
+            throw new IllegalStateException("Ray timing slot was not recorded before submission");
+        }
+        slot.execution = execution;
+        slot.state = RayTimingState.SUBMITTED;
+        rayTimingAwaitingSubmission = null;
+    }
+
+    private void cancelUnsubmittedRayTiming() {
+        RayTimingSlot slot = rayTimingAwaitingSubmission;
+        if (slot != null) {
+            cancelRayTiming(slot);
+        }
+    }
+
+    private void cancelRayTiming(RayTimingSlot slot) {
+        if (slot == null) {
+            return;
+        }
+        if (rayTimingAwaitingSubmission == slot) {
+            rayTimingAwaitingSubmission = null;
+        }
+        slot.reset();
+    }
+
+    private void pollCompletedRayTimings() {
+        if (rayTimestampQueryPool == null) {
+            return;
+        }
+        long completedExecution = ctx.cmd.getQueueCurrentExecution(0);
+        for (RayTimingSlot slot : rayTimingSlots) {
+            if (slot.state != RayTimingState.SUBMITTED || slot.execution > completedExecution) {
+                continue;
+            }
+            int queryBase = slot.index * RAY_TIMING_QUERIES_PER_SLOT;
+            long[] timestamps = rayTimestampQueryPool.get().getResultsLongIfAvailable(
+                    queryBase,
+                    RAY_TIMING_QUERIES_PER_SLOT);
+            if (timestamps == null) {
+                continue;
+            }
+            long gpuTicks = GpuTimestampMath.deltaTicks(
+                    timestamps[RAY_TIMING_START],
+                    timestamps[RAY_TIMING_END],
+                    ctx.properties.timestampValidBits);
+            LOGGER.debug("[Vulkanite][Phase7GPU] event=ray_sample seq={} execution={} path={} frame={} decision={} width={} height={} passes={} gpuTicks={} gpuMs={}",
+                    slot.sequence,
+                    slot.execution,
+                    slot.path,
+                    slot.frameIndex,
+                    slot.decision,
+                    slot.width,
+                    slot.height,
+                    slot.passCount,
+                    gpuTicks,
+                    formatGpuMillis(ticksToMillis(gpuTicks)));
+            recordRayTimingSample(slot, gpuTicks);
+            slot.reset();
+        }
+    }
+
+    private void recordRayTimingSample(RayTimingSlot slot, long gpuTicks) {
+        RayTimingKey key = new RayTimingKey(
+                slot.path,
+                slot.decision,
+                slot.width,
+                slot.height,
+                slot.passCount);
+        RayTimingWindow window = rayTimingWindows.computeIfAbsent(
+                key,
+                ignored -> new RayTimingWindow());
+        if (window.warmupRemaining > 0) {
+            window.warmupRemaining--;
+            window.warmupDiscarded++;
+            return;
+        }
+        window.samples[window.sampleCount++] = gpuTicks;
+        if (window.sampleCount == window.samples.length) {
+            logRayTimingWindow(key, window, false);
+        }
+    }
+
+    private void flushRayTimingWindows() {
+        for (Map.Entry<RayTimingKey, RayTimingWindow> entry : rayTimingWindows.entrySet()) {
+            if (entry.getValue().sampleCount > 0) {
+                logRayTimingWindow(entry.getKey(), entry.getValue(), true);
+            }
+        }
+    }
+
+    private void logRayTimingWindow(RayTimingKey key, RayTimingWindow window, boolean partial) {
+        long[] sorted = Arrays.copyOf(window.samples, window.sampleCount);
+        Arrays.sort(sorted);
+        double totalTicks = 0.0;
+        for (long sample : sorted) {
+            totalTicks += sample;
+        }
+        long minTicks = sorted[0];
+        long maxTicks = sorted[sorted.length - 1];
+        long p50Ticks = percentileNearestRank(sorted, 0.50);
+        long p95Ticks = percentileNearestRank(sorted, 0.95);
+        double averageTicks = totalTicks / sorted.length;
+        window.windowIndex++;
+        LOGGER.info("[Vulkanite][Phase7GPU] event=ray_window path={} decision={} width={} height={} passes={} window={} partial={} samples={} warmupDiscarded={} minMs={} avgMs={} p50Ms={} p95Ms={} maxMs={} queryDrops={}",
+                key.path,
+                key.decision,
+                key.width,
+                key.height,
+                key.passCount,
+                window.windowIndex,
+                partial,
+                sorted.length,
+                window.warmupDiscarded,
+                formatGpuMillis(ticksToMillis(minTicks)),
+                formatGpuMillis(ticksToMillis(averageTicks)),
+                formatGpuMillis(ticksToMillis(p50Ticks)),
+                formatGpuMillis(ticksToMillis(p95Ticks)),
+                formatGpuMillis(ticksToMillis(maxTicks)),
+                rayTimingDrops);
+        window.sampleCount = 0;
+    }
+
+    private static long percentileNearestRank(long[] sorted, double percentile) {
+        int index = Math.max(0, (int) Math.ceil(percentile * sorted.length) - 1);
+        return sorted[index];
+    }
+
+    private double ticksToMillis(double ticks) {
+        return ticks * (double) ctx.properties.timestampPeriodNanos / 1_000_000.0;
+    }
+
+    private static String formatGpuMillis(double millis) {
+        return String.format(Locale.ROOT, "%.6f", millis);
     }
 
     private static void clearForeignGlErrors() {
@@ -1048,6 +1526,7 @@ public class VulkanPipeline {
             specularTransportCache.reset();
             surfaceDirectLightCache.reset();
             resetTemporalHistory();
+            shadowComparisonActive = false;
         }
         shaderpackInitialized = true;
         currentShaderpackName = shaderpackName;
@@ -1061,12 +1540,32 @@ public class VulkanPipeline {
         ACTIVE_PIPELINES.remove(this);
 
         ctx.cmd.waitQueueIdle(0);
+        cancelUnsubmittedRayTiming();
+        pollCompletedRayTimings();
+        flushRayTimingWindows();
+        if (rayTimestampQueryPool != null) {
+            int pendingTimings = 0;
+            for (RayTimingSlot slot : rayTimingSlots) {
+                if (slot.state != RayTimingState.FREE) {
+                    pendingTimings++;
+                }
+            }
+            LOGGER.info("[Vulkanite][Phase7GPU] event=ray_timing_closed pending={} queryDrops={}",
+                    pendingTimings, rayTimingDrops);
+            rayTimestampQueryPool.close();
+        }
 
         cacheFeedbackPass.clearPendingFeedback();
         dlssdProcessor.cleanup();
         diffuseRadianceCache.destroy();
         specularTransportCache.destroy();
         surfaceDirectLightCache.destroy();
+        if (shadowComparisonBuffer != null) {
+            shadowComparisonBuffer.close();
+        }
+        if (shadowComparisonReadbackBuffer != null) {
+            shadowComparisonReadbackBuffer.close();
+        }
         cacheFeedbackPass.destroy();
         cacheResolvePass.destroy();
         renderPassExecutor.destroy();
@@ -1102,6 +1601,53 @@ public class VulkanPipeline {
         customTextureSampler.close();
 
         ctx.cmd.newFrame();
+    }
+
+    private enum RayTimingState {
+        FREE,
+        RECORDING,
+        RECORDED,
+        SUBMITTED
+    }
+
+    private static final class RayTimingSlot {
+        private final int index;
+        private RayTimingState state = RayTimingState.FREE;
+        private long sequence;
+        private long execution;
+        private String path;
+        private int frameIndex;
+        private String decision;
+        private int width;
+        private int height;
+        private int passCount;
+
+        private RayTimingSlot(int index) {
+            this.index = index;
+        }
+
+        private void reset() {
+            state = RayTimingState.FREE;
+            sequence = 0L;
+            execution = 0L;
+            path = null;
+            frameIndex = 0;
+            decision = null;
+            width = 0;
+            height = 0;
+            passCount = 0;
+        }
+    }
+
+    private record RayTimingKey(String path, String decision, int width, int height, int passCount) {
+    }
+
+    private static final class RayTimingWindow {
+        private final long[] samples = new long[RAY_TIMING_WINDOW_SAMPLES];
+        private int warmupRemaining = RAY_TIMING_WARMUP_SAMPLES;
+        private int warmupDiscarded;
+        private int sampleCount;
+        private long windowIndex;
     }
 
     public static void destroyActivePipelines() {

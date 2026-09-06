@@ -1,5 +1,6 @@
 package me.cortex.vulkanite.mixin.iris;
 
+import me.cortex.vulkanite.acceleration.HybridAccelerationConfig;
 import me.cortex.vulkanite.compat.IGetRaytracingSource;
 import me.cortex.vulkanite.compat.RaytracingShaderSource;
 import me.cortex.vulkanite.client.config.DLSSConfig;
@@ -211,9 +212,16 @@ public abstract class MixinProgramSet implements IGetRaytracingSource {
         boolean enableReSTIR = dlssConfig.isReSTIREnabled()
                 && (Boolean.TRUE.equals(getPackRestirSetting(firstRaygen)) || usesRestirApi(firstRaygen));
 
+        var accelerationConfig = HybridAccelerationConfig.fromSystemProperties();
         StringBuilder definesBuilder = new StringBuilder();
         definesBuilder.append("#define ENABLE_DLSS_RR ").append(enableDLSSRR ? 1 : 0).append("\n");
         definesBuilder.append("#define ENABLE_RESTIR ").append(enableReSTIR ? 1 : 0).append("\n");
+        definesBuilder.append("#define VULKANITE_COMPILE_DIAGNOSTICS ")
+                .append(accelerationConfig.compileDiagnostics() ? 1 : 0)
+                .append("\n");
+        definesBuilder.append("#define VULKANITE_HYBRID_SHADOW_PIPELINE ")
+                .append(accelerationConfig.compileHybridShadows() ? 1 : 0)
+                .append("\n");
 
         // RT Quality Defaults
         definesBuilder.append("#define SUN_INTENSITY ").append(dlssConfig.getSunIntensity()).append("\n");
@@ -264,6 +272,12 @@ public abstract class MixinProgramSet implements IGetRaytracingSource {
                 var close = sourceProvider.apply(directory.resolve("ray" + pass + "_" + hit + ".rchit"));
                 var any = sourceProvider.apply(directory.resolve("ray" + pass + "_" + hit + ".rahit"));
                 var intersect = sourceProvider.apply(directory.resolve("ray" + pass + "_" + hit + ".rint"));
+                if (intersect != null && intersect.contains("VULKANITE_REUSE_INTERSECTION_2")) {
+                    intersect = sourceProvider.apply(directory.resolve("ray" + pass + "_2.rint"));
+                    if (intersect == null) {
+                        throw new IllegalStateException("Procedural shadow hit group requires ray" + pass + "_2.rint");
+                    }
+                }
                 if (close == null && any == null && intersect == null)
                     break;
 

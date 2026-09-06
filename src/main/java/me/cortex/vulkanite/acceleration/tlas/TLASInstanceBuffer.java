@@ -32,7 +32,7 @@ public class TLASInstanceBuffer {
 
     private final IntArrayFIFOQueue freeIds = new IntArrayFIFOQueue();
     private int maxInstances = 0;
-    private VkAccelerationStructureInstanceKHR.Buffer instances = null;
+    protected VkAccelerationStructureInstanceKHR.Buffer instances = null;
     protected int count = 0;
 
     // Maps each location in the instance buffer to an id
@@ -40,7 +40,7 @@ public class TLASInstanceBuffer {
     // Maps each id to a location in the instance buffer
     private int[] id2loc = new int[maxInstances];
 
-    private final List<VkAccelerationStructureInstanceKHR> ephemeralInstances = new ArrayList<>();
+    protected final List<VkAccelerationStructureInstanceKHR> ephemeralInstances = new ArrayList<>();
     private final VRef<VBuffer>[] instanceUploadBuffers;
     private final long[] instanceUploadCapacities = new long[INSTANCE_UPLOAD_SLOTS];
     private int instanceUploadCursor = 0;
@@ -216,14 +216,17 @@ public class TLASInstanceBuffer {
         for (var asi : ephemeralInstances) {
             MemoryUtil.memCopy(asi.address(), ptr, VkAccelerationStructureInstanceKHR.SIZEOF);
             ptr += VkAccelerationStructureInstanceKHR.SIZEOF;
-            asi.free();
         }
-        ephemeralInstances.clear();
 
         data.get().unmap();
         data.get().flush();
 
         return new Pair<>(data, totalCount);
+    }
+
+    protected void clearEphemeralInstances() {
+        for (var asi : ephemeralInstances) asi.free();
+        ephemeralInstances.clear();
     }
 
     private VRef<VBuffer> getUploadBuffer(long size) {

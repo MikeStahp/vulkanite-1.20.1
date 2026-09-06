@@ -1,0 +1,32 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(location = 1) rayPayloadInEXT float shadowPayload;
+hitAttributeEXT vec2 baryCoord;
+layout(set = 1, binding = 0, std430) readonly buffer EntityGeometry { uint words[]; } geometryBuffers[];
+layout(set = 2, binding = 0) uniform sampler2D entityTextures[256];
+const uint WORDS_PER_VERTEX = 16u;
+const uint WORDS_PER_QUAD = WORDS_PER_VERTEX * 4u;
+
+uint vertexBase(uint vertexIndex) {
+    return uint(gl_PrimitiveID >> 1) * WORDS_PER_QUAD + vertexIndex * WORDS_PER_VERTEX;
+}
+vec2 vertexUv(uint vertexIndex) {
+    uint index = nonuniformEXT(gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT);
+    uint base = vertexBase(vertexIndex);
+    return vec2(uintBitsToFloat(geometryBuffers[index].words[base + 8u]),
+        uintBitsToFloat(geometryBuffers[index].words[base + 9u]));
+}
+void main() {
+    uint index = nonuniformEXT(gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT);
+    uvec2 other = (gl_PrimitiveID & 1) == 0 ? uvec2(1u, 2u) : uvec2(2u, 3u);
+    vec3 bary = vec3(1.0 - baryCoord.x - baryCoord.y, baryCoord.x, baryCoord.y);
+    vec2 uv = vertexUv(0u) * bary.x + vertexUv(other.x) * bary.y + vertexUv(other.y) * bary.z;
+    uint textureIndex = geometryBuffers[index].words[vertexBase(0u) + 11u];
+    uint alphaMode = geometryBuffers[index].words[vertexBase(0u) + 14u];
+    if (alphaMode != 0u && texture(entityTextures[nonuniformEXT(textureIndex)], uv).a
+            < (alphaMode == 1u ? 0.1 : 0.01)) {
+        ignoreIntersectionEXT;
+    }
+}

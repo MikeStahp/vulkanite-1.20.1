@@ -4,6 +4,7 @@ import me.jellysquid.mods.sodium.client.render.chunk.RenderSection;
 import me.jellysquid.mods.sodium.client.world.WorldSlice;
 import net.minecraft.block.BlockState;
 import net.minecraft.registry.Registries;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.Identifier;
 
 import java.util.ArrayList;
@@ -31,7 +32,11 @@ public final class SectionLightExtractor {
         int originZ = section.getOriginZ();
         List<SectionLight> lights = null;
         long[] opaqueBlocks = null;
+        long[] proceduralBlocks = null;
         boolean hasOpaqueBlocks = false;
+        int airCount = 0, voxelShadowCount = 0, triangleShadowCount = 0;
+        int emissiveCount = 0, compositeCount = 0, unknownFallbackCount = 0;
+        BlockPos.Mutable blockPos = new BlockPos.Mutable();
         BlockState lastState = null;
         BlockScanProfile lastProfile = null;
 
@@ -42,6 +47,7 @@ public final class SectionLightExtractor {
                 for (int x = 0; x < SECTION_SIZE; x++) {
                     int blockX = originX + x;
                     BlockState state = worldSlice.getBlockState(blockX, blockY, blockZ);
+                    blockPos.set(blockX, blockY, blockZ);
                     BlockScanProfile profile;
                     if (state == lastState) {
                         profile = lastProfile;
@@ -51,12 +57,39 @@ public final class SectionLightExtractor {
                         lastProfile = profile;
                     }
 
+                    boolean regularFullCube = state.isOpaqueFullCube(worldSlice, blockPos);
+                    BlockRayClassification classification = BlockRayClassifier.classify(
+                            new BlockRayClassifier.Traits(
+                                    state.isAir(), regularFullCube, !state.getFluidState().isEmpty(),
+                                    state.hasBlockEntity(), isCutoutLike(profile.path()),
+                                    isTranslucentLike(profile.path()), isMultipartLike(profile.path()),
+                                    profile.modded(), profile.packedRgbEmission() != 0));
+                    switch (classification.shadowRepresentation()) {
+                        case NONE -> airCount++;
+                        case VOXEL -> voxelShadowCount++;
+                        case TRIANGLE -> triangleShadowCount++;
+                    }
+                    if (classification.emissive()) emissiveCount++;
+                    if (classification.composite()) compositeCount++;
+                    if (classification.unknownFallback()) unknownFallbackCount++;
+
                     if (profile.opaqueForProbeVisibility()) {
                         if (opaqueBlocks == null) {
                             opaqueBlocks = SectionLightTable.newOpacityMask();
                         }
                         SectionLightTable.setOpaque(opaqueBlocks, x, y, z);
                         hasOpaqueBlocks = true;
+                    }
+                    // The procedural backend models an occupied cell as a unit
+                    // cube. Keep partial/cutout/connected models on triangles;
+                    // the broader probe-visibility mask intentionally includes
+                    // several of those and cannot be reused here.
+                    if (classification.shadowRepresentation()
+                            == BlockRayClassification.Representation.VOXEL) {
+                        if (proceduralBlocks == null) {
+                            proceduralBlocks = SectionLightTable.newOpacityMask();
+                        }
+                        SectionLightTable.setOpaque(proceduralBlocks, x, y, z);
                     }
                     if (profile.packedRgbEmission() == 0) {
                         continue;
@@ -81,7 +114,11 @@ public final class SectionLightExtractor {
                 section.getPosition(),
                 lights == null ? List.of() : lights,
                 opaqueBlocks,
-                hasOpaqueBlocks);
+                null,
+                hasOpaqueBlocks,
+                proceduralBlocks,
+                new SectionRayClassificationStats(airCount, voxelShadowCount, triangleShadowCount,
+                        emissiveCount, compositeCount, unknownFallbackCount));
     }
 
     private static BlockScanProfile profileFor(BlockState state) {
@@ -98,7 +135,8 @@ public final class SectionLightExtractor {
 
         int emission = state.getLuminance();
         if (emission <= 0) {
-            return new BlockScanProfile(opaqueForProbeVisibility, 0, (short) 0, (short) 0);
+            return new BlockScanProfile(opaqueForProbeVisibility, 0, (short) 0, (short) 0,
+                    path, !"minecraft".equals(namespace));
         }
 
         int rgb = colorFor(path, emission);
@@ -107,7 +145,25 @@ public final class SectionLightExtractor {
                 opaqueForProbeVisibility,
                 SectionLight.packRgbEmission(red(rgb), green(rgb), blue(rgb), emission),
                 (short) Math.max(1, Math.min(255, emission)),
-                flags);
+                flags, path, !"minecraft".equals(namespace));
+    }
+
+    private static boolean isCutoutLike(String path) {
+        return path.contains("leaves") || path.contains("sapling") || path.contains("flower")
+                || path.contains("grass") || path.contains("vine") || path.contains("pane")
+                || path.contains("bars") || path.contains("fence") || path.contains("door")
+                || path.contains("trapdoor") || path.contains("rail") || path.contains("torch");
+    }
+
+    private static boolean isTranslucentLike(String path) {
+        return path.contains("glass") || path.contains("ice") || path.contains("water")
+                || path.contains("portal") || path.contains("slime") || path.contains("honey");
+    }
+
+    private static boolean isMultipartLike(String path) {
+        return path.contains("fence") || path.contains("wall") || path.contains("pane")
+                || path.contains("bars") || path.contains("chest") || path.contains("bed")
+                || path.contains("door") || path.contains("piston");
     }
 
     private static boolean blocksProbeVisibility(BlockState state, String path, boolean isAir, boolean fluidEmpty) {
@@ -286,6 +342,8 @@ public final class SectionLightExtractor {
             boolean opaqueForProbeVisibility,
             int packedRgbEmission,
             short radius,
-            short flags) {
+            short flags,
+            String path,
+            boolean modded) {
     }
 }

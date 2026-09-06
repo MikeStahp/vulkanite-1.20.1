@@ -177,7 +177,7 @@ final class CacheFeedbackPass {
                 data.getInt(40));
     }
 
-    boolean execute(RtxPassGraph.Frame frame) {
+    boolean execute(RtxFrame frame) {
         if (frame.renderWidth() <= 0 || frame.renderHeight() <= 0 || missingGbuffer(frame)) {
             return false;
         }
@@ -390,11 +390,11 @@ final class CacheFeedbackPass {
         return CacheRequestSource.values()[sourceOrdinal];
     }
 
-    private void bindGbuffer(DescriptorUpdateBuilder updater, RtxPassGraph.Frame frame, int binding, int index) {
+    private void bindGbuffer(DescriptorUpdateBuilder updater, RtxFrame frame, int binding, int index) {
         updater.imageSampler(binding, frame.gbufferViews()[index], sampler);
     }
 
-    private boolean missingGbuffer(RtxPassGraph.Frame frame) {
+    private boolean missingGbuffer(RtxFrame frame) {
         VRef<VImageView>[] views = frame.gbufferViews();
         if (views == null || views.length < 5) {
             return true;

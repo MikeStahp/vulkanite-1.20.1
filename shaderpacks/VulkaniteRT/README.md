@@ -1,67 +1,63 @@
-# Vulkanite RT Shader Pack
+# Vulkanite RT shaderpack
 
-A ray tracing shader pack for Vulkanite, implementing a hybrid rendering approach with lightmap generation capabilities.
+The first-party shaderpack for Minecraft 1.20.1, Iris, Sodium, and Vulkanite.
+Iris rasterizes primary surface records; Vulkanite traces secondary rays and
+writes radiance and denoiser guides, optionally runs DLSS/RR, and blits the
+result into `colortex0` before Iris final presentation.
 
-## Features
+## Source ownership
 
-- **Hybrid Rendering**: Combines rasterized G-Buffer with ray traced effects
-- **Lightmap Generation**: Separate render targets for blocklight, sunlight, and LABPBR
-- **Mod-owned ReSTIR**: Uses Vulkanite's shared reservoir implementation
-- **Multi-layer Lighting**: Different ray tracing approaches for different light types
+Edit `shaders/` here. `gradlew.bat runClient` synchronizes tracked shaderpacks to
+`run/shaderpacks`; that directory is generated output. Ray stages are discovered
+from the active pack by `MixinProgramSet`. The mod injects only its shared
+ReSTIR library, `assets/vulkanite/shaders/raytracing/lib/restir.glsl`.
 
-## Shaders
+See [the shader index](shaders/SHADER_INDEX.md) for entry points and contracts.
+Shaderpack options live in `shaders/shaders.properties`; denoising and runtime
+controls are exposed through Vulkanite's configuration/UI.
 
-### Ray Generation (raygen.rgen)
-- Reads G-Buffer data for primary ray setup
-- Launches rays for block light, sun light, and LABPBR separately
-- Outputs to three separate lightmap render targets
+## Rendering techniques
 
-### Closest Hit (closesthit.rchit)
-- Handles geometry interactions
-- Different lighting calculations based on light type
-- Samples block atlas textures for material properties
+| Concern | Owner and selection |
+| --- | --- |
+| Primary visibility and compatibility | Iris/Sodium raster G-buffer, including entities, cutouts, and fluids. |
+| Full-frame secondary lighting | `FULL_RT_REFERENCE` dispatches `ray0.rgen` at render resolution. |
+| Cache-based lighting | `CACHE_ON_HIT` traces bounded fill requests, then resolves lighting; `CACHE_RESOLVE_ONLY` resolves without ray dispatch. |
+| Geometry traversal | Triangle reference by default; procedural opaque shadows and reflections are separate experiments. |
+| ReSTIR | Optional reservoir reuse; separate from geometry selection and DLSS/RR. |
+| Reconstruction | Vulkanite denoiser selection consumes the shared radiance/guide outputs. |
 
-### Miss (miss.rmiss)
-- Handles rays that don't hit any geometry
-- Provides appropriate background values for each light type
+`HybridAccelerationConfig` owns startup dependencies. Normal launches skip
+experimental SBT groups, procedural BLAS builds, and filtered shadow batches.
+Development options use `-Pvulkanite.<option>=...` with Gradle or
+`-Dvulkanite.<option>=...` on a directly launched JVM:
 
-### Any Hit (anyhit.rahit)
-- Performs alpha testing for transparent materials
-- Allows early ray termination for performance
+- `hybridShadow=true`: select the hybrid shadow TLAS and its shader/BLAS dependencies.
+- `compileDiagnostics=true`: compile comparison stages and build standalone procedural geometry.
+- `proceduralReflection=true`: enable the experimental material-bearing reflection path.
+- `hybridShadowPipeline=true`: compile shadow stages for pipeline experiments, without selecting hybrid dispatch.
+- `proceduralBlas=true|false`: explicitly override procedural geometry construction.
+- `hybridShadowGeometry=triangle-only`: retain unfiltered triangle shadow geometry for comparison/fallback.
+- `voxelBrickMode=fixed|adaptive` and `voxelBrickSize=4|8|16`: select brick policy once procedural geometry is enabled.
 
-## Lightmap Render Targets
+These are startup options; restart after changes. Device capabilities and
+compatible shader stages still gate execution. A single experiment flag does
+not certify visual correctness or performance. See the
+[hybrid acceleration plan](../../plans/HYBRID_GPU_ACCELERATION_PLAN.md).
 
-1. **Block Light** (`blockLightImage`) - Indirect illumination from emissive blocks
-2. **Sun Light** (`sunLightImage`) - Direct illumination from the sun
-3. **LABPBR** (`labpbrImage`) - Advanced lighting model data (placeholder)
+PowerShell example (quote dotted property arguments):
 
-## Requirements
+```powershell
+.\gradlew.bat runClient '-Pvulkanite.hybridShadow=true'
+```
 
-- Vulkanite mod installed
-- Compatible with Minecraft 1.20.1
-- Vulkan-compatible GPU with ray tracing support
+## ReSTIR contract
 
-## Configuration
-
-See `shader.properties` for configurable options including:
-- Ray tracing quality settings
-- Hybrid rendering parameters
-- Performance options
-
-## ReSTIR Contract
-
-Ray tracing packs opt into Vulkanite's shared ReSTIR implementation from
-`ray0.rgen`:
+A pack opts into the mod-owned API in `ray0.rgen` with:
 
 ```glsl
 #define VULKANITE_RESTIR 1
 ```
 
-Set the value to `0` to keep the shared declarations available while disabling
-ReSTIR. Omit the define entirely for packs that do not use ReSTIR.
-
-## Future Improvements
-
-- Advanced denoising algorithms
-- More sophisticated LABPBR lighting model
-- Improved geometry sampling in closest hit shaders
+Use `0` to keep shared declarations with ReSTIR disabled; omit the define if the
+pack does not use the API. The runtime ReSTIR setting also controls activation.

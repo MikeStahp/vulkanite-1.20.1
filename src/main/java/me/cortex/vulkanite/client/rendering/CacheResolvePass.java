@@ -73,7 +73,7 @@ final class CacheResolvePass {
         }
     }
 
-    void execute(RtxPassGraph.Frame frame, boolean clearReservoir) {
+    void execute(RtxFrame frame, boolean clearReservoir) {
         if (frame.renderWidth() <= 0 || frame.renderHeight() <= 0 || frame.noisyOutput() == null) {
             return;
         }
@@ -134,7 +134,7 @@ final class CacheResolvePass {
         }
     }
 
-    private void cmdPushConstants(RtxPassGraph.Frame frame, boolean clearReservoir) {
+    private void cmdPushConstants(RtxFrame frame, boolean clearReservoir) {
         DLSSConfig lighting = DLSSConfig.getInstance();
         pushConstants[0] = (long) frame.frameIndex() & 0xFFFFFFFFL
                 | (((long) frame.sampleIndex() & 0xFFFFFFFFL) << 32);
@@ -155,7 +155,7 @@ final class CacheResolvePass {
         pushConstants[8] = (long) Float.floatToRawIntBits(lighting.getSpecularIntensity()) & 0xFFFFFFFFL;
     }
 
-    private void bindGbuffer(DescriptorUpdateBuilder updater, RtxPassGraph.Frame frame, int binding, int index) {
+    private void bindGbuffer(DescriptorUpdateBuilder updater, RtxFrame frame, int binding, int index) {
         VRef<VImageView> view = frame.placeholderNormalsView();
         VRef<VImageView>[] gbufferViews = frame.gbufferViews();
         if (gbufferViews != null && index < gbufferViews.length && gbufferViews[index] != null) {

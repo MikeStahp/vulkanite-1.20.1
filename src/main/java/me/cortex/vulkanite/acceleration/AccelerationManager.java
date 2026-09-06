@@ -113,6 +113,34 @@ public class AccelerationManager {
         return tlasManager.buildTLAS(cmd);
     }
 
+    /** Selects the opt-in procedural material-instance layout for subsequent TLAS builds. */
+    public void setProceduralReflectionEnabled(boolean enabled) {
+        tlasManager.setProceduralReflectionEnabled(enabled);
+    }
+
+    public VRef<VAccelerationStructure> buildProceduralTLAS(int queueId, VCmdBuff cmd) {
+        // The triangle build queued the same BLAS completion waits immediately
+        // before this debug-only build. Keep the queue id in the API so both TLAS
+        // paths retain an identical submission contract.
+        return tlasManager.buildProceduralTLAS(cmd);
+    }
+
+    public VRef<VAccelerationStructure> buildHybridShadowTLAS(int queueId, VCmdBuff cmd) {
+        return tlasManager.buildHybridShadowTLAS(queueId, cmd);
+    }
+
+    public void markHybridTlasTimingSubmitted(long execution) {
+        tlasManager.markHybridTlasTimingSubmitted(execution);
+    }
+
+    public void cancelUnsubmittedHybridTlasTiming() {
+        tlasManager.cancelUnsubmittedHybridTlasTiming();
+    }
+
+    public void discardHybridShadowInstanceSnapshot() {
+        tlasManager.discardHybridShadowInstanceSnapshot();
+    }
+
     public void sectionRemove(RenderSection section) {
         retiredSections.add(section);
         latestBuildTimes.remove(section);

@@ -2,6 +2,7 @@ package me.cortex.vulkanite.acceleration.blas;
 
 import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.memory.VAccelerationStructure;
+import me.cortex.vulkanite.lib.memory.VBuffer;
 
 /** Worker-local ownership for a procedural BLAS between encode and publish. */
 final class ProceduralBLASBuild {
@@ -23,17 +24,32 @@ final class ProceduralBLASBuild {
         if (completed) {
             throw new IllegalStateException("Procedural BLAS build was already completed");
         }
-        completed = true;
-        var resource = ProceduralBLAS.create(
-                structure,
-                input.payloadBuffer().addRef(),
-                input.geometry().brickCount(),
-                accelerationStructureBytes,
-                input.debugName());
-        // The AABB buffer is no longer needed after vkCmdBuildAccelerationStructuresKHR
-        // completes. The resource retained its own payload reference above.
-        input.close();
-        return resource;
+        VRef<VBuffer> retainedPayload = null;
+        try {
+            retainedPayload = input.payloadBuffer().addRef();
+            VRef<ProceduralBLAS> resource = ProceduralBLAS.create(
+                    structure,
+                    retainedPayload,
+                    input.geometry().brickCount(),
+                    input.geometry().brickSize(),
+                    input.geometry().hasMaterialPayload(),
+                    input.geometry().hasCompleteMaterialPayload(),
+                    input.geometry().materialPayload().cellMaterialCount(),
+                    input.geometry().materialPayload().faceMaterialCount(),
+                    input.geometry().materialPayload().layerCount(),
+                    accelerationStructureBytes,
+                    input.debugName());
+            // The AABB buffer is no longer needed after the build completes.
+            input.close();
+            completed = true;
+            return resource;
+        } catch (RuntimeException | Error failure) {
+            if (retainedPayload != null) {
+                retainedPayload.close();
+            }
+            discard();
+            throw failure;
+        }
     }
 
     void discard() {

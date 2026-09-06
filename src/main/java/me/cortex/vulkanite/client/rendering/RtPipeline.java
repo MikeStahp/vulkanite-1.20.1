@@ -13,5 +13,8 @@ public record RtPipeline(
         int geomSet,
         int entityTextureSet,
         int customTexSet,
-        int ssboSet) {
+        int ssboSet,
+        boolean proceduralDebugHitGroup,
+        boolean proceduralShadowHitGroups,
+        boolean proceduralReflectionHitGroup) {
 }

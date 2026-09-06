@@ -1,0 +1,30 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "/lib/rt/data.glsl"
+#include "/lib/rt/payload.glsl"
+#include "/lib/rt/fragment_info.glsl"
+
+layout(location = 1) rayPayloadInEXT float shadowPayload;
+hitAttributeEXT vec2 baryCoord;
+layout(binding = 3) uniform sampler2D blockTex;
+layout(set = 1, binding = 0) readonly buffer Quads { Quad quads[]; } geometryBuffers[];
+
+void main() {
+    uint index = nonuniformEXT(gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT);
+    Quad quad = geometryBuffers[index].quads[gl_PrimitiveID >> 1];
+    float blockId = float(quad.vertices[0].block_id.x);
+    float alpha = texture(blockTex, getFragmentUV(quad, baryCoord)).a;
+    float threshold = isFoliageMaterial(blockId) ? 0.5 : 0.1;
+    if (alpha < threshold || isWaterMaterial(blockId) || isGlassMaterial(blockId) || isIceMaterial(blockId)) {
+        ignoreIntersectionEXT;
+    }
+}

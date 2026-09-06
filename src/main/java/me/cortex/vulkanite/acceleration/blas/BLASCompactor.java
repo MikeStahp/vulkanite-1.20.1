@@ -70,6 +70,7 @@ public class BLASCompactor {
     public void compactAndPublish(
             List<BLASBuildJob> jobs,
             List<VRef<VAccelerationStructure>> accelerationStructures,
+            List<ShadowTriangleBLASBuild> shadowBuilds,
             List<ProceduralBLASBuild> proceduralBuilds,
             long[] compactedSizes,
             VCommandPool singleUsePoolWorker,
@@ -95,98 +96,129 @@ public class BLASCompactor {
         
         List<BLASBuildResult> results = new ArrayList<>(jobs.size());
         var cmdRef = singleUsePoolWorker.createCommandBuffer();
-        
-        long compactStartTime = System.nanoTime();
-        cmdRef.get().resetQueryPool(timestampQueryPool, COMPACT_TIMESTAMP_START, 2);
-        cmdRef.get().writeTimestamp(timestampQueryPool, COMPACT_TIMESTAMP_START, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
-        
-        for (int idx = 0; idx < compactedSizes.length; idx++) {
-            LOGGER.debug("[BLAS Compactor] Batch #{} Creating compact AS[{}] with size {}", 
-                batchNumber, idx, compactedSizes[idx]);
-            
-            // Create compact acceleration structure
-            var compact_as = accelerationStructurePool.createAcceleration(compactedSizes[idx],
-                VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
-            
-            // Get source (fat) acceleration structure
-            var fat_as = accelerationStructures.get(idx);
-            
-            LOGGER.debug("[BLAS Compactor] Batch #{} Copying AS[{}]: src=0x{}, dst=0x{}",
-                batchNumber, idx, Long.toHexString(fat_as.get().structure),
-                Long.toHexString(compact_as.get().structure));
-            
-            // Copy and compact
-            vkCmdCopyAccelerationStructureKHR(cmdRef.get().buffer(),
-                VkCopyAccelerationStructureInfoKHR.calloc(stack).sType$Default()
-                    .src(fat_as.get().structure)
-                    .dst(compact_as.get().structure)
-                    .mode(VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR));
-            
-            // Add references and cleanup
-            cmdRef.get().addAccelerationStructureRef(fat_as);
-            cmdRef.get().addAccelerationStructureRef(compact_as);
-            fat_as.close();
-            
-            // Create result
-            var job = jobs.get(idx);
-            results.add(BLASBatchProcessor.createBuildResult(
-                    compact_as, job, proceduralBuilds.get(idx)));
-        }
-        cmdRef.get().writeTimestamp(timestampQueryPool, COMPACT_TIMESTAMP_END,
-                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
-        
-        // Submit compaction command
-        LOGGER.debug("[BLAS Compactor] Batch #{} Enqueueing compaction command", batchNumber);
-        long submitStartTime = System.nanoTime();
-        CompletableFuture<Long> blasExecutionFuture = context.cmd.enqueueSubmission(asyncQueue, cmdRef);
-        long submitTime = System.nanoTime() - submitStartTime;
-        cmdRef.close();
-        
-        long blasExecution;
-        long compactGpuNanos;
+        boolean resultsTransferred = false;
+        boolean waitInterrupted = false;
         try {
-            long waitStartTime = System.nanoTime();
-            blasExecution = blasExecutionFuture.get();
-            long waitTime = System.nanoTime() - waitStartTime;
-            long compactTime = System.nanoTime() - compactStartTime;
-            compactGpuNanos = readCompactGpuNanos();
-            long now = System.nanoTime();
-            if (compactTime >= SLOW_COMPACTION_LOG_NANOS
-                    && now - lastInfoLogNanos >= INFO_LOG_INTERVAL_NANOS) {
-                lastInfoLogNanos = now;
-                LOGGER.info("[BLAS Compactor] Batch #{} Compaction completed (execution={}) enqueue={} ms, submissionWait={} ms, compactStage={} ms, gpuCompact={} ms",
-                        batchNumber, blasExecution, formatMillis(submitTime), formatMillis(waitTime),
-                        formatMillis(compactTime), formatMillis(compactGpuNanos));
-            } else {
-                LOGGER.debug("[BLAS Compactor] Batch #{} Compaction completed (execution={}) enqueue={} ms, submissionWait={} ms, compactStage={} ms, gpuCompact={} ms",
-                        batchNumber, blasExecution, formatMillis(submitTime), formatMillis(waitTime),
-                        formatMillis(compactTime), formatMillis(compactGpuNanos));
+            long compactStartTime = System.nanoTime();
+            cmdRef.get().resetQueryPool(timestampQueryPool, COMPACT_TIMESTAMP_START, 2);
+            cmdRef.get().writeTimestamp(
+                    timestampQueryPool, COMPACT_TIMESTAMP_START, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+
+            for (int idx = 0; idx < compactedSizes.length; idx++) {
+                LOGGER.debug("[BLAS Compactor] Batch #{} Creating compact AS[{}] with size {}",
+                        batchNumber, idx, compactedSizes[idx]);
+
+                VRef<VAccelerationStructure> compactStructure = accelerationStructurePool.createAcceleration(
+                        compactedSizes[idx], VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+                boolean compactStructureTransferred = false;
+                try {
+                    VRef<VAccelerationStructure> sourceStructure = accelerationStructures.get(idx);
+                    LOGGER.debug("[BLAS Compactor] Batch #{} Copying AS[{}]: src=0x{}, dst=0x{}",
+                            batchNumber, idx, Long.toHexString(sourceStructure.get().structure),
+                            Long.toHexString(compactStructure.get().structure));
+
+                    vkCmdCopyAccelerationStructureKHR(cmdRef.get().buffer(),
+                            VkCopyAccelerationStructureInfoKHR.calloc(stack).sType$Default()
+                                    .src(sourceStructure.get().structure)
+                                    .dst(compactStructure.get().structure)
+                                    .mode(VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR));
+                    cmdRef.get().addAccelerationStructureRef(sourceStructure);
+                    cmdRef.get().addAccelerationStructureRef(compactStructure);
+
+                    BLASBuildResult result = BLASBatchProcessor.createBuildResult(
+                            compactStructure,
+                            jobs.get(idx),
+                            shadowBuilds.get(idx),
+                            proceduralBuilds.get(idx));
+                    try {
+                        results.add(result);
+                        compactStructureTransferred = true;
+                    } catch (RuntimeException | Error failure) {
+                        result.close();
+                        throw failure;
+                    }
+                } finally {
+                    if (!compactStructureTransferred) {
+                        compactStructure.close();
+                    }
+                }
             }
-        } catch (Exception e) {
-            LOGGER.error("[BLAS Compactor] Batch #{} Failed while waiting for compaction submission", batchNumber, e);
-            throw new RuntimeException(e);
+            cmdRef.get().writeTimestamp(timestampQueryPool, COMPACT_TIMESTAMP_END,
+                    VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
+
+            LOGGER.debug("[BLAS Compactor] Batch #{} Enqueueing compaction command", batchNumber);
+            long submitStartTime = System.nanoTime();
+            CompletableFuture<Long> blasExecutionFuture =
+                    context.cmd.enqueueSubmission(asyncQueue, cmdRef);
+            long submitTime = System.nanoTime() - submitStartTime;
+            cmdRef.close();
+
+            long blasExecution;
+            try {
+                long waitStartTime = System.nanoTime();
+                while (true) {
+                    try {
+                        blasExecution = blasExecutionFuture.get();
+                        break;
+                    } catch (InterruptedException interrupted) {
+                        // The compact source/destination structures are retained
+                        // by the submitted command. Do not let worker shutdown
+                        // reclaim them until that submission has completed.
+                        waitInterrupted = true;
+                    }
+                }
+                long waitTime = System.nanoTime() - waitStartTime;
+                long compactTime = System.nanoTime() - compactStartTime;
+                long compactGpuNanos = readCompactGpuNanos();
+                long now = System.nanoTime();
+                if (compactTime >= SLOW_COMPACTION_LOG_NANOS
+                        && now - lastInfoLogNanos >= INFO_LOG_INTERVAL_NANOS) {
+                    lastInfoLogNanos = now;
+                    LOGGER.info("[BLAS Compactor] Batch #{} Compaction completed (execution={}) enqueue={} ms, submissionWait={} ms, compactStage={} ms, gpuCompact={} ms",
+                            batchNumber, blasExecution, formatMillis(submitTime), formatMillis(waitTime),
+                            formatMillis(compactTime), formatMillis(compactGpuNanos));
+                } else {
+                    LOGGER.debug("[BLAS Compactor] Batch #{} Compaction completed (execution={}) enqueue={} ms, submissionWait={} ms, compactStage={} ms, gpuCompact={} ms",
+                            batchNumber, blasExecution, formatMillis(submitTime), formatMillis(waitTime),
+                            formatMillis(compactTime), formatMillis(compactGpuNanos));
+                }
+            } catch (Exception e) {
+                LOGGER.error("[BLAS Compactor] Batch #{} Failed while waiting for compaction submission",
+                        batchNumber, e);
+                throw new RuntimeException(e);
+            }
+
+            if (priorExecutions.size() >= 3) {
+                long prior = priorExecutions.poll();
+                LOGGER.debug("[BLAS Compactor] Batch #{} Waiting for prior execution {}", batchNumber, prior);
+                context.cmd.hostWaitForExecution(asyncQueue, prior);
+            }
+            priorExecutions.add(blasExecution);
+
+            try {
+                LOGGER.debug("[BLAS Compactor] Batch #{} Publishing {} results, enqueueToPublish avg={} ms, max={} ms",
+                        batchNumber, results.size(), formatMillis(averageEnqueueToPublishNanos(results)),
+                        formatMillis(maxEnqueueToPublishNanos(results)));
+                resultConsumer.accept(new BLASBatchResult(results, blasExecution));
+                resultsTransferred = true;
+            } catch (Exception e) {
+                LOGGER.error("[BLAS Compactor] Batch #{} Error publishing results", batchNumber, e);
+                throw e;
+            }
+        } finally {
+            cmdRef.close();
+            BLASBatchProcessor.closeAccelerationStructures(accelerationStructures);
+            if (!resultsTransferred) {
+                for (BLASBuildResult result : results) {
+                    result.close();
+                }
+                BLASBatchProcessor.discardShadowBuilds(shadowBuilds);
+                BLASBatchProcessor.discardProceduralBuilds(proceduralBuilds);
+            }
+            if (waitInterrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
-        
-        // Publish results
-        try {
-            resultConsumer.accept(new BLASBatchResult(results, blasExecution));
-            LOGGER.debug("[BLAS Compactor] Batch #{} Published {} results, enqueueToPublish avg={} ms, max={} ms",
-                    batchNumber, results.size(), formatMillis(averageEnqueueToPublishNanos(results)),
-                    formatMillis(maxEnqueueToPublishNanos(results)));
-        } catch (Exception e) {
-            LOGGER.error("[BLAS Compactor] Batch #{} Error publishing results", batchNumber, e);
-            throw e;
-        }
-        
-        // Track execution and handle prior synchronization
-        priorExecutions.add(blasExecution);
-        if (priorExecutions.size() > 3) {
-            long prior = priorExecutions.poll();
-            LOGGER.debug("[BLAS Compactor] Batch #{} Waiting for prior execution {}", batchNumber, prior);
-            context.cmd.hostWaitForExecution(asyncQueue, prior);
-        }
-        
-        LOGGER.debug("[BLAS Compactor] Batch #{} Compaction complete", batchNumber);
     }
 
     private static long averageEnqueueToPublishNanos(List<BLASBuildResult> results) {

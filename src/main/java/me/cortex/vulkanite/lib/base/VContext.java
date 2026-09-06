@@ -46,7 +46,7 @@ public class VContext {
         memory = new MemoryManager(device, hasDeviceAddresses);
         sync = new SyncManager(device);
         cmd = new CommandManager(device, queueCount, queueFamilyIndex);
-        properties = new DeviceProperties(device);
+        properties = new DeviceProperties(device, queueFamilyIndex);
         this.hasDebugUtils = hasDebugUtils;
         this.validationEnabled = debugCallback != null;
         this.debugCallback = debugCallback;

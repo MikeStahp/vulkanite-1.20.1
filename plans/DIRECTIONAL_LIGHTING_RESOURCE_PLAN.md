@@ -1,5 +1,13 @@
 # Directional Lighting Resource Plan
 
+September 2026 ownership update: the current rendering consolidation and
+acceleration acceptance order are recorded in
+[HYBRID_GPU_ACCELERATION_PLAN.md](HYBRID_GPU_ACCELERATION_PLAN.md).
+`RtxFrame` now carries shared pass inputs, `VulkanPipeline` owns execution order,
+and the forwarding `RtxPassGraph` has been removed. Unused bundled shader assets
+were removed after the repeated loader audit. The June verification snapshot
+below remains historical evidence, including references to those former files.
+
 ## Goal
 
 Build directional lighting that is much cheaper than full per-pixel path tracing

@@ -125,7 +125,20 @@ public class DLSSConfig {
         OUTPUT("Output", "Show DLSS output texture"),
         MOTION_VECTORS("Motion Vectors", "Show motion vectors"),
         DEPTH("Depth", "Show depth buffer"),
-        NORMALS("Normals", "Show normal buffer");
+        NORMALS("Normals", "Show normal buffer"),
+        PROCEDURAL_DISTANCE("Procedural Distance", "Show procedural voxel hit distance"),
+        PROCEDURAL_NORMALS("Procedural Normals", "Show procedural voxel face normals"),
+        PROCEDURAL_BRICK_IDS("Procedural Brick IDs", "Color procedural brick primitives"),
+        PROCEDURAL_VOXEL_IDS("Procedural Voxel IDs", "Color brick-local voxel cells"),
+        SHADOW_COMPARISON("Shadow Comparison", "Overlay triangle/procedural visibility totals"),
+        SHADOW_DANGEROUS_MISSES("Shadow Dangerous Misses", "Highlight triangle hits missed procedurally"),
+        SHADOW_EXTRA_HITS("Shadow Extra Hits", "Highlight conservative procedural-only hits"),
+        SHADOW_DOUBLE_TRACE_REFERENCE(
+                "Shadow Double-Trace Reference",
+                "Render the logical union of triangle and procedural shadow hits"),
+        PROCEDURAL_REFLECTION_COMPARISON(
+                "Procedural Reflection Comparison",
+                "Compare triangle and procedural primary material hits");
 
         private final String displayName;
         private final String description;
@@ -188,6 +201,9 @@ public class DLSSConfig {
 
     // Debug Settings
     private int debugCellIndex = -1;
+    private int shadowComparisonSamplingPercent = 100;
+    private float shadowComparisonDistanceTolerance = 0.01f;
+    private boolean shadowComparisonStructuredLogging = false;
 
     // =====================================================================
     // SINGLETON ACCESS
@@ -279,6 +295,12 @@ public class DLSSConfig {
 
             // Debug Settings
             debugCellIndex = parseInt(props, "debugCellIndex", -1, -1, Integer.MAX_VALUE);
+            shadowComparisonSamplingPercent = parseInt(
+                    props, "shadowComparisonSamplingPercent", 100, 1, 100);
+            shadowComparisonDistanceTolerance = parseFloat(
+                    props, "shadowComparisonDistanceTolerance", 0.01f, 0.0001f, 1.0f);
+            shadowComparisonStructuredLogging = parseBoolean(
+                    props, "shadowComparisonStructuredLogging", false);
 
             LOGGER.info("[Vulkanite] DLSS config loaded: denoiser={}, quality={}, restir={}", 
                 denoiserType, qualityPreset, restirEnabled);
@@ -333,6 +355,11 @@ public class DLSSConfig {
 
         // Debug Settings
         props.setProperty("debugCellIndex", String.valueOf(debugCellIndex));
+        props.setProperty("shadowComparisonSamplingPercent", String.valueOf(shadowComparisonSamplingPercent));
+        props.setProperty("shadowComparisonDistanceTolerance",
+                String.valueOf(shadowComparisonDistanceTolerance));
+        props.setProperty("shadowComparisonStructuredLogging",
+                String.valueOf(shadowComparisonStructuredLogging));
 
         try (FileWriter writer = new FileWriter(configFile)) {
             props.store(writer, "Vulkanite DLSS/FSR Configuration");
@@ -533,6 +560,9 @@ public class DLSSConfig {
     // =====================================================================
 
     public int getDebugCellIndex() { return debugCellIndex; }
+    public int getShadowComparisonSamplingPercent() { return shadowComparisonSamplingPercent; }
+    public float getShadowComparisonDistanceTolerance() { return shadowComparisonDistanceTolerance; }
+    public boolean isShadowComparisonStructuredLogging() { return shadowComparisonStructuredLogging; }
 
     // =====================================================================
     // SETTERS - Core DLSS Settings
@@ -678,6 +708,24 @@ public class DLSSConfig {
         markChanged("debugCellIndex", oldValue, this.debugCellIndex);
     }
 
+    public void setShadowComparisonSamplingPercent(int percent) {
+        int oldValue = this.shadowComparisonSamplingPercent;
+        this.shadowComparisonSamplingPercent = Math.max(1, Math.min(100, percent));
+        markChanged("shadowComparisonSamplingPercent", oldValue, this.shadowComparisonSamplingPercent);
+    }
+
+    public void setShadowComparisonDistanceTolerance(float tolerance) {
+        float oldValue = this.shadowComparisonDistanceTolerance;
+        this.shadowComparisonDistanceTolerance = Math.max(0.0001f, Math.min(1.0f, tolerance));
+        markChanged("shadowComparisonDistanceTolerance", oldValue, this.shadowComparisonDistanceTolerance);
+    }
+
+    public void setShadowComparisonStructuredLogging(boolean enabled) {
+        boolean oldValue = this.shadowComparisonStructuredLogging;
+        this.shadowComparisonStructuredLogging = enabled;
+        markChanged("shadowComparisonStructuredLogging", oldValue, this.shadowComparisonStructuredLogging);
+    }
+
     // =====================================================================
     // ADDITIONAL GETTERS - Used by MixinProgramSet
     // =====================================================================
@@ -754,6 +802,9 @@ public class DLSSConfig {
         specularIntensity = 1.0f;
         gamma = 2.2f;
         debugCellIndex = -1;
+        shadowComparisonSamplingPercent = 100;
+        shadowComparisonDistanceTolerance = 0.01f;
+        shadowComparisonStructuredLogging = false;
         dirty = true;
         
         LOGGER.info("[Vulkanite] DLSS config reset to defaults");

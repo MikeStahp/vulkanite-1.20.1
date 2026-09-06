@@ -1,0 +1,75 @@
+package me.cortex.vulkanite.client.rendering;
+
+import me.cortex.vulkanite.lib.base.VRef;
+import me.cortex.vulkanite.lib.cmd.VCmdBuff;
+import me.cortex.vulkanite.lib.memory.VAccelerationStructure;
+import me.cortex.vulkanite.lib.memory.VBuffer;
+import me.cortex.vulkanite.lib.memory.VGImage;
+import me.cortex.vulkanite.lib.memory.VImage;
+import me.cortex.vulkanite.lib.other.VImageView;
+import net.irisshaders.iris.gl.buffer.ShaderStorageBuffer;
+
+import java.util.List;
+
+/** Borrowed frame resources shared by ray dispatch, cache feedback, and cache resolve. */
+record RtxFrame(
+        VCmdBuff cmd,
+        VRef<VBuffer> uboBuffer,
+        long uboOffset,
+        long uboSize,
+        VRef<VAccelerationStructure> tlas,
+        VRef<VAccelerationStructure> proceduralTlas,
+        VRef<VAccelerationStructure> hybridShadowTlas,
+        VRef<VBuffer> shadowComparisonBuffer,
+        SharedImageViewTracker blockAtlasView,
+        SharedImageViewTracker blockAtlasNormalView,
+        SharedImageViewTracker blockAtlasSpecularView,
+        VRef<VImageView> placeholderNormalsView,
+        VRef<VImageView> placeholderSpecularView,
+        SharedImageViewTracker[] irisRenderTargetViews,
+        List<VRef<VGImage>> vgOutImgs,
+        List<VRef<VImage>> outImgs,
+        SharedImageViewTracker[] customTextureViews,
+        ShaderStorageBuffer[] ssbos,
+        VRef<VImageView>[] gbufferViews,
+        int frameIndex,
+        int sampleIndex,
+        float sunDirectionX,
+        float sunDirectionY,
+        float sunDirectionZ,
+        float sunColorR,
+        float sunColorG,
+        float sunColorB,
+        int enableReSTIR,
+        int debugMode,
+        int debugCellIndex,
+        int shadowComparisonSamplingPermille,
+        float shadowComparisonDistanceTolerance,
+        int cacheExecutionMode,
+        RtxFrameImages.StorageViews storageViews,
+        VRef<VImage> currentReservoir,
+        VRef<VImage> previousReservoir,
+        VRef<VImage> diffuseAlbedoMetallic,
+        VRef<VImage> specularAlbedo,
+        VRef<VImage> normalRoughness,
+        VRef<VImage> motionVectors,
+        VRef<VImage> linearDepth,
+        VRef<VImage> specularHitDepth,
+        VRef<VImage> firstHitDepth,
+        VRef<VImage> blocklightDetail,
+        VRef<VBuffer> sectionLightBuffer,
+        VRef<VBuffer> sectionLightProbeBuffer,
+        VRef<VBuffer> sectionLightProbeFeedbackBuffer,
+        VRef<VBuffer> sectionLightProbeFillRequestBuffer,
+        VRef<VBuffer> diffuseRadianceCacheBuffer,
+        VRef<VBuffer> diffuseRadianceFillRequestBuffer,
+        VRef<VBuffer> specularTransportCacheBuffer,
+        VRef<VBuffer> specularTransportFillRequestBuffer,
+        VRef<VBuffer> surfaceDirectLightCacheBuffer,
+        VRef<VBuffer> surfaceDirectLightFillRequestBuffer,
+        VRef<VImage> noisyOutput,
+        int renderWidth,
+        int renderHeight,
+        int rayDispatchWidth,
+        int rayDispatchHeight) {
+}

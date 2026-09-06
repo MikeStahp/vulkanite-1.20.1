@@ -114,17 +114,30 @@ public class BLASBatchProcessor {
         PointerBuffer proceduralBuildRanges = proceduralBuildCount == 0
                 ? null
                 : stack.mallocPointer(proceduralBuildCount);
+        int shadowBuildCount = (int) jobs.stream().filter(job -> job.shadowTriangleInput().isPresent()).count();
+        var shadowBuildInfos = shadowBuildCount == 0
+                ? null
+                : VkAccelerationStructureBuildGeometryInfoKHR.calloc(shadowBuildCount, stack);
+        PointerBuffer shadowBuildRanges = shadowBuildCount == 0
+                ? null
+                : stack.mallocPointer(shadowBuildCount);
         
         var accelerationStructures = new ArrayList<VRef<VAccelerationStructure>>(jobs.size());
         var proceduralBuilds = new ArrayList<ProceduralBLASBuild>(jobs.size());
+        var shadowBuilds = new ArrayList<ShadowTriangleBLASBuild>(jobs.size());
         for (int i = 0; i < jobs.size(); i++) {
             proceduralBuilds.add(null);
+            shadowBuilds.add(null);
         }
         
         // Create command buffer for geometry processing and build
         var uploadBuildCmdRef = singleUsePoolWorker.createCommandBuffer();
-        var uploadBuildCmd = uploadBuildCmdRef.get();
-        uploadBuildCmd.bindCompute(gpuVertexDecodePipeline);
+        CompletableFuture<Long> buildExecutionFuture;
+        long submitTime;
+        long buildStartTime;
+        try {
+            var uploadBuildCmd = uploadBuildCmdRef.get();
+            uploadBuildCmd.bindCompute(gpuVertexDecodePipeline);
         
         // Process geometry for all jobs
         var geometryProcessor = new BLASGeometryProcessor(
@@ -136,6 +149,10 @@ public class BLASBatchProcessor {
             LOGGER.trace("[BLAS Batch #{}] Processing job {} with {} geometries",
                 batchNumber, i, job.geometries().size());
             geometryProcessor.processJob(job, i, buildInfos, buildRanges, pAccelerationStructures, accelerationStructures);
+            if (job.shadowTriangleInput().isPresent()) {
+                shadowBuilds.set(i, geometryProcessor.processShadowTriangleJob(
+                        job, i, shadowBuildInfos, shadowBuildRanges));
+            }
             if (job.proceduralInput().isPresent()) {
                 proceduralBuilds.set(i, geometryProcessor.processProceduralJob(
                         job, i, proceduralBuildInfos, proceduralBuildRanges));
@@ -154,13 +171,21 @@ public class BLASBatchProcessor {
             proceduralBuildInfos.rewind();
             proceduralBuildRanges.rewind();
         }
+        if (shadowBuildInfos != null) {
+            shadowBuildInfos.rewind();
+            shadowBuildRanges.rewind();
+        }
         
         // Build acceleration structures
         LOGGER.debug("[BLAS Batch #{}] Building {} acceleration structures", batchNumber, jobs.size());
-        long buildStartTime = System.nanoTime();
+        buildStartTime = System.nanoTime();
         uploadBuildCmd.resetQueryPool(timestampQueryPool, BUILD_TIMESTAMP_START, 2);
         uploadBuildCmd.writeTimestamp(timestampQueryPool, BUILD_TIMESTAMP_START, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
         vkCmdBuildAccelerationStructuresKHR(uploadBuildCmd.buffer(), buildInfos, buildRanges);
+        if (shadowBuildInfos != null) {
+            vkCmdBuildAccelerationStructuresKHR(
+                    uploadBuildCmd.buffer(), shadowBuildInfos, shadowBuildRanges);
+        }
         if (proceduralBuildInfos != null) {
             vkCmdBuildAccelerationStructuresKHR(
                     uploadBuildCmd.buffer(), proceduralBuildInfos, proceduralBuildRanges);
@@ -181,28 +206,49 @@ public class BLASBatchProcessor {
         // Submit and wait for build to complete
         LOGGER.debug("[BLAS Batch #{}] Submitting build command", batchNumber);
         long submitStartTime = System.nanoTime();
-        CompletableFuture<Long> buildExecutionFuture = context.cmd.enqueueSubmission(asyncQueue, uploadBuildCmdRef);
-        long submitTime = System.nanoTime() - submitStartTime;
+        buildExecutionFuture = context.cmd.enqueueSubmission(asyncQueue, uploadBuildCmdRef);
+        submitTime = System.nanoTime() - submitStartTime;
+        } catch (RuntimeException | Error failure) {
+            uploadBuildCmdRef.close();
+            closeAccelerationStructures(accelerationStructures);
+            discardShadowBuilds(shadowBuilds);
+            discardProceduralBuilds(proceduralBuilds);
+            throw failure;
+        }
         long buildExecution;
         long buildGpuNanos;
+        boolean waitInterrupted = false;
         try {
-            long waitStartTime = System.nanoTime();
-            buildExecution = buildExecutionFuture.get();
-            long waitTime = System.nanoTime() - waitStartTime;
-            long buildTime = System.nanoTime() - buildStartTime;
-            buildGpuNanos = readBuildGpuNanos();
-            LOGGER.debug("[BLAS Batch #{}] Build completed (execution={}) enqueue={} ms, submissionWait={} ms, buildStage={} ms, gpuBuild={} ms",
-                    batchNumber, buildExecution, formatMillis(submitTime), formatMillis(waitTime),
-                    formatMillis(buildTime), formatMillis(buildGpuNanos));
-        } catch (Exception e) {
-            LOGGER.error("[BLAS Batch #{}] Failed while waiting for build submission", batchNumber, e);
-            discardProceduralBuilds(proceduralBuilds);
-            throw new RuntimeException(e);
-        }
+            try {
+                long waitStartTime = System.nanoTime();
+                while (true) {
+                    try {
+                        buildExecution = buildExecutionFuture.get();
+                        break;
+                    } catch (InterruptedException interrupted) {
+                        // Submitted work still owns allocator-backed build inputs.
+                        // Finish the GPU wait before the worker may reset them.
+                        waitInterrupted = true;
+                    }
+                }
+                long waitTime = System.nanoTime() - waitStartTime;
+                long buildTime = System.nanoTime() - buildStartTime;
+                buildGpuNanos = readBuildGpuNanos();
+                LOGGER.debug("[BLAS Batch #{}] Build completed (execution={}) enqueue={} ms, submissionWait={} ms, buildStage={} ms, gpuBuild={} ms",
+                        batchNumber, buildExecution, formatMillis(submitTime), formatMillis(waitTime),
+                        formatMillis(buildTime), formatMillis(buildGpuNanos));
+            } catch (Exception e) {
+                LOGGER.error("[BLAS Batch #{}] Failed while waiting for build submission", batchNumber, e);
+                uploadBuildCmdRef.close();
+                closeAccelerationStructures(accelerationStructures);
+                discardShadowBuilds(shadowBuilds);
+                discardProceduralBuilds(proceduralBuilds);
+                throw new RuntimeException(e);
+            }
         
-        uploadBuildCmdRef.close();
+            uploadBuildCmdRef.close();
         
-        if (COMPACT_BLAS) {
+            if (COMPACT_BLAS) {
             // Read and validate compacted sizes
             long queryReadStartTime = System.nanoTime();
             long[] compactedSizes;
@@ -215,27 +261,52 @@ public class BLASBatchProcessor {
                 queryBuilder.validateCompactedSizes(compactedSizes, batchNumber);
             } catch (Exception e) {
                 LOGGER.error("[BLAS Batch #{}] Error reading query pool results", batchNumber, e);
+                closeAccelerationStructures(accelerationStructures);
+                discardShadowBuilds(shadowBuilds);
+                discardProceduralBuilds(proceduralBuilds);
                 throw e;
             }
 
-            // Compact and publish results (compactor handles closing source AS)
-            compactor.compactAndPublish(jobs, accelerationStructures, proceduralBuilds, compactedSizes,
-                singleUsePoolWorker, stack, priorExecutions, batchNumber);
-        } else {
-            publishBuiltResults(jobs, accelerationStructures, proceduralBuilds,
-                    buildExecution, priorExecutions, batchNumber);
-        }
+                // The compactor owns all build outputs once entered. The catch
+                // still covers validation/command-buffer creation failures that
+                // occur before its internal ownership guard is established.
+                try {
+                    compactor.compactAndPublish(
+                            jobs, accelerationStructures, shadowBuilds, proceduralBuilds, compactedSizes,
+                            singleUsePoolWorker, stack, priorExecutions, batchNumber);
+                } catch (RuntimeException | Error failure) {
+                    closeAccelerationStructures(accelerationStructures);
+                    discardShadowBuilds(shadowBuilds);
+                    discardProceduralBuilds(proceduralBuilds);
+                    throw failure;
+                }
+            } else {
+                publishBuiltResults(jobs, accelerationStructures, shadowBuilds, proceduralBuilds,
+                        buildExecution, priorExecutions, batchNumber);
+            }
 
-        long totalBatchNanos = System.nanoTime() - batchStartTime;
-        long now = System.nanoTime();
-        if (totalBatchNanos >= SLOW_BATCH_LOG_NANOS
-                && now - lastInfoLogNanos >= INFO_LOG_INTERVAL_NANOS) {
-            lastInfoLogNanos = now;
-            LOGGER.info("[BLAS Batch #{}] Completed {} jobs in {} ms total, gpuBuild={} ms",
-                    batchNumber, jobs.size(), formatMillis(totalBatchNanos), formatMillis(buildGpuNanos));
-        } else {
-            LOGGER.debug("[BLAS Batch #{}] Completed {} jobs in {} ms total, gpuBuild={} ms",
-                    batchNumber, jobs.size(), formatMillis(totalBatchNanos), formatMillis(buildGpuNanos));
+            int completedJobCount = jobs.size();
+            // Results now own every job input. Clear the worker's mutable list
+            // before diagnostics so a later non-rendering exception cannot make
+            // BLASBuildWorker close resources that have already been published.
+            jobs.clear();
+            long totalBatchNanos = System.nanoTime() - batchStartTime;
+            long now = System.nanoTime();
+            if (totalBatchNanos >= SLOW_BATCH_LOG_NANOS
+                    && now - lastInfoLogNanos >= INFO_LOG_INTERVAL_NANOS) {
+                lastInfoLogNanos = now;
+                LOGGER.info("[BLAS Batch #{}] Completed {} jobs in {} ms total, gpuBuild={} ms",
+                        batchNumber, completedJobCount,
+                        formatMillis(totalBatchNanos), formatMillis(buildGpuNanos));
+            } else {
+                LOGGER.debug("[BLAS Batch #{}] Completed {} jobs in {} ms total, gpuBuild={} ms",
+                        batchNumber, completedJobCount,
+                        formatMillis(totalBatchNanos), formatMillis(buildGpuNanos));
+            }
+        } finally {
+            if (waitInterrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -263,6 +334,7 @@ public class BLASBatchProcessor {
     private void publishBuiltResults(
             List<BLASBuildJob> jobs,
             List<VRef<VAccelerationStructure>> accelerationStructures,
+            List<ShadowTriangleBLASBuild> shadowBuilds,
             List<ProceduralBLASBuild> proceduralBuilds,
             long buildExecution,
             Deque<Long> priorExecutions,
@@ -273,39 +345,98 @@ public class BLASBatchProcessor {
         }
 
         List<BLASBuildResult> results = new ArrayList<>(jobs.size());
-        for (int i = 0; i < jobs.size(); i++) {
-            results.add(createBuildResult(
-                    accelerationStructures.get(i), jobs.get(i), proceduralBuilds.get(i)));
-        }
+        boolean resultsTransferred = false;
+        try {
+            for (int i = 0; i < jobs.size(); i++) {
+                BLASBuildResult result = createBuildResult(
+                        accelerationStructures.get(i), jobs.get(i),
+                        shadowBuilds.get(i), proceduralBuilds.get(i));
+                try {
+                    results.add(result);
+                } catch (RuntimeException | Error failure) {
+                    result.close();
+                    throw failure;
+                }
+            }
 
-        resultConsumer.accept(new BLASBatchResult(results, buildExecution));
-        LOGGER.debug("[BLAS Batch #{}] Published {} uncompacted results, enqueueToPublish avg={} ms, max={} ms",
-                batchNumber, results.size(), formatMillis(averageEnqueueToPublishNanos(results)),
-                formatMillis(maxEnqueueToPublishNanos(results)));
+            LOGGER.debug("[BLAS Batch #{}] Publishing {} uncompacted results, enqueueToPublish avg={} ms, max={} ms",
+                    batchNumber, results.size(), formatMillis(averageEnqueueToPublishNanos(results)),
+                    formatMillis(maxEnqueueToPublishNanos(results)));
 
-        priorExecutions.add(buildExecution);
-        if (priorExecutions.size() > 3) {
-            long prior = priorExecutions.poll();
-            LOGGER.debug("[BLAS Batch #{}] Waiting for prior execution {}", batchNumber, prior);
-            context.cmd.hostWaitForExecution(asyncQueue, prior);
+            if (priorExecutions.size() >= 3) {
+                long prior = priorExecutions.poll();
+                LOGGER.debug("[BLAS Batch #{}] Waiting for prior execution {}", batchNumber, prior);
+                context.cmd.hostWaitForExecution(asyncQueue, prior);
+            }
+            priorExecutions.add(buildExecution);
+
+            resultConsumer.accept(new BLASBatchResult(results, buildExecution));
+            resultsTransferred = true;
+        } finally {
+            if (!resultsTransferred) {
+                for (BLASBuildResult result : results) {
+                    result.close();
+                }
+                closeAccelerationStructures(accelerationStructures);
+                discardShadowBuilds(shadowBuilds);
+                discardProceduralBuilds(proceduralBuilds);
+            }
         }
     }
 
     static BLASBuildResult createBuildResult(
             VRef<VAccelerationStructure> triangleStructure,
             BLASBuildJob job,
+            ShadowTriangleBLASBuild shadowBuild,
             ProceduralBLASBuild proceduralBuild) {
+        Optional<VRef<ShadowTriangleBLAS>> shadow = Optional.empty();
         Optional<VRef<ProceduralBLAS>> procedural = Optional.empty();
-        if (job.proceduralDisposition() == ProceduralBLASDisposition.REPLACE) {
-            if (proceduralBuild == null) {
-                throw new IllegalStateException("Missing procedural build for REPLACE result");
+        boolean resultCreated = false;
+        try {
+            if (job.shadowTriangleInput().isPresent()) {
+                if (shadowBuild == null) {
+                    throw new IllegalStateException("Missing filtered shadow triangle build");
+                }
+                shadow = Optional.of(shadowBuild.complete());
+            } else if (shadowBuild != null) {
+                throw new IllegalStateException("Unexpected filtered shadow triangle build");
             }
-            procedural = Optional.of(proceduralBuild.complete());
-        } else if (proceduralBuild != null) {
-            throw new IllegalStateException("Unexpected procedural build for " + job.proceduralDisposition());
+            if (job.proceduralDisposition() == ProceduralBLASDisposition.REPLACE) {
+                if (proceduralBuild == null) {
+                    throw new IllegalStateException("Missing procedural build for REPLACE result");
+                }
+                procedural = Optional.of(proceduralBuild.complete());
+            } else if (proceduralBuild != null) {
+                throw new IllegalStateException(
+                        "Unexpected procedural build for " + job.proceduralDisposition());
+            }
+            BLASBuildResult result = new BLASBuildResult(
+                    triangleStructure, job.data(), shadow, job.filteredShadowGeometry(),
+                    procedural, job.proceduralDisposition());
+            resultCreated = true;
+            return result;
+        } finally {
+            if (!resultCreated) {
+                shadow.ifPresent(VRef::close);
+                procedural.ifPresent(VRef::close);
+            }
         }
-        return new BLASBuildResult(
-                triangleStructure, job.data(), procedural, job.proceduralDisposition());
+    }
+
+    static void discardShadowBuilds(List<ShadowTriangleBLASBuild> builds) {
+        for (ShadowTriangleBLASBuild build : builds) {
+            if (build != null) {
+                build.discard();
+            }
+        }
+    }
+
+    static void closeAccelerationStructures(List<VRef<VAccelerationStructure>> structures) {
+        for (VRef<VAccelerationStructure> structure : structures) {
+            if (structure != null) {
+                structure.close();
+            }
+        }
     }
 
     static void discardProceduralBuilds(List<ProceduralBLASBuild> builds) {

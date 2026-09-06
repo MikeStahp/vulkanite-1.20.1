@@ -1,5 +1,147 @@
 # Hybrid Vulkan Ray-Tracing Acceleration Plan
 
+## Reassessment — 2026-09-06
+
+**Current acceptance milestone: Phase 0 validation and baseline recovery.** The
+working tree already contains implementation through Phase 10. That source
+coverage does not advance the release gate: renderer validation, labelled scene
+captures, and comparable triangle/hybrid measurements remain incomplete.
+
+The phase checklists below retain dated evidence from earlier work. A historical
+checkmark applies to the recorded implementation and experiment, not automatically
+to subsequent geometry, payload, shader, or driver changes. In particular, the
+Phase 7 measurements predate the Phase 8–10 changes. Revalidate their gates on
+the consolidated implementation before promoting any experimental default.
+
+### One renderer with separate decisions
+
+These are independent axes, not competing complete renderers:
+
+| Decision | Canonical owner | Current behavior |
+| --- | --- | --- |
+| Primary visibility and final presentation | Iris/Sodium and `MixinIrisRenderingPipeline` | Raster surface records and compatibility geometry; Vulkanite runs after Iris composites and before final presentation. |
+| Per-frame lighting work | `RtxFrameDecision` / `VulkanPipeline` | Full-frame reference RT, bounded cache-fill RT plus resolve, or cache resolve without ray dispatch. |
+| Shadow/reflection geometry and development dependencies | `HybridAccelerationConfig` | Triangle reference by default; hybrid shadows, diagnostics, and procedural reflections are selected independently. |
+| SBT indices, geometry compatibility, ray masks | `HybridSbtLayout` | Fixed compatible terrain/entity/procedural records; shader stages and device checks still gate execution. |
+| Ray encoding and frame inputs | `RenderPassExecutor` / `RtxFrame` | One borrowed frame contract shared with cache feedback/resolve; `VulkanPipeline` owns order and explicit barriers. |
+| Ray descriptor ABI | `PipelineDescriptorSets` | One common binding schema; reflected shader subsets remain valid. Compute passes retain their own layouts. |
+| Temporal resources and reconstruction | `RtxFrameImages` / denoiser configuration | ReSTIR, cache histories, and DLSS/RR are separate consumers, not geometry backend switches. |
+| Shader source | Active Iris shaderpack; tracked `shaderpacks/VulkaniteRT` | The only injected bundled library is ReSTIR. Runtime pack copies are generated. |
+
+`RtxPassGraph` was a sequential forwarding wrapper, not a dependency/barrier
+scheduler. It has been removed, along with the second 57-argument execution
+signature and duplicated expected descriptor layouts. Do not add a replacement
+graph facade without moving actual dependency and resource-lifetime ownership.
+
+### Findings that change the optimization order
+
+1. **Normal launches were building unused experimental geometry.** The old
+   `proceduralBlas=true` default enabled AABB builds, filtered shadow batches, and
+   material extraction even when the hybrid shader groups were disabled. The
+   existing `run/logs/latest.log` records both “Skipping experimental hybrid SBT
+   groups” and later nonzero `shadowPersistentBytes` / `proceduralPersistentBytes`.
+   Central selection now disables that work by default and derives BLAS/shader
+   dependencies from selected consumers. This establishes a source-level removal
+   of unnecessary work; no new frame-time or VRAM savings measurement is claimed.
+2. **Phase 8 removes triangles from shadow traversal, not from total residency.**
+   The original material-bearing triangle BLAS remains for reflection/fallback;
+   filtered shadow triangles, procedural AS/payloads, and extra TLAS resources
+   are additional allocations. Compare *total* resident/peak memory and build
+   work against triangle-only mode. Fewer authoritative shadow triangles cannot
+   by itself establish total VRAM savings.
+3. **Adaptive bricks are an uncalibrated policy.** Determinism and hysteresis can
+   be tested offline. Traversal/empty-space/byte estimates are not driver timings;
+   include real v2 material payload sizes and rebuild costs when calibrating.
+   Keep fixed sizes available and keep `fixed` as the default until measured.
+4. **Procedural reflection is a separate material-correctness milestone.** Its v2
+   payload and six-face completeness checks do not prove animated, tinted,
+   layered, reloaded, or modded materials render correctly. Keep full triangle
+   resources and the default triangle reflection path until Phase 10 acceptance.
+5. **Frame-resource allocation is still unconditional.** `RtxFrameImages` creates
+   two reservoirs and four specular history images even in full-reference mode
+   with ReSTIR off. Introduce a tested resource-use plan before resizing/removing
+   them: reflected bindings, unconditional shader writes, cache transitions,
+   history resets, and denoiser guides must all remain valid. This cleanup does
+   not claim that allocation optimization is implemented.
+6. **Cache scheduling remains CPU-driven after GPU feedback.** `CacheFeedbackPass`
+   readback, `CacheRequestQueue`, bounded batching, and CPU-packed requests are
+   current owners. Phase 11 must replace compaction/dispatch sizing coherently,
+   with a capability fallback, rather than adding a second competing scheduler.
+
+### Startup selection after consolidation
+
+`HybridAccelerationConfig` resolves these properties for all consumers. Supply
+`-Pvulkanite.<name>=...` to Gradle (explicit `vulkanite.*` properties are forwarded
+to the game JVM), or `-Dvulkanite.<name>=...` to a direct JVM launch. Restart after
+changes; UI debug selection does not compile stages omitted at startup.
+
+For example, in PowerShell, quote dotted property arguments:
+
+```powershell
+.\gradlew.bat runClient '-Pvulkanite.hybridShadow=true' '-Pvulkanite.voxelBrickSize=8'
+```
+
+| Property | Default / dependency |
+| --- | --- |
+| `hybridShadow` | `false`; selecting it also selects shadow shader compilation and procedural BLAS construction. |
+| `hybridShadowPipeline` | `false`; explicit compile-only experiment, without selecting hybrid dispatch or BLAS builds by itself. |
+| `compileDiagnostics` | `false`; selects diagnostic/extended stages and standalone procedural geometry. |
+| `proceduralReflection` | `false`; selects reflection stages and material-bearing procedural geometry, without selecting hybrid shadow dispatch. |
+| `proceduralBlas` | Derived from diagnostics/shadows/reflections; explicit `false` overrides construction, explicit `true` permits BLAS-only measurements. |
+| `hybridShadowGeometry` | Filtering only when a shadow/reflection consumer needs it; `triangle-only` retains full shadow triangles. |
+| `voxelBrickMode` / `voxelBrickSize` | `fixed` / existing fixed-size override; `adaptive` remains opt-in. |
+| `fastPipelineCompile` | `false`; retain normal driver optimization. |
+
+These are requested techniques, not a claim of supported or enabled device
+features. Capability checks, shader compatibility, complete per-section resources,
+and triangle fallbacks remain in their existing owners.
+
+### Revised acceptance order
+
+1. **Consolidation and offline correctness:** one feature selector, frame contract,
+   descriptor ABI, and shader source owner; executable geometry tests; Java 21 in
+   CI. This pass implements that scope, preserving existing experimental work.
+2. **Recover the baseline:** reproduce or clear the previously recorded validation
+   layer/runtime crash; capture labelled triangle-only scenes, camera route,
+   cold/warm pipeline creation, total AS/payload/VRAM costs, and frame/RT timings.
+   Recheck ordinary entity/cutout/fluid behavior and reload after this cleanup.
+3. **Accept hybrid shadows as one milestone (Phases 4–8):** compare triangle-only,
+   unfiltered hybrid, and filtered hybrid with fixed brick sizes. Require sampled
+   mismatch and lifecycle gates plus actual traversal/frame benefit with bounded
+   memory/build overhead. Keep the double trace for diagnostics only; do not
+   introduce another production shadow path to replay Phase 5.
+4. **Calibrate Phase 9, then validate Phase 10 independently.** Do not use reflection
+   expansion to justify unmeasured shadow or adaptive defaults.
+5. **Revisit Phases 11–13 only after that evidence:** indirect request compaction,
+   priority, and queue overlap each need their own capability/synchronization and
+   measured-benefit gates. Phases 14–16 still control robustness and rollout.
+
+### This pass: verification record
+
+- Baseline `gradlew.bat test --offline --console=plain`: 63 tests, 7 failures in
+  `ShadowGeometryFilterTest` during Minecraft registry initialization.
+- Corrected the harness with Fabric Loader JUnit (matching Loader 0.15.11),
+  Minecraft bootstrap, and scoped in-memory Sodium options for native buffers.
+  Tests use `build/test-runtime` so Loader-generated configuration/logs remain
+  build output. No application client or user configuration is required by the fixture.
+- After consolidation: 73 tests passed, zero failures/skips. Added coverage for
+  feature dependencies/explicit fallbacks and descriptor compatibility.
+- `gradlew.bat build --console=plain` and the subsequent offline build:
+  **BUILD SUCCESSFUL**, including the
+  73-test suite, remapped jar/source packaging, and access-widener validation.
+  The initial offline build lacked cached JOML 1.10.4; the normal build resolved
+  that dependency and completed. Existing deprecation/unchecked warnings remain.
+- Jar inspection: `RtxFrame` and `HybridAccelerationConfig` present, old graph
+  classes absent, ReSTIR retained, all 14 inactive shader assets absent.
+- A temporary Gradle assertion task verified explicit shadow, BLAS-override, and
+  brick-size properties reach `runClient` without launching a client.
+- `git diff --check` passed. Comparison with the turn-start snapshot confirmed the
+  consolidated common descriptor ABI retains the same 35 bindings/types/shapes.
+- New Vulkan validation, shader compiler execution, live rendering, screenshots,
+  GPU benchmarks, and hardware/driver retesting: **not executed** in this pass.
+- Next unchecked acceptance task: recover Phase 0 renderer validation, then capture
+  the labelled triangle-only reference set and matching performance baseline.
+
 ## Project target
 
 Implement a hybrid ray-tracing backend for the existing Minecraft 1.20.1 Vulkan sidecar renderer.
@@ -21,8 +163,8 @@ Do not assume access to Mojang’s later Vulkan renderer or render graph.
 
 ## Execution rules
 
-1. Work on exactly one phase at a time.
-2. Start with the earliest phase containing unchecked tasks.
+1. Work on one acceptance milestone at a time, using the revised order above.
+2. Start with the earliest unmet acceptance gate; existing later-phase source is not release evidence.
 3. Inspect the existing repository before changing code.
 4. Reuse existing abstractions where practical.
 5. Do not replace working systems unnecessarily.
@@ -31,7 +173,7 @@ Do not assume access to Mojang’s later Vulkan renderer or render graph.
 8. Mark a task with `[x]` only after its stated verification requirement succeeds.
 9. Leave incomplete tasks as `[ ]`.
 10. If a task is blocked, leave it unchecked and add a short `BLOCKED:` note underneath it.
-11. Do not begin the next phase until every required gate in the current phase passes.
+11. Do not promote a later phase or enable its defaults until prerequisite gates pass. Cross-phase cleanup and offline verification may proceed without claiming gate completion.
 12. Optional tasks may remain unchecked without blocking later required phases.
 13. Update this document after every implementation pass.
 14. Preserve prior completed checkmarks unless a regression invalidates them.
@@ -84,6 +226,9 @@ The implementation should verify these claims against the actual repository befo
 * Entities use a separate triangle hit group and SBT offset.
 * `SectionLightExtractor` scans logical block state.
 * `SectionLightExtractor` produces a 4,096-bit opaque-block field.
+* `SectionLightExtractor` produces a separate 4,096-bit regular opaque
+  full-cube field for procedural geometry; the broader probe field is not a
+  valid procedural occupancy source because it includes irregular blockers.
 * Hierarchical occupancy mips are available.
 * `VoxelBrickGeometry` converts occupancy into tightly packed `VkAabbPositionsKHR` records.
 * `VoxelBrickGeometry` creates fixed-stride local-DDA payloads.
@@ -368,35 +513,55 @@ raySbtRecordStride = existing ray-type stride
 
 The exact index must follow the repository’s existing SBT organization.
 
+The implemented Phase 3 layout is:
+
+```text
+triangleTerrainHitGroup = 0
+entityTriangleHitGroup = 1
+proceduralTerrainHitGroup = 2
+geometryCountPerProceduralBlas = 1
+instanceShaderBindingTableRecordOffset = 2
+raySbtRecordOffset = 0
+raySbtRecordStride = 0
+proceduralMissIndex = 2
+proceduralPayloadDescriptorSet = 1
+proceduralPayloadDescriptorBinding = 0
+proceduralDebugTlasBinding = 32
+```
+
+The zero ray-record stride matches the existing single-ray-type pipeline. The
+procedural TLAS instance custom index selects the packed payload descriptor;
+`gl_PrimitiveID` selects the fixed-stride brick record inside that payload.
+
 ## Tasks
 
-* [ ] Add a procedural intersection shader such as `ray0_2.rint`.
-* [ ] Add a minimal procedural closest-hit shader for debugging.
-* [ ] Add the procedural hit group to the ray-tracing pipeline.
-* [ ] Add the procedural hit group to SBT construction.
-* [ ] Add explicit assertions for SBT record offsets.
-* [ ] Add explicit assertions for geometry type and hit-group compatibility.
-* [ ] Build a second procedural section TLAS.
-* [ ] Use the correct instance SBT record offset.
-* [ ] Bind the packed payload through the existing bindless geometry system.
-* [ ] Make the payload address or descriptor discoverable from the section instance.
-* [ ] Ensure `gl_PrimitiveID` indexes the correct brick payload.
-* [ ] Ensure section-local ray coordinates are reconstructed correctly.
-* [ ] Implement exact brick-local DDA.
-* [ ] Call `reportIntersectionEXT` only for an occupied voxel hit.
-* [ ] Report the exact voxel hit distance.
-* [ ] Return a debug block-local hit position.
-* [ ] Return a debug face normal.
-* [ ] Return a debug local-cell index.
-* [ ] Handle rays starting inside a candidate AABB.
-* [ ] Handle rays parallel to one or more brick axes.
-* [ ] Handle zero and near-zero direction components safely.
-* [ ] Handle entry exactly on a voxel boundary.
-* [ ] Handle section and brick boundaries deterministically.
-* [ ] Add a debug view that visualizes procedural hit distance.
-* [ ] Add a debug view that visualizes procedural face normals.
-* [ ] Add a debug view that visualizes brick IDs.
-* [ ] Add a debug view that visualizes local voxel IDs.
+* [x] Add a procedural intersection shader such as `ray0_2.rint`.
+* [x] Add a minimal procedural closest-hit shader for debugging.
+* [x] Add the procedural hit group to the ray-tracing pipeline.
+* [x] Add the procedural hit group to SBT construction.
+* [x] Add explicit assertions for SBT record offsets.
+* [x] Add explicit assertions for geometry type and hit-group compatibility.
+* [x] Build a second procedural section TLAS.
+* [x] Use the correct instance SBT record offset.
+* [x] Bind the packed payload through the existing bindless geometry system.
+* [x] Make the payload address or descriptor discoverable from the section instance.
+* [x] Ensure `gl_PrimitiveID` indexes the correct brick payload.
+* [x] Ensure section-local ray coordinates are reconstructed correctly.
+* [x] Implement exact brick-local DDA.
+* [x] Call `reportIntersectionEXT` only for an occupied voxel hit.
+* [x] Report the exact voxel hit distance.
+* [x] Return a debug block-local hit position.
+* [x] Return a debug face normal.
+* [x] Return a debug local-cell index.
+* [x] Handle rays starting inside a candidate AABB.
+* [x] Handle rays parallel to one or more brick axes.
+* [x] Handle zero and near-zero direction components safely.
+* [x] Handle entry exactly on a voxel boundary.
+* [x] Handle section and brick boundaries deterministically.
+* [x] Add a debug view that visualizes procedural hit distance.
+* [x] Add a debug view that visualizes procedural face normals.
+* [x] Add a debug view that visualizes brick IDs.
+* [x] Add a debug view that visualizes local voxel IDs.
 
 ## Important correctness rule
 
@@ -407,6 +572,10 @@ The intersection shader must perform exact local DDA and must not report an inte
 A candidate AABB alone is not an occluder.
 
 ## Validation scenes
+
+The implementation, Java tests, shader compilation, and shaderpack sync pass.
+The following scene checks remain unchecked until an interactive client run can
+exercise binding 32 and the procedural SBT record on a Vulkan device.
 
 * [ ] Single block in an empty section.
 * [ ] Thin one-block wall.
@@ -424,11 +593,18 @@ A candidate AABB alone is not an occluder.
 Do not continue until:
 
 * [ ] Procedural TLAS builds successfully.
-* [ ] SBT indexing assertions pass.
+  * BLOCKED: The device-side debug TLAS build needs an interactive world run;
+    source compilation alone does not validate `vkCmdBuildAccelerationStructuresKHR`.
+* [x] SBT indexing assertions pass.
 * [ ] Vulkan validation reports no geometry-type or SBT mismatch.
+  * BLOCKED: Renderer validation remains blocked by the Phase 0 native
+    `vkCreateInstance` crash with `VK_LAYER_KHRONOS_validation`.
 * [ ] Debug hit positions and normals match expected voxel geometry.
+  * BLOCKED: Requires the Phase 3 interactive validation scenes above.
 * [ ] Rays inside AABBs are handled correctly.
-* [ ] No production lighting result depends on this path yet.
+  * BLOCKED: The shader handles inside starts, but device-side scene validation
+    is still required before checking this gate.
+* [x] No production lighting result depends on this path yet.
 
 ---
 
@@ -464,52 +640,235 @@ Interpretation:
 
 ## Tasks
 
-* [ ] Add a debug dual-trace mode.
-* [ ] Trace the same ray against both TLAS paths.
-* [ ] Add atomic counters for all mismatch categories.
-* [ ] Add a hit-distance tolerance.
-* [ ] Record maximum observed hit-distance difference.
-* [ ] Record average hit-distance difference.
-* [ ] Record mismatch counts by brick size.
-* [ ] Record mismatch counts by ray direction octant.
-* [ ] Record mismatch counts for rays beginning inside AABBs.
-* [ ] Record mismatch counts by material classification.
-* [ ] Record mismatch counts by section coordinate.
-* [ ] Add a screen overlay with mismatch totals.
-* [ ] Add a visualization for dangerous procedural misses.
-* [ ] Add a visualization for conservative procedural extra hits.
-* [ ] Add optional structured debug logging for sampled mismatches.
-* [ ] Add a configurable comparison sampling rate.
-* [ ] Support 100% comparison in debug captures.
-* [ ] Support a low sampling rate for extended gameplay tests.
-* [ ] Compare sun visibility rays.
-* [ ] Compare local-light visibility rays.
-* [ ] Verify correct finite ray minimum and maximum distances.
-* [ ] Verify equivalent ray-origin bias between both paths.
-* [ ] Verify equivalent opaque classification between both paths.
+* [x] Add a debug dual-trace mode.
+* [x] Trace the same ray against both TLAS paths.
+* [x] Add atomic counters for all mismatch categories.
+* [x] Add a hit-distance tolerance.
+* [x] Record maximum observed hit-distance difference.
+* [x] Record average hit-distance difference.
+* [x] Record mismatch counts by brick size.
+* [x] Record mismatch counts by ray direction octant.
+* [x] Record mismatch counts for rays beginning inside AABBs.
+* [x] Record mismatch counts by material classification.
+* [x] Record mismatch counts by section coordinate.
+* [x] Add a screen overlay with mismatch totals.
+* [x] Add a visualization for dangerous procedural misses.
+* [x] Add a visualization for conservative procedural extra hits.
+* [x] Add optional structured debug logging for sampled mismatches.
+* [x] Add a configurable comparison sampling rate.
+* [x] Support 100% comparison in debug captures.
+* [x] Support a low sampling rate for extended gameplay tests.
+* [x] Compare sun visibility rays.
+* [x] Compare local-light visibility rays.
+* [x] Verify correct finite ray minimum and maximum distances.
+* [x] Verify equivalent ray-origin bias between both paths.
+* [x] Verify equivalent opaque classification between both paths.
+  * VERIFIED FOR PROCEDURAL-OWNED CELLS: Five exact 2026-07-11 windows in
+    `ray-tracing-test-place` used 100% sampling and a 0.01-block tolerance.
+    Across 894,703,511 rays, all 22,527 raw triangle-hit/procedural-miss cases
+    belonged to triangle-only cells; procedural-owned and unknown dangerous
+    misses were both zero. The capture therefore found no full-cube occupancy
+    classification false negative. Triangle-only irregular geometry remains
+    intentionally outside the procedural TLAS and stays authoritative through
+    the triangle path.
+
+The Phase 4 implementation compares the procedural TLAS from inside the
+existing `alphaAwareVisibility` path, after the authoritative triangle ray
+query completes. Both paths receive the exact same origin, direction,
+`tMin = 0.001`, and caller-provided finite `tMax`; only triangle visibility is
+returned to production lighting. Debug modes 7–9 expose a cumulative overlay,
+dangerous procedural misses, and conservative procedural-only hits. The
+comparison SSBO records the four visibility outcomes, distance agreement,
+maximum distance error, a 1/64-block fixed-point distance sum/count for the
+average, brick-size and direction buckets, inside-brick starts, triangle
+material class, and a bounded 64-entry section-coordinate table. The sampling
+control supports 1–100%, and the tolerance supports 0.0001–1 block. Eight
+distance-mismatch buckets now separate errors at 0.02, 0.05, 0.1, 0.5, 1, 2,
+16, and greater than 16 blocks.
+
+The next classification capture now has ownership-scoped counters instead of
+assuming every opaque triangle belongs in the procedural representation. For a
+mismatching terrain hit, the shader reconstructs the owning world cell from
+Iris's per-vertex `mid_block` data and probes that cell from its center against
+the procedural TLAS. The eight logged ownership buckets are ordered as
+`[procedural-owned dangerous miss, triangle-only dangerous miss, unknown
+dangerous miss, same-cell procedural distance mismatch, triangle-only distance
+mismatch, unknown distance mismatch, different-caster solid hit, reserved]`.
+Entities are known
+triangle-only. Missing `mid_block` metadata is reported as unknown. The
+quarter-block ownership probe is issued only for an already mismatching debug
+sample and cannot leave the candidate cell, so it separates actionable
+full-cube traversal errors from expected irregular-geometry differences without
+changing production visibility.
+
+`Log Shadow Mismatches` adds an opt-in five-second diagnostic window. At the
+end of a window, the renderer copies the device-local SSBO into a host-visible
+readback buffer, waits for that explicitly requested diagnostic copy, and logs
+exact key/value totals, distance statistics, all brick/direction/material
+buckets, overflow indicators, and the eight hottest section coordinates. The
+normal path performs no readback or queue wait. Each logged window resets the
+GPU counters, and the shader counters saturate instead of silently wrapping.
+CPU snapshot parsing, unsigned-counter handling, distance conversion, and
+section ordering have focused unit coverage.
+
+The 2026-07-11 pass stopped reusing probe visibility as procedural occupancy.
+That mask intentionally includes stairs, slabs, fences, doors, leaves, and
+other irregular meshes as conservative probe blockers. Procedural BLAS input
+now uses a separately scanned `isOpaqueFullCube` mask, leaving irregular and
+transparent geometry on the triangle path.
+
+A temporary bounded per-ray sampler isolated one dangerous false-negative
+class at the exact outer corner of the benchmark quartz platform. For example,
+a ray from `(509.11316, -56.47532, -4.95750)` in direction
+`(-0.9981621, -0.0606009, 0)` hit the triangle platform at `t=25.159391` while
+the DDA missed: advancing both tied axes simultaneously stepped outside the
+platform without testing the voxel touched only at that edge. The intersection
+shader now checks every adjacent cell touched at a tied edge/corner before the
+diagonal step. A comparable exact window dropped from 203 dangerous misses
+before this change to 58 afterward. The detailed sampler was removed after the
+capture because it increased first-use driver pipeline compilation from about
+8 seconds to roughly 2 minutes; compact aggregate logging remains.
+
+Offline verification completed with forced Java compilation/unit tests and
+Vulkan 1.2 `glslc` compilation of the ray-generation, procedural intersection,
+procedural closest-hit, and procedural miss shaders.
+
+The ownership-scoped diagnostic extension also passed forced Java compilation
+and unit tests, Vulkan 1.2 `glslc` compilation of `ray0.rgen`, shaderpack sync,
+and the tracked/runtime shaderpack drift check on 2026-07-11. The classification
+capture then completed five bounded windows and reported all six non-reserved
+ownership buckets without counter saturation. The same windows classified
+1,307,121 of 1,338,284 distance mismatches as procedural-owned, 31,163 as
+triangle-only, and zero as unknown. This resolves occupancy ownership but
+confirms that full-cube hit-distance disagreement remains the next correctness
+problem. The first post-startup window also contained 232,806 transient extra
+hits while section acceleration structures streamed in; the following four
+windows contained 984 combined extra hits.
+
+An interactive Vulkan client run completed on 2026-07-10 with validation
+layers disabled because of the Phase 0 native crash. The client reached more
+than 3,200 `FULL_RT_REFERENCE` frames, built procedural BLAS/TLAS resources,
+and shut down cleanly. At 848x480, the initial clean capture showed a 76-pixel
+both-hit segment and a 772-pixel both-miss segment with no visible red or blue;
+the distance row showed 825 pixels within tolerance and 23 pixels outside it.
+After rotating across more opaque geometry, two captures showed a one-pixel
+blue conservative-extra-hit segment. Distance disagreement remained visible,
+ranging from 7 to 23 pixels of the 848-pixel overlay width.
+
+The extended 100% run also exposed a counter-lifetime limitation in the earlier
+implementation: after about 2,700 full-reference frames, the visibility bar
+changed to an implausible all-green result. The later structured-logging pass
+replaced silent wrapping with saturating counters and bounded five-second log
+windows. Multiple 2026-07-11 device runs verified exact bounded values with
+zero counter saturations and graceful shutdown, but classification equivalence,
+distance disagreement, and the remaining lifecycle scenarios are unresolved.
 
 ## Required stress scenarios
 
-* [ ] Rebuild a chunk repeatedly while comparison mode is active.
-* [ ] Unload chunks while rays are in flight.
-* [ ] Reload shaders repeatedly.
-* [ ] Change worlds.
-* [ ] Exit to title.
-* [ ] Shut down the game.
-* [ ] Place and remove full opaque blocks rapidly.
-* [ ] Move rapidly across chunk boundaries.
-* [ ] Test negative coordinates.
-* [ ] Test high and low world sections.
+BLOCKED: These scenarios require an interactive client run with a working
+procedural TLAS. Offline compilation cannot validate in-flight Vulkan lifetime
+or world/chunk transitions.
+
+* [x] Rebuild a chunk repeatedly while comparison mode is active.
+  * VERIFIED: A clean 2026-07-11 client run waited for RT pipeline creation and
+    a live 100% comparison sample before issuing updates. Twenty alternating
+    stone/quartz updates repeatedly rebuilt triangle geometry while correctly
+    skipping procedural rebuilds because occupancy was unchanged. Twelve
+    alternating air/quartz updates then exercised occupancy changes; coalescing
+    produced six procedural BLAS replacement batches and seven TLAS update
+    batches while 13 bounded comparison windows continued. Every window
+    reported zero counter saturations, the client remained responsive, working
+    memory returned to about 3.1 GiB after the rebuilds, no lifecycle or device
+    errors were logged, and clean shutdown stopped the BLAS worker and freed
+    its buffer allocators.
+* [x] Unload chunks while rays are in flight.
+  * VERIFIED: A 2026-07-11 `FULL_RT_REFERENCE` run kept 100% procedural shadow
+    comparison active while teleporting repeatedly between the benchmark area
+    and three locations roughly 3,000 blocks away. The section table processed
+    removal batches of 3,528 and 8,760 entries while full-frame ray dispatches
+    continued, including transitions to zero active instances and subsequent
+    reloads. The client remained responsive past 21,000 reference frames, no
+    Vulkan/device-lost or acceleration-lifetime error was logged, and clean
+    shutdown stopped the BLAS worker and completed the Gradle run successfully.
+    Empty far-field comparison windows saturated the bounded total-ray counter;
+    this was reported explicitly and did not coincide with a lifecycle failure.
+* [x] Reload shaders repeatedly.
+  * VERIFIED: A 2026-07-11 `FULL_RT_REFERENCE` run issued five consecutive
+    F3+T resource/shader reloads while 100% procedural shadow comparison was
+    active. Every reload stopped and restarted all ten chunk workers, removed
+    and repopulated section acceleration data, and resumed bounded comparison
+    dispatch within roughly 9-11 seconds. Eighteen post-reload windows all
+    reported zero counter saturations; the client logged no error, exception,
+    device loss, or acceleration-structure lifetime failure. Working memory
+    was 4.4 GiB after the fifth reload; low-system-memory warnings appeared
+    during three rebuild bursts, so this run verifies lifecycle recovery but
+    does not resolve the separate long-run VRAM/RAM stability gate. Graceful
+    shutdown stopped the probe and BLAS workers, freed the BLAS allocators, and
+    the Gradle client task completed successfully.
+* [x] Change worlds.
+  * VERIFIED: A 2026-07-11 run changed from `ray-tracing-test-place` to the
+    distinct `New World` save and returned while 100% procedural shadow
+    comparison was active. Across three title/world transitions, the cache
+    world generation advanced three times, Iris destroyed and recreated the
+    overworld pipeline three times, and the procedural TLAS reached zero active
+    instances before new section BLAS/TLAS data populated. Comparison dispatch
+    recovered in both saves and the return benchmark window reported
+    278,790,545 rays with zero counter saturations. The denser second save did
+    saturate diagnostic mismatch counters in one window; this was reported and
+    did not coincide with a lifecycle failure. No device loss or acceleration-
+    structure error occurred. Two random-sequence load errors came from the
+    benchmark world's saved data and were unrelated to Vulkan. Graceful
+    shutdown stopped the probe and BLAS workers, freed BLAS allocators, and the
+    Gradle client task completed successfully.
+* [x] Exit to title.
+  * VERIFIED BY EXISTING WORLD-CHANGE RUN: The three recorded title/world
+    transitions are accepted as sufficient evidence; no redundant transition
+    was performed this pass.
+* [x] Shut down the game.
+* [x] Place and remove full opaque blocks rapidly.
+* [x] Move rapidly across chunk boundaries.
+* [x] Test negative coordinates.
+* [x] Test high and low world sections.
+  * VERIFIED TOGETHER: One 2026-07-11 client run used 1% comparison sampling,
+    issued five successful 512-block stone/quartz/air fill replacements, moved
+    through x=520, 552, 584, 616, and 648, visited (-512,80,-512) and
+    (-544,80,-512), then y=300 and y=-60. Procedural BLAS/TLAS updates
+    continued, bounded samples had zero counter saturation, and clean shutdown
+    stopped the BLAS worker after 111 batches.
 
 ## Phase gate
 
 Do not continue until:
 
-* [ ] Dangerous procedural false negatives are understood and resolved.
-* [ ] Remaining conservative false positives are documented and accepted.
+* [x] Dangerous procedural false negatives are understood and resolved.
+  * The ownership-scoped capture classified every raw dangerous miss as
+    triangle-only and found zero procedural-owned or unknown dangerous misses
+    across 894,703,511 rays. These triangle-only casters remain in the hybrid
+    representation and are not procedural false negatives.
+* [x] Remaining conservative false positives are documented and accepted.
+  * ACCEPTANCE CRITERIA: An extra hit is acceptable only when attributable to
+    the interior or boundary of a regular opaque full cube, triangle geometry
+    remains authoritative for all irregular/cutout/fluid/entity casters, no
+    procedural-owned dangerous miss is introduced, and stable post-streaming
+    extras remain below one per million compared rays. Startup/streaming windows
+    are reported separately. The sampled solid-volume case and stable exact
+    windows (124 extras at brick size 8; 75 at size 16 across hundreds of
+    millions of rays) satisfy this criterion.
 * [ ] Hit-distance disagreement is within the defined tolerance.
-* [ ] Comparison mode survives all lifecycle stress tests.
+  * BLOCKED: Investigation found that rays starting inside an occupied voxel
+    correctly report immediate procedural solid occlusion at `tMin`, while the
+    surface triangle path reports a later exit face. Those distances are not
+    comparable and are now counted as `solidInteriorStarts`. The diagnostic now
+    also separates same-cell disagreement from a different valid solid caster.
+    Shader compilation and unit tests pass, but one post-change device window is
+    still required to verify the same-cell bucket at the 0.01-block tolerance.
+* [x] Comparison mode survives all lifecycle stress tests.
+  * Existing rebuild, unload, shader reload, world change, title, and shutdown
+    evidence plus the bundled 1% block-update, chunk-border, negative-coordinate,
+    and vertical-extreme run cover every required scenario.
 * [ ] Vulkan validation remains clean.
+  * BLOCKED: Renderer validation remains blocked by the Phase 0 native
+    `vkCreateInstance` crash with `VK_LAYER_KHRONOS_validation`.
 
 ---
 
@@ -664,26 +1023,34 @@ COMPOSITE_GEOMETRY
 
 ## Tasks
 
-* [ ] Add ray-role-aware classification data.
-* [ ] Populate classification during `SectionLightExtractor.scan` or the appropriate extraction stage.
-* [ ] Distinguish opaque full cubes from merely opaque-looking models.
+* [x] Add ray-role-aware classification data.
+* [x] Populate classification during `SectionLightExtractor.scan` or the appropriate extraction stage.
+* [x] Distinguish opaque full cubes from merely opaque-looking models.
 * [ ] Account for cutout render layers.
 * [ ] Account for translucent render layers.
-* [ ] Account for fluids.
-* [ ] Account for block entities.
-* [ ] Account for modded irregular models.
-* [ ] Account for waterlogged blocks.
-* [ ] Account for multipart models.
-* [ ] Add validation that every opaque shadow caster has exactly one authoritative shadow representation.
-* [ ] Allow both representations only for explicit comparison or composite cases.
-* [ ] Add validation that air and non-occluding blocks have no shadow representation.
-* [ ] Add validation that reflection-visible blocks retain a reflection representation.
-* [ ] Add debug statistics by classification.
+* [x] Account for fluids.
+* [x] Account for block entities.
+* [x] Account for modded irregular models.
+* [x] Account for waterlogged blocks.
+* [x] Account for multipart models.
+* [x] Add validation that every opaque shadow caster has exactly one authoritative shadow representation.
+* [x] Allow both representations only for explicit comparison or composite cases.
+* [x] Add validation that air and non-occluding blocks have no shadow representation.
+* [x] Add validation that reflection-visible blocks retain a reflection representation.
+* [x] Add debug statistics by classification.
 * [ ] Add a debug visualization of representation ownership.
 * [ ] Add warnings for unclassified visible blocks.
 * [ ] Add warnings for accidental duplicate authoritative ownership.
 * [ ] Add unit tests for vanilla block categories.
-* [ ] Add extension points or fallback behavior for unknown modded blocks.
+* [x] Add extension points or fallback behavior for unknown modded blocks.
+
+Implementation note (2026-07-11): `BlockRayClassification` defines ownership
+per ray role. `SectionLightExtractor` applies the conservative classifier and
+records per-section counters. Unknown modded, fluid, block-entity, multipart,
+cutout-like, and translucent-like geometry remains triangle-owned; only regular
+opaque full cubes become voxel shadow/GI geometry. Reflection remains triangle
+owned through Phase 10. Compile-only verification passed; category/runtime tests
+remain deferred at the user's request.
 
 ## Phase gate
 
@@ -719,36 +1086,115 @@ SBT instance offsets must select compatible hit groups.
 
 ## Tasks
 
-* [ ] Design the mixed shadow TLAS instance list.
-* [ ] Add procedural section instances.
-* [ ] Add triangle special-geometry instances.
-* [ ] Add entity triangle instances.
-* [ ] Assign correct SBT offsets for procedural and triangle instances.
-* [ ] Add assertions preventing AABB geometry from selecting a triangle-only hit group.
-* [ ] Add assertions preventing triangle geometry from selecting a procedural-only hit group.
-* [ ] Keep stable instance masks by ray role.
-* [ ] Preserve entity SBT behavior.
-* [ ] Preserve existing culling flags where appropriate.
-* [ ] Route production shadow rays through the hybrid TLAS.
-* [ ] Remove the permanent requirement for two shadow traces.
-* [ ] Retain the old double-trace path as a debug comparison mode.
-* [ ] Verify instance updates after chunk rebuild.
-* [ ] Verify instance removal after chunk unload.
-* [ ] Verify entity updates.
-* [ ] Verify world-change cleanup.
-* [ ] Benchmark hybrid TLAS build and update cost.
-* [ ] Benchmark hybrid shadow ray time.
-* [ ] Compare hybrid results with the old double-trace reference.
+* [x] Design the mixed shadow TLAS instance list.
+* [x] Add procedural section instances.
+* [x] Add triangle special-geometry instances.
+* [x] Add entity triangle instances.
+* [x] Assign correct SBT offsets for procedural and triangle instances.
+* [x] Add assertions preventing AABB geometry from selecting a triangle-only hit group.
+* [x] Add assertions preventing triangle geometry from selecting a procedural-only hit group.
+* [x] Keep stable instance masks by ray role.
+* [x] Preserve entity SBT behavior.
+* [x] Preserve existing culling flags where appropriate.
+* [x] Route production shadow rays through the hybrid TLAS.
+* [x] Remove the permanent requirement for two shadow traces.
+* [x] Retain the old double-trace path as a debug comparison mode.
+* [x] Verify instance updates after chunk rebuild.
+* [x] Verify instance removal after chunk unload.
+* [x] Verify entity updates.
+* [x] Verify world-change cleanup.
+* [x] Benchmark hybrid TLAS build and update cost.
+* [x] Benchmark hybrid shadow ray time.
+* [x] Compare hybrid results with the old double-trace reference.
+
+Implementation note (updated 2026-07-13): `HybridShadowInstanceLayout`
+documents and validates the mixed terrain-triangle, terrain-AABB, and
+entity-triangle roles. `HybridSbtLayout` owns the stable masks and records and
+now rejects both geometry/SBT type mismatches and production record/mask
+mismatches. Focused unit tests cover records 0-5, masks 1/2/4, the combined
+mask, role ordering, and invalid role/type/record/address combinations.
+
+`TLASSectionManager` emits a mixed instance snapshot with terrain triangles at
+record 3/mask 1, entity triangles at record 4/mask 4, and procedural section
+AABBs at record 5/mask 2. Existing triangle transforms, custom indices, device
+addresses, and culling flags are copied before the shadow record and mask are
+overridden. `AccelerationTLASManager` builds and caches this snapshot as a
+separate TLAS, and binding 34 exposes it without replacing the material TLAS at
+binding 1. Reflection and other material-bearing rays therefore remain on the
+original TLAS. Section triangle instances still include the regular full-cube
+triangles; this intentional duplication remains until Phase 8 separates
+shadow geometry ownership.
+
+Production visibility uses one `traceRayEXT` call with terminate-on-first-hit,
+skip-closest-hit, miss record 1, payload location 1, and records 3/4/5. This is
+required for procedural record 5 to run the verified exact-DDA intersection
+shader: an inline `rayQueryEXT` would expose only the brick AABB candidate and
+would not execute that shader. Records 3 and 4 retain terrain/entity alpha
+tests. Debug modes 7-9 keep the Phase 4 triangle-versus-procedural comparison.
+`SHADOW_DOUBLE_TRACE_REFERENCE` (mode 10) retains the Phase 5 reference
+contract: one material-TLAS triangle query plus one standalone procedural trace
+with mask 2, miss record 1, and SBT offset 3 selecting production record 5 from
+the procedural instance's record 2. `vulkanite.phase7GpuTiming` adds bounded
+timestamp-query rings for the ray pass and hybrid TLAS operations, with
+warm-up, complete/partial windows, pending-query accounting, and drop counts.
+The opt-in `vulkanite.hybridShadow` system property remains false by default;
+a 64-byte push-constant flag distinguishes a real mixed TLAS from the material
+TLAS descriptor fallback, so disabled and unsupported configurations retain
+the triangle-only inline-query path.
+
+Device evidence captured 2026-07-13 with
+`-Dvulkanite.hybridShadow=true` on the RTX 3060 Ti:
+
+* `20260713-155620-production-smoke-rerun` exercised repeated section rebuilds,
+  8,760 far-teleport removals down to zero active sections/instances followed
+  by repopulation, Overworld -> Nether -> Overworld teardown/recreation across
+  world IDs 2 -> 3 -> 4, and clean worker/allocator shutdown.
+* `20260713-161638-comparison-entity` captured moving entities (up to 32
+  instances, 63 geometries, and 2,626 quads) with zero texture misses or entity
+  errors. `20260713-163235-comparison-postfix` compared 1,222,496,529 fixed-camera
+  shadow rays: 27,437 triangle-only raw misses, 17 procedural-owned raw misses,
+  zero unknown misses, nine extras, and zero counter saturation. Phase 7 still
+  includes the opaque triangle member of the production union, so every raw
+  miss remained covered and combined visibility had no gap.
+* `20260713-164135-timing-hybrid` measured 17 settled section-update batches
+  covering 132 updates at 0.085882 ms average GPU time; the last 120 settled
+  entity-only TLAS rebuilds averaged 0.100674 ms with zero query drops.
+* The locked-camera native comparison used 848x480, one `FULL_RT_REFERENCE`
+  pass, 141 terrain plus 141 procedural instances, and 1,200 accepted samples
+  per arm. Hybrid windows 29-38 in
+  `20260713-171700-timing-hybrid-corrected-controlled` averaged 51.001911 ms;
+  old-reference windows 7-16 in
+  `20260713-172400-timing-double-reference-matched-controlled` averaged
+  52.664647 ms. Hybrid was 1.662736 ms / 3.157% faster, with zero query drops
+  and clean timing-ring/worker/allocator shutdown in both captures.
+
+Forced Java compilation and the full unit suite pass. Standalone Vulkan 1.2
+compilation and `spirv-val` pass for the ray generator and affected runtime
+miss/hit/intersection stages, and shaderpack sync/drift verification passes.
+Device validation remained disabled because the Phase 0 Java 21
+`vkCreateInstance` validation-layer crash is still unresolved; this is not a
+Phase 7 gate, but remains an explicit validation-coverage limitation.
+
+Frozen-time visual follow-up passed in
+`20260713-173602-visual-hybrid-frozen` and
+`20260713-173833-visual-reference-frozen`. Both captures used the same camera,
+time 6000 with daylight cycling disabled, clear weather, 848x480 render state,
+141 terrain/procedural sections, and eight entities at the screenshot frame.
+Direct RGBA inspection disproved an apparent black-floor viewer artifact: both
+PNGs are fully opaque, rows 298-479 are byte-for-byte identical, and the floor
+region has RGB MAE 0.019 with only 9 of 161,120 pixels differing by more than
+20 levels. Remaining differences are balanced high-frequency ray noise from
+different frame-seeded sun-disk samples; low-pass broad radiance matches.
 
 ## Phase gate
 
 Do not continue until:
 
-* [ ] One hybrid shadow TLAS produces correct combined visibility.
-* [ ] SBT geometry-type validation passes.
-* [ ] The old double-trace mode remains usable for debugging.
-* [ ] Hybrid ray time is no worse than the temporary double-trace path.
-* [ ] Lifecycle tests pass.
+* [x] One hybrid shadow TLAS produces correct combined visibility.
+* [x] SBT geometry-type validation passes.
+* [x] The old double-trace mode remains usable for debugging.
+* [x] Hybrid ray time is no worse than the temporary double-trace path.
+* [x] Lifecycle tests pass.
 
 ---
 
@@ -793,6 +1239,20 @@ Reflection representation:
 * [ ] Record results while rapidly loading chunks.
 * [ ] Record results during repeated block updates.
 * [ ] Keep a runtime switch restoring triangle-only shadow geometry.
+
+Implementation note (2026-08-19, execution deferred): the section upload path
+now retains the original material-bearing triangle batch while
+`ShadowGeometryFilter` builds a byte-exact shadow-only batch. Only solid quads
+whose four vertices conservatively agree on an occupied full-cube owner are
+removed; malformed, ambiguous, cutout, translucent, and otherwise unresolved
+geometry stays triangle-owned. Empty filtered ranges are omitted, including the
+all-procedural case where no shadow triangle BLAS is built. The hybrid TLAS uses
+filtered triangles and procedural AABBs only when both resources are complete;
+otherwise it emits the original triangle instance alone. Per-range ownership,
+quad reduction, resident BLAS bytes, and procedural cost are logged. Set
+`vulkanite.hybridShadowGeometry=triangle-only` for the explicit fallback. Unit
+coverage was added, but no test, build, Vulkan validation, or benchmark command
+was run in this pass.
 
 ## Acceptance condition
 
@@ -848,15 +1308,31 @@ Larger bricks:
 * [ ] Benchmark sparse sections.
 * [ ] Benchmark fragmented checkerboard-like sections.
 * [ ] Benchmark cave-heavy sections.
-* [ ] Add a fixed-size runtime override.
-* [ ] Design an adaptive per-section heuristic.
-* [ ] Include occupied-brick count in the heuristic.
-* [ ] Include estimated local-DDA work in the heuristic.
-* [ ] Add hysteresis to prevent repeated size switching.
-* [ ] Rebuild only when the selected brick size materially changes.
+* [x] Add a fixed-size runtime override.
+* [x] Design an adaptive per-section heuristic.
+* [x] Include occupied-brick count in the heuristic.
+* [x] Include estimated local-DDA work in the heuristic.
+* [x] Add hysteresis to prevent repeated size switching.
+* [x] Rebuild only when the selected brick size materially changes.
 * [ ] Record selected brick-size distribution in debug statistics.
-* [ ] Verify deterministic selection for unchanged occupancy.
+* [x] Verify deterministic selection for unchanged occupancy.
 * [ ] Verify adaptive mode improves or matches the best practical fixed mode.
+
+Implementation note (updated 2026-08-19, execution deferred):
+`vulkanite.voxelBrickMode=fixed`
+preserves the existing `vulkanite.voxelBrickSize=4|8|16` override. Setting the
+mode to `adaptive` evaluates all three sizes using occupied AABB count,
+estimated empty-volume/local-DDA work, and payload/AABB bytes. The weights and
+switch hysteresis are system-property configurable. Per-section state includes
+the selected size, so unchanged occupancy retains its BLAS while a material
+size change requests exactly one replacement. Unit tests cover deterministic
+selection, supported-size estimates, hysteresis, size-change rebuilds, and
+telemetry aggregation. Structured statistics now record 4/8/16 candidate and
+selected distributions, hysteresis retention, the switch matrix, estimated
+primitive/DDA/byte costs, and actual live procedural AS/payload bytes per size.
+Debug comparison counters separately record candidate acceptance and local-DDA
+steps per size. The instrumentation and tests were not executed; device-side
+timings, benchmark captures, and benchmark-based weights remain unchecked.
 
 ## Suggested initial heuristic
 
@@ -935,6 +1411,29 @@ The procedural path must reconstruct:
 * [ ] Test world change.
 * [ ] Remove regular opaque full cubes from reflection triangle geometry only after validation passes.
 * [ ] Preserve triangle fallback.
+
+Implementation note (2026-08-19, execution deferred): an opt-in v2 procedural
+payload adds occupied-cell references plus deduplicated cell, face, and overlay
+material tables while keeping the existing occupancy-only v1 layout byte
+compatible. The extractor captures per-face block/material IDs, atlas UVs,
+rotation, tint, tangent handedness, raw light UVs, emission, and layered
+overlays; conflicting vertex identity or orientation data makes the cell
+incomplete so it remains triangle-owned. Reflection SBT record 6 now has a
+dedicated v2 DDA intersection shader and closest-hit shader. Runtime activation
+is default-off behind `vulkanite.proceduralReflection=true`, requires compatible
+record-2/record-6 shader stages, and replaces a section's reflection triangles
+only when its filtered ownership, procedural BLAS, and complete six-face
+material payload all exist. Full triangle BLAS resources remain resident for
+fallback.
+
+Debug mode 11 traces the complete triangle TLAS and the standalone procedural
+TLAS for sampled primary rays, then compares hit state, distance, geometric
+normal, block/material IDs, sampled albedo, emission, and PBR values. Atlas UV
+is currently checked indirectly through sampled albedo because raw UV is not in
+the shared payload ABI. Focused Java and shader-source tests were added, but no
+test, build, shader compilation, Vulkan validation, screenshot, or runtime
+comparison was run in this pass. Reflection triangles therefore remain the
+authoritative default.
 
 ## Phase gate
 

@@ -1,44 +1,34 @@
-# Bundled RT Shader Resource Audit
+# Bundled shader resource audit
 
-## Status
+## September 2026 disposition
 
-Audited during the first directional-lighting resource pass.
+The loader audit was repeated during rendering consolidation. `MixinProgramSet`
+discovers `rayN.rgen` and `rayN_M.rmiss|rchit|rahit|rint` through the active Iris
+shaderpack's `sourceProvider`. Its only classpath shader read is
+`assets/vulkanite/shaders/raytracing/lib/restir.glsl`.
 
-Current `MixinProgramSet` loads ray tracing stages from the active shaderpack via
-Iris' `sourceProvider`:
+Repository searches of Java resource loading, shader includes, mixins, resource
+metadata, tests, and Gradle tasks found no loading path for the bundled legacy
+ray/deferred programs. `ShaderCompiler` receives already provided source; it
+does not discover a second fallback pack. Gradle copies tracked shaderpacks from
+`shaderpacks/` into the development run directory.
 
-- `ray0.rgen`, `ray1.rgen`, ...
-- `rayN_M.rmiss`
-- `rayN_M.rchit`
-- `rayN_M.rahit`
-- `rayN_M.rint`
+Removed 14 inactive assets from `src/main/resources/assets/vulkanite/shaders`:
 
-The only bundled classpath shader resource injected by this loader is:
+- Nine ray entry points: `ray0.rgen`, `raygen.rgen`, `ray0_0.rmiss`, `miss.rmiss`,
+  `ray0_0.rchit`, `ray0_1.rchit`, `closesthit.rchit`, `ray0_0.rahit`, `ray0_1.rahit`.
+- Private ray helpers `lib/utils.glsl` and `lib/lighting.glsl`.
+- Deferred experiments `deferred_lighting.vert` and `deferred_lighting.frag`.
+- Their unused `include/raylib.glsl` helper.
 
-- `src/main/resources/assets/vulkanite/shaders/raytracing/lib/restir.glsl`
+The active shaderpack stages and mod-owned ReSTIR library remain authoritative.
+No helper from the removed programs is required by the current loader. This is
+repository loading-path evidence; arbitrary external mods reading private
+classpath files were not inventoried. The former shaderpack README and estimated
+preprocessed line index now describe the actual sources and ownership.
 
-## Bundled Files Not Loaded By The Current Shaderpack Path
+## Validation
 
-These files remain in `src/main/resources/assets/vulkanite/shaders/raytracing`,
-but the current loader does not use them as fallback ray-tracing stages:
-
-- `ray0.rgen`
-- `raygen.rgen`
-- `ray0_0.rmiss`
-- `miss.rmiss`
-- `ray0_0.rchit`
-- `ray0_1.rchit`
-- `closesthit.rchit`
-- `ray0_0.rahit`
-- `ray0_1.rahit`
-- `lib/utils.glsl`
-- `lib/lighting.glsl`
-
-## Decision
-
-Keep `lib/restir.glsl` as a mod-owned injected library for now.
-
-Do not delete the other bundled files in this pass. Treat them as stale fallback
-or experiment assets until a shader-load audit confirms no external pack or
-development path still expects them. Useful helper code should move into
-`shaderpacks/VulkaniteRT/shaders/lib/rt` before deletion.
+Java compilation, unit tests, and jar packaging are checked with Gradle. No live
+Vulkan frame, GPU timing, shader reload, or external shaderpack run is implied by
+those checks. See `HYBRID_GPU_ACCELERATION_PLAN.md` for current pass results.

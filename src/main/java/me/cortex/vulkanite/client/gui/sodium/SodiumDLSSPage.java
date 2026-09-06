@@ -175,11 +175,48 @@ public class SodiumDLSSPage {
                                 Text.of("Output"),
                                 Text.of("Motion Vectors"),
                                 Text.of("Depth"),
-                                Text.of("Normals")
+                                Text.of("Normals"),
+                                Text.of("Procedural Distance"),
+                                Text.of("Procedural Normals"),
+                                Text.of("Procedural Brick IDs"),
+                                Text.of("Procedural Voxel IDs"),
+                                Text.of("Shadow Comparison"),
+                                Text.of("Shadow Dangerous Misses"),
+                                Text.of("Shadow Extra Hits"),
+                                Text.of("Shadow Double-Trace Reference"),
+                                Text.of("Procedural Reflection Comparison")
                         }))
                         .setBinding(
                                 (opts, value) -> STORAGE.getConfig().setDebugType(value),
                                 (opts) -> STORAGE.getConfig().getDebugType())
+                        .build())
+                .add(OptionImpl.createBuilder(Integer.class, STORAGE)
+                        .setName(Text.of("Procedural Comparison Sampling"))
+                        .setTooltip(Text.of("Percent of debug shadow or material rays compared; use 100% for captures."))
+                        .setControl((opt) -> new SliderControl(opt, 1, 100, 1,
+                                (value) -> Text.of(value + "%")))
+                        .setBinding(
+                                (opts, value) -> STORAGE.getConfig().setShadowComparisonSamplingPercent(value),
+                                (opts) -> STORAGE.getConfig().getShadowComparisonSamplingPercent())
+                        .build())
+                .add(OptionImpl.createBuilder(Integer.class, STORAGE)
+                        .setName(Text.of("Procedural Distance Tolerance"))
+                        .setTooltip(Text.of("Allowed triangle/procedural hit-distance difference, in thousandths of a block."))
+                        .setControl((opt) -> new SliderControl(opt, 1, 1000, 1,
+                                (value) -> Text.of(String.format("%.3f", value / 1000.0f))))
+                        .setBinding(
+                                (opts, value) -> STORAGE.getConfig()
+                                        .setShadowComparisonDistanceTolerance(value / 1000.0f),
+                                (opts) -> Math.round(STORAGE.getConfig()
+                                        .getShadowComparisonDistanceTolerance() * 1000.0f))
+                        .build())
+                .add(OptionImpl.createBuilder(boolean.class, STORAGE)
+                        .setName(Text.of("Log Shadow Mismatches"))
+                        .setTooltip(Text.of("Periodically log exact comparison counters; diagnostic readback may briefly stall rendering."))
+                        .setControl(TickBoxControl::new)
+                        .setBinding(
+                                (opts, value) -> STORAGE.getConfig().setShadowComparisonStructuredLogging(value),
+                                (opts) -> STORAGE.getConfig().isShadowComparisonStructuredLogging())
                         .build())
                 .build());
 

@@ -214,22 +214,6 @@ final class RtxFrameImages {
         return reservoirs[(frameIndex + 1) & 1];
     }
 
-    VRef<VImage> currentSpecularHistory(int frameIndex) {
-        return specularHistory[frameIndex & 1];
-    }
-
-    VRef<VImage> previousSpecularHistory(int frameIndex) {
-        return specularHistory[(frameIndex + 1) & 1];
-    }
-
-    VRef<VImage> currentSpecularSurfaceHistory(int frameIndex) {
-        return specularSurfaceHistory[frameIndex & 1];
-    }
-
-    VRef<VImage> previousSpecularSurfaceHistory(int frameIndex) {
-        return specularSurfaceHistory[(frameIndex + 1) & 1];
-    }
-
     VRef<VImage> radiance() {
         return radiance;
     }

@@ -7,6 +7,7 @@ import me.cortex.vulkanite.mixin.minecraft.ParticleAccessor;
 import net.caffeinemc.mods.sodium.api.vertex.attributes.CommonVertexAttribute;
 import net.caffeinemc.mods.sodium.api.vertex.buffer.VertexBufferWriter;
 import net.caffeinemc.mods.sodium.api.vertex.format.VertexFormatDescription;
+import net.irisshaders.batchedentityrendering.impl.WrappableRenderType;
 import net.irisshaders.iris.mixin.LevelRendererAccessor;
 import me.cortex.vulkanite.mixin.minecraft.ParticleManagerAccessor;
 import net.minecraft.client.MinecraftClient;
@@ -24,6 +25,7 @@ import net.minecraft.client.texture.SpriteAtlasTexture;
 import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.LivingEntity;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -131,6 +133,14 @@ public final class EntityCapture implements AutoCloseable {
         double maxDistanceSquared = maxDistanceSquared(maxEntityDistance);
         List<Entity> candidates = new ArrayList<>();
         for (Entity entity : world.getEntities()) {
+            boolean focusedCameraEntity = camera != null && entity == camera.getFocusedEntity();
+            boolean sleeping = entity instanceof LivingEntity livingEntity && livingEntity.isSleeping();
+            if (shouldExcludeFocusedCameraEntity(
+                    focusedCameraEntity,
+                    camera != null && camera.isThirdPerson(),
+                    sleeping)) {
+                continue;
+            }
             if (cameraPos == null || distanceSquared(entity, cameraPos) <= maxDistanceSquared) {
                 candidates.add(entity);
             }
@@ -139,6 +149,11 @@ public final class EntityCapture implements AutoCloseable {
             candidates.sort(Comparator.comparingDouble(entity -> distanceSquared(entity, cameraPos)));
         }
         return candidates;
+    }
+
+    static boolean shouldExcludeFocusedCameraEntity(
+            boolean focusedCameraEntity, boolean thirdPerson, boolean sleeping) {
+        return focusedCameraEntity && !thirdPerson && !sleeping;
     }
 
     private static double maxDistanceSquared(int maxEntityDistance) {
@@ -206,8 +221,16 @@ public final class EntityCapture implements AutoCloseable {
         }
 
         TextureBinding resolve(RenderLayer layer) {
+            RenderLayer textureLayer = layer;
+            for (int depth = 0; depth < 8 && textureLayer instanceof WrappableRenderType wrapped; depth++) {
+                RenderLayer unwrapped = wrapped.unwrap();
+                if (unwrapped == textureLayer) {
+                    break;
+                }
+                textureLayer = unwrapped;
+            }
             Identifier id = MissingSprite.getMissingSpriteId();
-            if (layer instanceof RenderLayer.MultiPhase multiPhase) {
+            if (textureLayer instanceof RenderLayer.MultiPhase multiPhase) {
                 id = multiPhase.phases.texture.getId().orElse(id);
             }
 

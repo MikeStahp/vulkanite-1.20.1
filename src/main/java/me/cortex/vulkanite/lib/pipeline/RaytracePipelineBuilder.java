@@ -8,6 +8,8 @@ import me.cortex.vulkanite.lib.shader.reflection.ShaderReflection;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
@@ -25,6 +27,9 @@ import static org.lwjgl.vulkan.VK10.*;
  * debugging capabilities.
  */
 public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBuilder> {
+    private static final Logger LOGGER = LoggerFactory.getLogger(RaytracePipelineBuilder.class);
+    private static final boolean FAST_PIPELINE_COMPILE = Boolean.getBoolean("vulkanite.fastPipelineCompile");
+
     private final Set<ShaderModule> shaders = new LinkedHashSet<>();
     private ShaderModule rayGenShader;
     private final List<ShaderModule> missShaders = new ArrayList<>();
@@ -128,16 +133,21 @@ public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBui
             LongBuffer pPipeline = stack.mallocLong(1);
             VkRayTracingPipelineCreateInfoKHR pipelineCreateInfo = VkRayTracingPipelineCreateInfoKHR.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR)
+                    .flags(FAST_PIPELINE_COMPILE ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0)
                     .layout(pipelineLayout)
                     .pStages(shaderStages)
                     .pGroups(groups)
                     .maxPipelineRayRecursionDepth(maxDepth);
 
+            LOGGER.info("Creating Vulkan RT pipeline: stages={}, groups={}, driverOptimization={}",
+                    shaderStages.remaining(), groups.remaining(), FAST_PIPELINE_COMPILE ? "disabled" : "enabled");
+            long pipelineStartedAt = System.nanoTime();
             int result = vkCreateRayTracingPipelinesKHR(context.device, 0, 0,
                     VkRayTracingPipelineCreateInfoKHR.create(pipelineCreateInfo.address(), 1),
                     null, pPipeline);
 
             _CHECK_(result, "Failed to create ray tracing pipeline");
+            LOGGER.info("Vulkan RT pipeline created in {} ms", (System.nanoTime() - pipelineStartedAt) / 1_000_000L);
 
             long pipelineHandle = pPipeline.get(0);
 
@@ -309,7 +319,7 @@ public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBui
                         VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR |
                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR,
                 VK_MEMORY_HEAP_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                0, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                groupBaseAlignment, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
         VBuffer sbtBuffer = sbtBufferRef.get();
         sbtBuffer.setDebugUtilsObjectName("SBT");
         long ptr = sbtBuffer.map();
@@ -349,7 +359,26 @@ public class RaytracePipelineBuilder extends PipelineBuilder<RaytracePipelineBui
         VkStridedDeviceAddressRegionKHR callableRegion = VkStridedDeviceAddressRegionKHR.calloc()
                 .set(sbtBuffer.deviceAddress() + callGroupBase, handleSizeAligned, handleSizeAligned * callGroupCount);
 
+        assertSbtRegion("raygen", rayGenRegion, 1, handleSizeAligned, groupBaseAlignment);
+        assertSbtRegion("miss", missRegion, missGroupCount, handleSizeAligned, groupBaseAlignment);
+        assertSbtRegion("hit", hitRegion, hitGroupsCount, handleSizeAligned, groupBaseAlignment);
+        assertSbtRegion("callable", callableRegion, callGroupCount, handleSizeAligned, groupBaseAlignment);
+
         return new ShaderBindingTable(sbtBufferRef, rayGenRegion, missRegion, hitRegion, callableRegion);
+    }
+
+    private static void assertSbtRegion(
+            String name,
+            VkStridedDeviceAddressRegionKHR region,
+            long recordCount,
+            long expectedStride,
+            long baseAlignment) {
+        if (region.stride() != expectedStride || region.size() != expectedStride * recordCount) {
+            throw new IllegalStateException(name + " SBT region does not match its record count");
+        }
+        if (region.deviceAddress() != 0L && (region.deviceAddress() % baseAlignment) != 0L) {
+            throw new IllegalStateException(name + " SBT region is not base aligned");
+        }
     }
 
     /**

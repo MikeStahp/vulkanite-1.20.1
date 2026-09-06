@@ -9,7 +9,6 @@ import me.cortex.vulkanite.lib.cmd.VCmdBuff;
 import me.cortex.vulkanite.lib.descriptors.DescriptorUpdateBuilder;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorPool;
 import me.cortex.vulkanite.lib.descriptors.VDescriptorSet;
-import me.cortex.vulkanite.lib.memory.VAccelerationStructure;
 import me.cortex.vulkanite.lib.memory.VBuffer;
 import me.cortex.vulkanite.lib.memory.VGImage;
 import me.cortex.vulkanite.lib.memory.VImage;
@@ -46,7 +45,7 @@ public final class RenderPassExecutor {
     private final List<VRef<?>> resourcesToCloseCache = new ArrayList<>(32);
     private final List<VRef<VImageView>> scaledViewListCache = new ArrayList<>(1);
     private final List<VRef<VImageView>> entityTextureViewListCache = new ArrayList<>(EntityCapture.MAX_TEXTURES);
-    private final long[] pushConstantsCache = new long[6];
+    private final long[] pushConstantsCache = new long[8];
     private final Map<Long, VRef<VDescriptorPool>> entityTexturePools = new HashMap<>();
 
     public RenderPassExecutor(VContext ctx, AccelerationManager accelerationManager,
@@ -57,75 +56,11 @@ public final class RenderPassExecutor {
         this.ctexSampler = ctexSampler;
     }
 
-    /**
-     * Executes a single ray tracing pipeline pass.
-     *
-     * @param gbufferViews       Array of G-buffer image views for hybrid rendering:
-     *                           [0] = colortex1 (Albedo)
-     *                           [1] = colortex2 (Material Properties)
-     *                           [2] = colortex3 (Normal)
-     *                           [3] = colortex4 (World Position)
-     *                           [4] = colortex5 (Additional Properties)
-     * @param reservoirImageView Optional reservoir image view for ReSTIR (binding
-     *                           6)
-     */
-    public void execute(
-            VCmdBuff cmd,
-            RtPipeline record,
-            VRef<VBuffer> uboBuffer,
-            long uboOffset,
-            long uboSize,
-            VRef<VAccelerationStructure> tlas,
-            SharedImageViewTracker blockAtlasView,
-            SharedImageViewTracker blockAtlasNormalView,
-            SharedImageViewTracker blockAtlasSpecularView,
-            VRef<VImageView> placeholderNormalsView,
-            VRef<VImageView> placeholderSpecularView,
-            SharedImageViewTracker[] irisRenderTargetViews,
-            List<VRef<VGImage>> vgOutImgs,
-            List<VRef<VImage>> outImgs,
-            SharedImageViewTracker[] customTextureViews,
-            ShaderStorageBuffer[] ssbos,
-            VRef<VImageView>[] gbufferViews,
-            int frameIndex,
-            int sampleIndex,
-            float sunDirectionX,
-            float sunDirectionY,
-            float sunDirectionZ,
-            float sunColorR,
-            float sunColorG,
-            float sunColorB,
-            int enableReSTIR, // New parameter for ReSTIR toggle (0/1)
-            int debugMode, // New parameter for Debug Mode (0=NONE, 1=DLSS, 2=BUFFERS)
-            int debugCellIndex, // For DLSS debug mode: which cell to display (0-5), -1 for grid view
-            int cacheExecutionMode,
-            RtxFrameImages.StorageViews storageViews,
-            VRef<VImage> currentReservoirImage,
-            VRef<VImage> prevReservoirImage,
-            VRef<VImage> diffuseAlbedoMetallicImage,
-            VRef<VImage> specularAlbedoImage,
-            VRef<VImage> normalRoughnessImage,
-            VRef<VImage> motionVectorImage,
-            VRef<VImage> linearDepthImage,
-            VRef<VImage> specularHitDepthImage,
-            VRef<VImage> firstHitDepthImage,
-            VRef<VImage> blocklightDetailImage,
-            VRef<VBuffer> sectionLightBuffer,
-            VRef<VBuffer> sectionLightProbeBuffer,
-            VRef<VBuffer> sectionLightProbeFeedbackBuffer,
-            VRef<VBuffer> sectionLightProbeFillRequestBuffer,
-            VRef<VBuffer> diffuseRadianceCacheBuffer,
-            VRef<VBuffer> diffuseRadianceFillRequestBuffer,
-            VRef<VBuffer> specularTransportCacheBuffer,
-            VRef<VBuffer> specularTransportFillRequestBuffer,
-            VRef<VBuffer> surfaceDirectLightCacheBuffer,
-            VRef<VBuffer> surfaceDirectLightFillRequestBuffer,
-            VRef<VImage> scaledOutputImage, // DLSS: Scaled output image for binding 12 (or null to use Iris target)
-            int rayDispatchWidth,
-            int rayDispatchHeight) {
+    /** Encodes one shaderpack ray pass using the shared frame contract. */
+    void execute(RtPipeline record, RtxFrame frame) {
 
         // Early empty check to avoid unnecessary encoding work
-        if (outImgs.isEmpty()) {
+        if (frame.outImgs().isEmpty()) {
             LOGGER.warn("No output images found for ray tracing. Skipping pass.");
             return;
         }
@@ -135,7 +70,7 @@ public final class RenderPassExecutor {
         try {
             var pipeline = record.pipeline();
             var reflection = pipeline.get().reflection;
-            cmd.bindRT(pipeline);
+            frame.cmd().bindRT(pipeline);
 
             var layouts = reflection.getLayouts();
             int layoutCount = layouts.size();
@@ -152,25 +87,30 @@ public final class RenderPassExecutor {
                 var setReflection = reflection.getSet(commonSetIdx);
 
                 // Get view references, using placeholders as fallback
-                var blockView = blockAtlasView.getView();
+                var blockView = frame.blockAtlasView().getView();
                 if (blockView != null)
                     resourcesToClose.add(blockView);
 
-                var normalView = blockAtlasNormalView.getView();
+                var normalView = frame.blockAtlasNormalView().getView();
                 if (normalView != null)
                     resourcesToClose.add(normalView);
 
-                var specularView = blockAtlasSpecularView.getView();
+                var specularView = frame.blockAtlasSpecularView().getView();
                 if (specularView != null)
                     resourcesToClose.add(specularView);
 
                 var updater = new DescriptorUpdateBuilder(ctx, setReflection)
                         .set(commonSet)
-                        .uniform(0, uboBuffer, uboOffset, uboSize)
-                        .acceleration(1, tlas)
-                        .imageSampler(3, blockView != null ? blockView : placeholderNormalsView, sampler)
-                        .imageSampler(4, normalView != null ? normalView : placeholderNormalsView, sampler)
-                        .imageSampler(5, specularView != null ? specularView : placeholderSpecularView, sampler);
+                        .uniform(0, frame.uboBuffer(), frame.uboOffset(), frame.uboSize())
+                        .acceleration(1, frame.tlas())
+                        // Binding 32 is reflected only by pipelines containing the
+                        // procedural debug group. A valid triangle TLAS is used as
+                        // an inert fallback when the debug TLAS is unavailable.
+                        .acceleration(32, frame.proceduralTlas() != null ? frame.proceduralTlas() : frame.tlas())
+                        .acceleration(34, frame.hybridShadowTlas() != null ? frame.hybridShadowTlas() : frame.tlas())
+                        .imageSampler(3, blockView != null ? blockView : frame.placeholderNormalsView(), sampler)
+                        .imageSampler(4, normalView != null ? normalView : frame.placeholderNormalsView(), sampler)
+                        .imageSampler(5, specularView != null ? specularView : frame.placeholderSpecularView(), sampler);
 
                 // Bind G-buffer textures for hybrid rendering (bindings 7-11)
                 // Binding 7: colortex1 (Albedo) - gbufferViews[0]
@@ -178,34 +118,34 @@ public final class RenderPassExecutor {
                 // Binding 9: colortex3 (Normal) - gbufferViews[2]
                 // Binding 10: colortex4 (WorldPos) - gbufferViews[3]
                 // Binding 11: colortex5 (Extra) - gbufferViews[4]
-                if (gbufferViews != null && gbufferViews.length >= 5) {
-                    if (gbufferViews[0] != null) {
+                if (frame.gbufferViews() != null && frame.gbufferViews().length >= 5) {
+                    if (frame.gbufferViews()[0] != null) {
                         LOGGER.trace("Binding 7: gbufferAlbedo OK");
-                        updater.imageSampler(7, gbufferViews[0], sampler);
+                        updater.imageSampler(7, frame.gbufferViews()[0], sampler);
                     } else {
                         LOGGER.warn("Binding 7: gbufferAlbedo is NULL! Binding placeholder.");
-                        updater.imageSampler(7, placeholderNormalsView, sampler); // Fallback
+                        updater.imageSampler(7, frame.placeholderNormalsView(), sampler); // Fallback
                     }
 
-                    if (gbufferViews[1] != null)
-                        updater.imageSampler(8, gbufferViews[1], sampler);
+                    if (frame.gbufferViews()[1] != null)
+                        updater.imageSampler(8, frame.gbufferViews()[1], sampler);
                     else
-                        updater.imageSampler(8, placeholderNormalsView, sampler);
+                        updater.imageSampler(8, frame.placeholderNormalsView(), sampler);
 
-                    if (gbufferViews[2] != null)
-                        updater.imageSampler(9, gbufferViews[2], sampler);
+                    if (frame.gbufferViews()[2] != null)
+                        updater.imageSampler(9, frame.gbufferViews()[2], sampler);
                     else
-                        updater.imageSampler(9, placeholderNormalsView, sampler);
+                        updater.imageSampler(9, frame.placeholderNormalsView(), sampler);
 
-                    if (gbufferViews[3] != null)
-                        updater.imageSampler(10, gbufferViews[3], sampler);
+                    if (frame.gbufferViews()[3] != null)
+                        updater.imageSampler(10, frame.gbufferViews()[3], sampler);
                     else
-                        updater.imageSampler(10, placeholderNormalsView, sampler);
+                        updater.imageSampler(10, frame.placeholderNormalsView(), sampler);
 
-                    if (gbufferViews[4] != null)
-                        updater.imageSampler(11, gbufferViews[4], sampler);
+                    if (frame.gbufferViews()[4] != null)
+                        updater.imageSampler(11, frame.gbufferViews()[4], sampler);
                     else
-                        updater.imageSampler(11, placeholderNormalsView, sampler);
+                        updater.imageSampler(11, frame.placeholderNormalsView(), sampler);
                 } else {
                     LOGGER.error("G-Buffer views array is NULL or too small!");
                 }
@@ -223,11 +163,11 @@ public final class RenderPassExecutor {
                     if (binding6.descriptorType() == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && binding6.arraySize() == 0) {
                         if (binding12 != null) {
                             // VulkaniteRT/Dirt-RT-Optimized: binding 6 is reservoir/intermediate
-                            if (currentReservoirImage != null) {
+                            if (frame.currentReservoir() != null) {
                                 LOGGER.trace(
                                         "Binding 6: Binding ReSTIR reservoir image (VulkaniteRT/Dirt-RT-Optimized path)");
                                 var reservoirView = resolveStorageView(
-                                        storageViews.currentReservoir(), currentReservoirImage, resourcesToClose);
+                                        frame.storageViews().currentReservoir(), frame.currentReservoir(), resourcesToClose);
                                 updater.imageStore(6, reservoirView);
                             } else {
                                 LOGGER.warn("Binding 6: Reservoir image is null!");
@@ -235,8 +175,8 @@ public final class RenderPassExecutor {
                         } else {
                             // dirtrtold: binding 6 is the output
                             LOGGER.trace("Binding 6: Binding final output as fallback (dirtrtold path)");
-                            if (outImgViewListCache.isEmpty() && !outImgs.isEmpty()) {
-                                var view = irisRenderTargetViews[0].getView(() -> vgOutImgs.get(0));
+                            if (outImgViewListCache.isEmpty() && !frame.outImgs().isEmpty()) {
+                                var view = frame.irisRenderTargetViews()[0].getView(() -> frame.vgOutImgs().get(0));
                                 if (view != null)
                                     resourcesToClose.add(view);
                                 outImgViewListCache.add(view);
@@ -251,11 +191,11 @@ public final class RenderPassExecutor {
                         LOGGER.trace("Binding 6: Binding array of {} images (Legacy path)", binding6.arraySize());
                         // Traditional use: binding 6 as an array of render targets
                         int maxImages = binding6.arraySize();
-                        int imageCount = Math.min(outImgs.size(), maxImages);
+                        int imageCount = Math.min(frame.outImgs().size(), maxImages);
 
                         for (int i = 0; i < imageCount; i++) {
                             int index = i;
-                            var view = irisRenderTargetViews[i].getView(() -> vgOutImgs.get(index));
+                            var view = frame.irisRenderTargetViews()[i].getView(() -> frame.vgOutImgs().get(index));
                             if (view != null)
                                 resourcesToClose.add(view);
                             outImgViewListCache.add(view);
@@ -268,19 +208,19 @@ public final class RenderPassExecutor {
                     // DLSS FIX: Use scaled output image when DLSS is active
                     // When scaledOutputImage is provided, bind it instead of the full-resolution Iris target
                     // This ensures ray tracing writes to a scaled buffer that DLSSD can then upscale
-                    if (scaledOutputImage != null) {
+                    if (frame.noisyOutput() != null) {
                         // Use the scaled output image for DLSS
                         var scaledView = resolveStorageView(
-                                storageViews.radiance(), scaledOutputImage, resourcesToClose);
+                                frame.storageViews().radiance(), frame.noisyOutput(), resourcesToClose);
                         scaledViewListCache.clear();
                         scaledViewListCache.add(scaledView);
                         updater.imageStore(12, 0, scaledViewListCache); // Scaled output for DLSS
                         LOGGER.trace("Binding 12: Using scaled output image ({}x{}) for DLSS",
-                                scaledOutputImage.get().width, scaledOutputImage.get().height);
+                                frame.noisyOutput().get().width, frame.noisyOutput().get().height);
                     } else {
                         // Use the first output image for final output if no dedicated intermediate buffer
-                        if (outImgViewListCache.isEmpty() && !outImgs.isEmpty()) {
-                            var view = irisRenderTargetViews[0].getView(() -> vgOutImgs.get(0));
+                        if (outImgViewListCache.isEmpty() && !frame.outImgs().isEmpty()) {
+                            var view = frame.irisRenderTargetViews()[0].getView(() -> frame.vgOutImgs().get(0));
                             if (view != null)
                                 resourcesToClose.add(view);
                             outImgViewListCache.add(view);
@@ -292,9 +232,9 @@ public final class RenderPassExecutor {
                 // Add Binding 13 for Motion Vectors
                 var binding13 = setReflection.getBindingAt(13);
                 if (binding13 != null) {
-                    if (motionVectorImage != null) {
+                    if (frame.motionVectors() != null) {
                         var mvView = resolveStorageView(
-                                storageViews.motionVector(), motionVectorImage, resourcesToClose);
+                                frame.storageViews().motionVector(), frame.motionVectors(), resourcesToClose);
                         updater.imageStore(13, mvView);
                     } else if (outImgViewListCache.size() > 0) {
                         // Fallback: use first output image as dummy target if MV image is null
@@ -307,9 +247,9 @@ public final class RenderPassExecutor {
                 // Add Binding 14 for Linear Depth
                 var binding14 = setReflection.getBindingAt(14);
                 if (binding14 != null) {
-                    if (linearDepthImage != null) {
+                    if (frame.linearDepth() != null) {
                         var depthView = resolveStorageView(
-                                storageViews.linearDepth(), linearDepthImage, resourcesToClose);
+                                frame.storageViews().linearDepth(), frame.linearDepth(), resourcesToClose);
                         updater.imageStore(14, depthView);
                     } else if (outImgViewListCache.size() > 0) {
                         // Fallback: use first output image as dummy target if depth image is null
@@ -322,9 +262,9 @@ public final class RenderPassExecutor {
                 // Add Binding 15 for Previous Frame Reservoir (ReSTIR ping-pong read)
                 var binding15 = setReflection.getBindingAt(15);
                 if (binding15 != null) {
-                    if (prevReservoirImage != null) {
+                    if (frame.previousReservoir() != null) {
                         var prevResView = resolveStorageView(
-                                storageViews.previousReservoir(), prevReservoirImage, resourcesToClose);
+                                frame.storageViews().previousReservoir(), frame.previousReservoir(), resourcesToClose);
                         updater.imageStore(15, prevResView);
                     } else if (outImgViewListCache.size() > 0) {
                         // Fallback: use first output image as dummy target if prev reservoir is null
@@ -333,35 +273,38 @@ public final class RenderPassExecutor {
                 }
 
                 bindOptionalStorageImage(updater, setReflection, resourcesToClose, outImgViewListCache,
-                        16, storageViews.diffuseAlbedoMetallic(), diffuseAlbedoMetallicImage, "DiffuseAlbedoMetallic");
+                        16, frame.storageViews().diffuseAlbedoMetallic(), frame.diffuseAlbedoMetallic(), "DiffuseAlbedoMetallic");
                 bindOptionalStorageImage(updater, setReflection, resourcesToClose, outImgViewListCache,
-                        17, storageViews.specularAlbedo(), specularAlbedoImage, "SpecularAlbedo");
+                        17, frame.storageViews().specularAlbedo(), frame.specularAlbedo(), "SpecularAlbedo");
                 bindOptionalStorageImage(updater, setReflection, resourcesToClose, outImgViewListCache,
-                        18, storageViews.normalRoughness(), normalRoughnessImage, "NormalRoughness");
+                        18, frame.storageViews().normalRoughness(), frame.normalRoughness(), "NormalRoughness");
                 bindOptionalStorageImage(updater, setReflection, resourcesToClose, outImgViewListCache,
-                        19, storageViews.specularHitDepth(), specularHitDepthImage, "SpecularHitDepth");
+                        19, frame.storageViews().specularHitDepth(), frame.specularHitDepth(), "SpecularHitDepth");
                 bindOptionalStorageImage(updater, setReflection, resourcesToClose, outImgViewListCache,
-                        20, storageViews.firstHitDepth(), firstHitDepthImage, "FirstHitDepth");
+                        20, frame.storageViews().firstHitDepth(), frame.firstHitDepth(), "FirstHitDepth");
                 bindOptionalStorageImage(updater, setReflection, resourcesToClose, outImgViewListCache,
-                        21, storageViews.blocklightDetail(), blocklightDetailImage, "BlocklightDetail");
-                bindOptionalStorageBuffer(updater, setReflection, 22, sectionLightBuffer, "SectionLights");
-                bindOptionalStorageBuffer(updater, setReflection, 23, sectionLightProbeBuffer, "SectionLightProbes");
-                bindOptionalStorageBuffer(updater, setReflection, 24, sectionLightProbeFeedbackBuffer,
+                        21, frame.storageViews().blocklightDetail(), frame.blocklightDetail(), "BlocklightDetail");
+                bindOptionalStorageBuffer(updater, setReflection, 22, frame.sectionLightBuffer(), "SectionLights");
+                bindOptionalStorageBuffer(updater, setReflection, 23, frame.sectionLightProbeBuffer(), "SectionLightProbes");
+                bindOptionalStorageBuffer(updater, setReflection, 24, frame.sectionLightProbeFeedbackBuffer(),
                         "SectionLightProbeFeedback");
-                bindOptionalStorageBuffer(updater, setReflection, 25, sectionLightProbeFillRequestBuffer,
+                bindOptionalStorageBuffer(updater, setReflection, 25, frame.sectionLightProbeFillRequestBuffer(),
                         "SectionLightProbeFillRequests");
-                bindOptionalStorageBuffer(updater, setReflection, 26, diffuseRadianceCacheBuffer,
+                bindOptionalStorageBuffer(updater, setReflection, 26, frame.diffuseRadianceCacheBuffer(),
                         "DiffuseRadianceCache");
-                bindOptionalStorageBuffer(updater, setReflection, 27, diffuseRadianceFillRequestBuffer,
+                bindOptionalStorageBuffer(updater, setReflection, 27, frame.diffuseRadianceFillRequestBuffer(),
                         "DiffuseRadianceFillRequests");
-                bindOptionalStorageBuffer(updater, setReflection, 28, specularTransportCacheBuffer,
+                bindOptionalStorageBuffer(updater, setReflection, 28, frame.specularTransportCacheBuffer(),
                         "SpecularTransportCache");
-                bindOptionalStorageBuffer(updater, setReflection, 29, specularTransportFillRequestBuffer,
+                bindOptionalStorageBuffer(updater, setReflection, 29, frame.specularTransportFillRequestBuffer(),
                         "SpecularTransportFillRequests");
-                bindOptionalStorageBuffer(updater, setReflection, 30, surfaceDirectLightCacheBuffer,
+                bindOptionalStorageBuffer(updater, setReflection, 30, frame.surfaceDirectLightCacheBuffer(),
                         "SurfaceDirectLightCache");
-                bindOptionalStorageBuffer(updater, setReflection, 31, surfaceDirectLightFillRequestBuffer,
+                bindOptionalStorageBuffer(updater, setReflection, 31, frame.surfaceDirectLightFillRequestBuffer(),
                         "SurfaceDirectLightFillRequests");
+                bindOptionalStorageBuffer(updater, setReflection,
+                        HybridShadowComparisonLayout.DESCRIPTOR_BINDING,
+                        frame.shadowComparisonBuffer(), "HybridShadowComparison");
 
                 updater.apply();
 
@@ -382,14 +325,14 @@ public final class RenderPassExecutor {
                 VRef<VDescriptorSet> entityTextureSet = pool.get().allocateSet();
                 var updater = new DescriptorUpdateBuilder(ctx, reflection.getSet(entityTextureSetIdx))
                         .set(entityTextureSet);
-                List<VRef<me.cortex.vulkanite.lib.memory.VGImage>> images =
+                List<VRef<VGImage>> images =
                         accelerationManager.getEntityTextureImages();
                 List<VRef<VImageView>> views = entityTextureViewListCache;
                 views.clear();
                 try {
                     int imageCount = Math.min(images.size(), EntityCapture.MAX_TEXTURES);
                     for (int i = 0; i < imageCount; i++) {
-                        VRef<me.cortex.vulkanite.lib.memory.VGImage> image = images.get(i);
+                        VRef<VGImage> image = images.get(i);
                         @SuppressWarnings({"rawtypes", "unchecked"})
                         VRef<VImage> imageRef = (VRef) image;
                         VRef<VImageView> view = VImageView.create(ctx, imageRef);
@@ -397,12 +340,12 @@ public final class RenderPassExecutor {
                         resourcesToClose.add(view);
                     }
                     while (views.size() < EntityCapture.MAX_TEXTURES) {
-                        views.add(placeholderNormalsView);
+                        views.add(frame.placeholderNormalsView());
                     }
                     updater.imageSampler(0, 0, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, views, ctexSampler);
                     updater.apply();
                 } finally {
-                    for (VRef<me.cortex.vulkanite.lib.memory.VGImage> image : images) {
+                    for (VRef<VGImage> image : images) {
                         image.close();
                     }
                 }
@@ -414,8 +357,8 @@ public final class RenderPassExecutor {
                 var ctexSet = Vulkanite.INSTANCE.getPoolByLayout(layouts.get(customTexSetIdx)).get().allocateSet();
                 var updater = new DescriptorUpdateBuilder(ctx, reflection.getSet(customTexSetIdx)).set(ctexSet);
 
-                for (int i = 0, len = customTextureViews.length; i < len; i++) {
-                    var view = customTextureViews[i].getView();
+                for (int i = 0, len = frame.customTextureViews().length; i < len; i++) {
+                    var view = frame.customTextureViews()[i].getView();
                     if (view != null)
                         resourcesToClose.add(view);
                     updater.imageSampler(i, view, ctexSampler);
@@ -429,7 +372,7 @@ public final class RenderPassExecutor {
                 var ssboSet = Vulkanite.INSTANCE.getPoolByLayout(layouts.get(ssboSetIdx)).get().allocateSet();
                 var updater = new DescriptorUpdateBuilder(ctx, reflection.getSet(ssboSetIdx)).set(ssboSet);
 
-                for (ShaderStorageBuffer ssbo : ssbos) {
+                for (ShaderStorageBuffer ssbo : frame.ssbos()) {
                     updater.buffer(ssbo.getIndex(), new VRef<>(((IVGBuffer) ssbo).getBuffer().get()));
                 }
                 updater.apply();
@@ -443,43 +386,50 @@ public final class RenderPassExecutor {
                 }
             }
 
-            cmd.bindDSet(sets);
+            frame.cmd().bindDSet(sets);
 
             // Memory barrier: ensure descriptor set updates (including geometry buffers and
             // TLAS)
             // are visible before ray tracing dispatch reads them
-            cmd.encodeMemoryBarrier();
+            frame.cmd().encodeMemoryBarrier();
 
             // Push constants for ray tracing shader.
             long[] pushConstants = pushConstantsCache;
             // Pack frameIndex (uint) and sampleIndex (uint) into first long
-            pushConstants[0] = (long) frameIndex & 0xFFFFFFFFL | (((long) sampleIndex & 0xFFFFFFFFL) << 32);
+            pushConstants[0] = (long) frame.frameIndex() & 0xFFFFFFFFL | (((long) frame.sampleIndex() & 0xFFFFFFFFL) << 32);
             // Pack sunDirection (vec3)
-            pushConstants[1] = (long) Float.floatToRawIntBits(sunDirectionX) & 0xFFFFFFFFL |
-                (((long) Float.floatToRawIntBits(sunDirectionY) & 0xFFFFFFFFL) << 32);
-            pushConstants[2] = (long) Float.floatToRawIntBits(sunDirectionZ) & 0xFFFFFFFFL |
-                (((long) Float.floatToRawIntBits(sunColorR) & 0xFFFFFFFFL) << 32);
-            pushConstants[3] = (long) Float.floatToRawIntBits(sunColorG) & 0xFFFFFFFFL |
-                (((long) Float.floatToRawIntBits(sunColorB) & 0xFFFFFFFFL) << 32);
+            pushConstants[1] = (long) Float.floatToRawIntBits(frame.sunDirectionX()) & 0xFFFFFFFFL |
+                (((long) Float.floatToRawIntBits(frame.sunDirectionY()) & 0xFFFFFFFFL) << 32);
+            pushConstants[2] = (long) Float.floatToRawIntBits(frame.sunDirectionZ()) & 0xFFFFFFFFL |
+                (((long) Float.floatToRawIntBits(frame.sunColorR()) & 0xFFFFFFFFL) << 32);
+            pushConstants[3] = (long) Float.floatToRawIntBits(frame.sunColorG()) & 0xFFFFFFFFL |
+                (((long) Float.floatToRawIntBits(frame.sunColorB()) & 0xFFFFFFFFL) << 32);
             // Pack enableReSTIR (int) and debugMode (int)
-            pushConstants[4] = ((long) enableReSTIR & 0xFFFFFFFFL) | (((long) debugMode & 0xFFFFFFFFL) << 32);
-            pushConstants[5] = (long) debugCellIndex & 0xFFFFFFFFL
-                    | (((long) cacheExecutionMode & 0xFFFFFFFFL) << 32);
+            pushConstants[4] = ((long) frame.enableReSTIR() & 0xFFFFFFFFL) | (((long) frame.debugMode() & 0xFFFFFFFFL) << 32);
+            pushConstants[5] = (long) frame.debugCellIndex() & 0xFFFFFFFFL
+                    | (((long) frame.cacheExecutionMode() & 0xFFFFFFFFL) << 32);
+            pushConstants[6] = (long) frame.shadowComparisonSamplingPermille() & 0xFFFFFFFFL
+                    | (((long) Float.floatToRawIntBits(frame.shadowComparisonDistanceTolerance())
+                    & 0xFFFFFFFFL) << 32);
+            // The descriptor always has a valid fallback TLAS, so the shader
+            // needs an explicit bit to distinguish a real mixed shadow TLAS
+            // from the triangle-only material TLAS bound in its place.
+            pushConstants[7] = frame.hybridShadowTlas() != null ? 1L : 0L;
 
-            cmd.pushConstants(0, pushConstants, VK_SHADER_STAGE_ALL);
-            cmd.traceRays(rayDispatchWidth, rayDispatchHeight, 1);
+            frame.cmd().pushConstants(0, pushConstants, VK_SHADER_STAGE_ALL);
+            frame.cmd().traceRays(frame.rayDispatchWidth(), frame.rayDispatchHeight(), 1);
 
             // Diagnostic logging (throttled to every 300 frames)
-            if (frameIndex % 300 == 0) {
-                VImage boundOutput = scaledOutputImage != null ? scaledOutputImage.get() : outImgs.get(0).get();
-                if (rayDispatchWidth != boundOutput.width || rayDispatchHeight != boundOutput.height) {
+            if (frame.frameIndex() % 300 == 0) {
+                VImage boundOutput = frame.noisyOutput() != null ? frame.noisyOutput().get() : frame.outImgs().get(0).get();
+                if (frame.rayDispatchWidth() != boundOutput.width || frame.rayDispatchHeight() != boundOutput.height) {
                     LOGGER.warn(
                             "[JITTER FRAME DIAG] DIMENSION MISMATCH: traceRays {}x{} vs output {}x{} - may cause visible boundary!",
-                            rayDispatchWidth, rayDispatchHeight, boundOutput.width, boundOutput.height);
+                            frame.rayDispatchWidth(), frame.rayDispatchHeight(), boundOutput.width, boundOutput.height);
                 } else if (LOGGER.isTraceEnabled()) {
                     LOGGER.trace("[DLSS-RT] traceRays: {}x{} (output image: {}x{}, cacheExecutionMode={})",
-                            rayDispatchWidth, rayDispatchHeight,
-                            boundOutput.width, boundOutput.height, cacheExecutionMode);
+                            frame.rayDispatchWidth(), frame.rayDispatchHeight(),
+                            boundOutput.width, boundOutput.height, frame.cacheExecutionMode());
                 }
             }
 

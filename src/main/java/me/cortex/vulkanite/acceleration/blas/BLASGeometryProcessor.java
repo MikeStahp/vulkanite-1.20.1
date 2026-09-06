@@ -6,6 +6,7 @@ import me.cortex.vulkanite.lib.base.VRef;
 import me.cortex.vulkanite.lib.cmd.VCmdBuff;
 import me.cortex.vulkanite.lib.memory.AccelerationStructurePool;
 import me.cortex.vulkanite.lib.memory.VAccelerationStructure;
+import me.cortex.vulkanite.lib.memory.VBuffer;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
@@ -53,14 +54,71 @@ public class BLASGeometryProcessor {
                         PointerBuffer buildRanges,
                         LongBuffer pAccelerationStructures,
                         List<VRef<VAccelerationStructure>> accelerationStructures) {
+                processTriangleJob(
+                                job.geometries(),
+                                job.data().geometryBuffer(),
+                                job.data().bufferOffsets(),
+                                jobIndex,
+                                "Material terrain",
+                                compactBlas,
+                                buildInfos,
+                                buildRanges,
+                                pAccelerationStructures,
+                                accelerationStructures);
+        }
+
+        public ShadowTriangleBLASBuild processShadowTriangleJob(
+                        BLASBuildJob job,
+                        int jobIndex,
+                        VkAccelerationStructureBuildGeometryInfoKHR.Buffer buildInfos,
+                        PointerBuffer buildRanges) {
+                ShadowTriangleBLASInput input = job.shadowTriangleInput().orElseThrow();
+                List<VRef<VAccelerationStructure>> structures = new ArrayList<>(1);
+                long structureBytes = processTriangleJob(
+                                input.geometries(),
+                                input.geometryBuffer(),
+                                input.bufferOffsets(),
+                                jobIndex,
+                                input.debugName(),
+                                false,
+                                buildInfos,
+                                buildRanges,
+                                null,
+                                structures);
+                if (structures.size() != 1) {
+                        throw new IllegalStateException("Shadow triangle build did not create exactly one BLAS");
+                }
+                VRef<VAccelerationStructure> structure = structures.get(0);
+                context.setDebugUtilsObjectName(
+                                structure.get().structure,
+                                VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR,
+                                input.debugName() + " BLAS");
+                return new ShadowTriangleBLASBuild(structure, input, structureBytes);
+        }
+
+        private long processTriangleJob(
+                        List<BLASTriangleData> geometries,
+                        VRef<VBuffer> geometryBuffer,
+                        List<Long> bufferOffsets,
+                        int jobIndex,
+                        String debugName,
+                        boolean compact,
+                        VkAccelerationStructureBuildGeometryInfoKHR.Buffer buildInfos,
+                        PointerBuffer buildRanges,
+                        LongBuffer pAccelerationStructures,
+                        List<VRef<VAccelerationStructure>> accelerationStructures) {
+                if (geometries.isEmpty() || geometries.size() != bufferOffsets.size()) {
+                        throw new IllegalArgumentException("Triangle BLAS requires aligned non-empty geometry ranges");
+                }
                 var stack = buildCtx.stack;
-                var brs = VkAccelerationStructureBuildRangeInfoKHR.calloc(job.geometries().size(), stack);
-                var geometryInfos = VkAccelerationStructureGeometryKHR.calloc(job.geometries().size(), stack);
-                var maxPrims = stack.callocInt(job.geometries().size());
+                var brs = VkAccelerationStructureBuildRangeInfoKHR.calloc(geometries.size(), stack);
+                var geometryInfos = VkAccelerationStructureGeometryKHR.calloc(geometries.size(), stack);
+                var maxPrims = stack.callocInt(geometries.size());
                 buildRanges.put(brs);
 
-                for (int geoIdx = 0; geoIdx < job.geometries().size(); geoIdx++) {
-                        processGeometry(job, geoIdx, geometryInfos, brs, maxPrims, jobIndex);
+                for (int geoIdx = 0; geoIdx < geometries.size(); geoIdx++) {
+                        processGeometry(geometries.get(geoIdx), geometryBuffer, bufferOffsets.get(geoIdx),
+                                        geoIdx, geometryInfos, brs, maxPrims, jobIndex);
                 }
 
                 geometryInfos.rewind();
@@ -69,9 +127,9 @@ public class BLASGeometryProcessor {
                 var bi = buildInfos.get()
                                 .sType$Default()
                                 .type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
-                                .flags(buildFlags())
+                                .flags(BLASBuildPolicy.staticTerrainBuildFlags(compact))
                                 .pGeometries(geometryInfos)
-                                .geometryCount(job.geometries().size());
+                                .geometryCount(geometries.size());
 
                 VkAccelerationStructureBuildSizesInfoKHR buildSizesInfo = VkAccelerationStructureBuildSizesInfoKHR
                                 .calloc(stack)
@@ -85,7 +143,7 @@ public class BLASGeometryProcessor {
                                 buildSizesInfo);
 
                 VRef<VAccelerationStructure> structure;
-                if (compactBlas) {
+                if (compact) {
                         var backingBuffer = buildCtx.initialASBufferAllocator
                                         .allocate(buildSizesInfo.accelerationStructureSize());
                         structure = context.memory.createAcceleration(backingBuffer.buffer(), backingBuffer.offset(),
@@ -101,8 +159,14 @@ public class BLASGeometryProcessor {
                 bi.scratchData(VkDeviceOrHostAddressKHR.calloc(stack).deviceAddress(scratch.deviceAddress()));
                 bi.dstAccelerationStructure(structure.get().structure);
 
-                pAccelerationStructures.put(structure.get().structure);
+                if (pAccelerationStructures != null) {
+                        pAccelerationStructures.put(structure.get().structure);
+                }
                 accelerationStructures.add(structure);
+                LOGGER.debug("[BLAS] Encoded {}: job={}, ranges={}, AS bytes={}, scratch bytes={}, compact={}",
+                                debugName, jobIndex, geometries.size(), buildSizesInfo.accelerationStructureSize(),
+                                buildSizesInfo.buildScratchSize(), compact);
+                return buildSizesInfo.accelerationStructureSize();
         }
 
         public ProceduralBLASBuild processProceduralJob(
@@ -145,6 +209,11 @@ public class BLASGeometryProcessor {
                                 .flags(BLASBuildPolicy.staticTerrainBuildFlags(false))
                                 .pGeometries(geometryInfo)
                                 .geometryCount(1);
+                if (geometryInfo.get(0).geometryType() != VK_GEOMETRY_TYPE_AABBS_KHR
+                                || buildInfo.geometryCount() != 1) {
+                        throw new IllegalStateException(
+                                        "Procedural terrain requires one AABB geometry per section BLAS");
+                }
 
                 VkAccelerationStructureBuildSizesInfoKHR buildSizes =
                                 VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
@@ -178,12 +247,14 @@ public class BLASGeometryProcessor {
                 return new ProceduralBLASBuild(structure, input, buildSizes.accelerationStructureSize());
         }
 
-        private void processGeometry(BLASBuildJob job, int geoIdx,
+        private void processGeometry(BLASTriangleData geometry,
+                        VRef<VBuffer> geometryInputBuffer,
+                        long geometryInputBufferOffset,
+                        int geoIdx,
                         VkAccelerationStructureGeometryKHR.Buffer geometryInfos,
                         VkAccelerationStructureBuildRangeInfoKHR.Buffer brs,
                         java.nio.IntBuffer maxPrims, int jobIndex) {
                 var stack = buildCtx.stack;
-                var geometry = job.geometries().get(geoIdx);
                 var geometryInfo = geometryInfos.get().sType$Default();
                 var br = brs.get();
 
@@ -193,8 +264,6 @@ public class BLASGeometryProcessor {
                         throw new IllegalStateException("Invalid quadCount: " + geometry.quadCount());
                 }
 
-                var geometryInputBuffer = job.data().geometryBuffer();
-                var geometryInputBufferOffset = job.data().bufferOffsets().get(geoIdx);
                 long inputAddress = geometryInputBuffer.get().deviceAddress() + geometryInputBufferOffset;
 
                 if (inputAddress == 0) {
@@ -342,7 +411,4 @@ public class BLASGeometryProcessor {
         private record BuildInputBarrier(VRef<me.cortex.vulkanite.lib.memory.VBuffer> buffer, long offset, long size) {
         }
 
-        private int buildFlags() {
-                return BLASBuildPolicy.staticTerrainBuildFlags(compactBlas);
-        }
 }

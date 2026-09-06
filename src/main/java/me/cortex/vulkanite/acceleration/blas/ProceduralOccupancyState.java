@@ -1,5 +1,7 @@
 package me.cortex.vulkanite.acceleration.blas;
 
+import me.cortex.vulkanite.acceleration.voxel.ProceduralMaterialPayload;
+
 import java.util.Arrays;
 import java.util.Objects;
 
@@ -15,21 +17,38 @@ final class ProceduralOccupancyState {
     private long[] occupancy;
     private long buildTime;
     private boolean installed;
+    private int brickSize;
+    private ProceduralMaterialPayload materialPayload = ProceduralMaterialPayload.empty();
 
-    public ProceduralBLASDisposition record(long[] newOccupancy, long newBuildTime) {
+    public ProceduralBLASDisposition record(long[] newOccupancy, long newBuildTime, int newBrickSize) {
+        return record(newOccupancy, newBuildTime, newBrickSize, ProceduralMaterialPayload.empty());
+    }
+
+    public ProceduralBLASDisposition record(
+            long[] newOccupancy,
+            long newBuildTime,
+            int newBrickSize,
+            ProceduralMaterialPayload newMaterialPayload) {
         Objects.requireNonNull(newOccupancy, "newOccupancy");
-        boolean unchanged = occupancy != null && Arrays.equals(occupancy, newOccupancy);
+        Objects.requireNonNull(newMaterialPayload, "newMaterialPayload");
+        boolean unchanged = occupancy != null && brickSize == newBrickSize
+                && Arrays.equals(occupancy, newOccupancy)
+                && materialPayload.equals(newMaterialPayload);
         if (unchanged && installed) {
             return ProceduralBLASDisposition.RETAIN;
         }
 
         occupancy = newOccupancy.clone();
         buildTime = newBuildTime;
+        brickSize = newBrickSize;
+        materialPayload = newMaterialPayload;
         installed = false;
         return isEmpty(newOccupancy)
                 ? ProceduralBLASDisposition.CLEAR
                 : ProceduralBLASDisposition.REPLACE;
     }
+
+    public int brickSize() { return brickSize; }
 
     public void markInstalled(long installedBuildTime, ProceduralBLASDisposition disposition) {
         if (disposition != ProceduralBLASDisposition.RETAIN && buildTime == installedBuildTime) {

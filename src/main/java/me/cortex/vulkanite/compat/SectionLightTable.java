@@ -11,7 +11,9 @@ public record SectionLightTable(
         List<SectionLight> lights,
         long[] opaqueBlocks,
         long[] opaqueMipWords,
-        boolean hasOpaqueBlocks) {
+        boolean hasOpaqueBlocks,
+        long[] proceduralBlocks,
+        SectionRayClassificationStats rayClassificationStats) {
     private static final int SECTION_SIZE = 16;
     private static final int BLOCK_COUNT = SECTION_SIZE * SECTION_SIZE * SECTION_SIZE;
     private static final int OPAQUE_WORD_COUNT = BLOCK_COUNT / Long.SIZE;
@@ -25,6 +27,19 @@ public record SectionLightTable(
         opaqueBlocks = normalizeOpaqueBlocks(opaqueBlocks);
         hasOpaqueBlocks = hasOpaqueBlocks || containsOpaqueBlocks(opaqueBlocks);
         opaqueMipWords = normalizeOpaqueMipWords(opaqueMipWords, opaqueBlocks, hasOpaqueBlocks);
+        proceduralBlocks = normalizeOpaqueBlocks(proceduralBlocks);
+        rayClassificationStats = rayClassificationStats == null ? SectionRayClassificationStats.EMPTY : rayClassificationStats;
+    }
+
+    public SectionLightTable(ChunkSectionPos sectionPos, List<SectionLight> lights, long[] opaqueBlocks,
+            long[] opaqueMipWords, boolean hasOpaqueBlocks, long[] proceduralBlocks) {
+        this(sectionPos, lights, opaqueBlocks, opaqueMipWords, hasOpaqueBlocks, proceduralBlocks,
+                SectionRayClassificationStats.EMPTY);
+    }
+
+    public SectionLightTable(ChunkSectionPos sectionPos, List<SectionLight> lights, long[] opaqueBlocks,
+            long[] opaqueMipWords, boolean hasOpaqueBlocks) {
+        this(sectionPos, lights, opaqueBlocks, opaqueMipWords, hasOpaqueBlocks, opaqueBlocks);
     }
 
     public SectionLightTable(ChunkSectionPos sectionPos, List<SectionLight> lights, long[] opaqueBlocks,
@@ -59,6 +74,12 @@ public record SectionLightTable(
     public boolean isOpaque(int localX, int localY, int localZ) {
         int index = blockIndex(localX, localY, localZ);
         return (opaqueBlocks[index >>> 6] & (1L << (index & 63))) != 0L;
+    }
+
+    /** Returns whether this cell is a regular opaque full cube suitable for procedural RT. */
+    public boolean isProceduralFullCube(int localX, int localY, int localZ) {
+        int index = blockIndex(localX, localY, localZ);
+        return (proceduralBlocks[index >>> 6] & (1L << (index & 63))) != 0L;
     }
 
     public boolean hasOpaqueInBox(int minX, int minY, int minZ, int maxX, int maxY, int maxZ) {
@@ -115,7 +136,9 @@ public record SectionLightTable(
                 && lights.equals(other.lights)
                 && hasOpaqueBlocks == other.hasOpaqueBlocks
                 && Arrays.equals(opaqueBlocks, other.opaqueBlocks)
-                && Arrays.equals(opaqueMipWords, other.opaqueMipWords);
+                && Arrays.equals(opaqueMipWords, other.opaqueMipWords)
+                && Arrays.equals(proceduralBlocks, other.proceduralBlocks)
+                && rayClassificationStats.equals(other.rayClassificationStats);
     }
 
     @Override
@@ -125,6 +148,8 @@ public record SectionLightTable(
         result = 31 * result + Arrays.hashCode(opaqueBlocks);
         result = 31 * result + Arrays.hashCode(opaqueMipWords);
         result = 31 * result + Boolean.hashCode(hasOpaqueBlocks);
+        result = 31 * result + Arrays.hashCode(proceduralBlocks);
+        result = 31 * result + rayClassificationStats.hashCode();
         return result;
     }
 

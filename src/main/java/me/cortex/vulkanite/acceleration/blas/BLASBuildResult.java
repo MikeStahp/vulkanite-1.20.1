@@ -15,12 +15,18 @@ import java.util.Optional;
 public record BLASBuildResult(
         VRef<VAccelerationStructure> structure,
         JobPassThroughData data,
+        Optional<VRef<ShadowTriangleBLAS>> shadowTriangleBlas,
+        boolean filteredShadowGeometry,
         Optional<VRef<ProceduralBLAS>> proceduralBlas,
         ProceduralBLASDisposition proceduralDisposition) implements AutoCloseable {
 
     public BLASBuildResult {
         Objects.requireNonNull(structure, "structure");
         Objects.requireNonNull(data, "data");
+        shadowTriangleBlas = Objects.requireNonNull(shadowTriangleBlas, "shadowTriangleBlas");
+        if (shadowTriangleBlas.isPresent() && !filteredShadowGeometry) {
+            throw new IllegalArgumentException("A filtered shadow BLAS requires filtered ownership");
+        }
         proceduralBlas = Objects.requireNonNull(proceduralBlas, "proceduralBlas");
         Objects.requireNonNull(proceduralDisposition, "proceduralDisposition");
         if ((proceduralDisposition == ProceduralBLASDisposition.REPLACE) != proceduralBlas.isPresent()) {
@@ -29,12 +35,13 @@ public record BLASBuildResult(
     }
 
     public BLASBuildResult(VRef<VAccelerationStructure> structure, JobPassThroughData data) {
-        this(structure, data, Optional.empty(), ProceduralBLASDisposition.CLEAR);
+        this(structure, data, Optional.empty(), false, Optional.empty(), ProceduralBLASDisposition.CLEAR);
     }
 
     @Override
     public void close() {
         structure.close();
+        shadowTriangleBlas.ifPresent(VRef::close);
         proceduralBlas.ifPresent(VRef::close);
         data.geometryBuffer().close();
     }
